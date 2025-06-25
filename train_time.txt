@@ -1,0 +1,60 @@
+LSTM_IOPTQCfP_13F_1Out_timeF_Scaled_240Seq_0Label_128Batch_1e-06LR_80H_1L
+5
+LSTM_IOPTQCfP_13F_1Out_timeF_Scaled_240Seq_0Label_128Batch_1e-06LR_80H_1L
+Time per epoch: 6 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 1 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 18 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 25 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 18 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 20 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 78 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
+
+
+N2O_LSTM_DQAPTQN_13F_1Out_timeF_Unscaled_240Seq_0Label_16Batch_1e-06LR_256H_2L
+Time per epoch: 19 Seconds
