@@ -1,7 +1,9 @@
 from .lstm import SimpleLSTM
+from .transformer import SimpleTransformer
 
 MODEL_REGISTRY = {
     "lstm": SimpleLSTM,
+    "transformer": SimpleTransformer,
 }
 
 

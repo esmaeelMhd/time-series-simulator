@@ -1,0 +1,18 @@
+dataset:
+  name: sine
+  seq_len: 24
+  pred_len: 12
+  batch_size: 32
+
+training:
+  epochs: 10
+  loss: mse
+  learning_rate: 0.001
+
+model:
+  type: lstm
+  hidden_dim: 64
+  num_layers: 2
+
+misc:
+  device: cpu 

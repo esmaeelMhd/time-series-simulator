@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable, Tuple
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -19,7 +20,9 @@ class Trainer:
                  optimizer: torch.optim.Optimizer | None = None,
                  device: torch.device | str = "cpu",
                  early_stopping: bool = False,
-                 patience: int = 5):
+                 patience: int = 5,
+                 run_dir: str | None = None,
+                 writer: "SummaryWriter" | None = None):
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
@@ -33,6 +36,27 @@ class Trainer:
         self.optimizer = optimizer or torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.loss_type = loss
         self.early_stopping = EarlyStopping(patience=patience) if early_stopping else None
+        # Logging / outputs
+        self.run_dir = Path(run_dir) if run_dir else None
+        if self.run_dir:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            # Lazy import – avoids dependency if not requested
+            if writer is not None:
+                self.writer = writer
+            else:
+                try:
+                    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+                    self.writer = SummaryWriter(log_dir=self.run_dir)
+                except ModuleNotFoundError:
+                    self.writer = None
+            # Prepare csv file
+            self.metrics_path = self.run_dir / "metrics.csv"
+            if not self.metrics_path.exists():
+                with open(self.metrics_path, "w", encoding="utf-8") as f:
+                    f.write("epoch,train_loss,val_loss\n")
+        else:
+            self.writer = writer  # could be None
+            self.metrics_path = None
 
     def _step(self, batch: Tuple[torch.Tensor, torch.Tensor]):
         x, y = batch
@@ -86,6 +110,14 @@ class Trainer:
                     if verbose:
                         print("Early stopping triggered.")
                     break
+            # After computing train_loss and val_loss
+            if self.writer is not None:
+                self.writer.add_scalar("Loss/train", train_loss, epoch)
+                if val_loss is not None:
+                    self.writer.add_scalar("Loss/val", val_loss, epoch)
+            if self.metrics_path is not None:
+                with open(self.metrics_path, "a", encoding="utf-8") as f:
+                    f.write(f"{epoch},{train_loss},{val_loss if val_loss is not None else ''}\n")
         return train_losses, val_losses
 
     def save(self, path: str):
