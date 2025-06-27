@@ -1,8 +1,0 @@
---data = 'IOTQCfP'
---dataset_name = 'wastewater.csv'
---setting = 'LSTM_IOTQCfP_12F_1Out_timeF_Scaled_240Seq_10Pred_0Label_128Batch_1e-06LR_80H_1L'
---seq_length = 240
---experiment = 1
---gap_flag = 'small_gap'
---const_episode_length = 240
---max_episode_length = 480

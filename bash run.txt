@@ -1,3 +1,0 @@
-chmod +x retrain_batch.sh
-sed -i 's/\r$//' retrain_batch.sh
-./retrain_batch.sh
