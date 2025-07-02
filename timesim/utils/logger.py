@@ -21,21 +21,21 @@ FMT = "[%(asctime)s] %(levelname)s: %(message)s"
 DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 
-def create_run_dir(base: str | os.PathLike = "./runs", name_parts: Dict[str, str] | None = None) -> Path:
-    """Create a unique run directory inside *base* and return its Path.
-
-    The directory name is of the form::
-        YYYYmmdd_HHMMSS[_key_val...]
-
-    where *key_val* pairs come from *name_parts* (e.g. {"model": "lstm"}).
-    """
-    base_path = Path(base)
-    base_path.mkdir(parents=True, exist_ok=True)
+def create_run_dir(base: str | os.PathLike = "./runs",
+                   dataset: str | None = None,
+                   model: str | None = None,
+                   suffix: str | None = None) -> Path:
+    """Create nested run directory runs/<dataset>/<model>/<timestamp>[_suffix]."""
+    if dataset is None or model is None:
+        raise ValueError("dataset and model names must be provided")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    extra = "".join(f"_{k}-{v}" for k, v in (name_parts or {}).items())
-    run_dir = base_path / f"{ts}{extra}"
+    name = ts if suffix is None else f"{ts}_{suffix}"
+
+    run_dir = Path(base) / dataset / model / name
     run_dir.mkdir(parents=True, exist_ok=False)
+
+    # subfolders
     (run_dir / "figs").mkdir(exist_ok=True)
     return run_dir
 

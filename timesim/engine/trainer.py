@@ -67,6 +67,9 @@ class Trainer:
             loss = self.loss_fn(pred, y)
         else:
             loss, _, _ = dilate_loss(y, pred, device=self.device)
+        # Guard against NaNs/Infs early so we don't silently propagate them
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise ValueError("Encountered NaN/Inf in training loss. Check data preprocessing and model stability.")
         loss.backward()
         self.optimizer.step()
         return loss.item()
@@ -78,8 +81,15 @@ class Trainer:
         for x, y in loader:
             x, y = x.to(self.device), y.to(self.device)
             pred = self.model(x)
+            if torch.isnan(pred).any() or torch.isnan(y).any():
+                raise ValueError("NaNs detected in validation data or predictions. Inspect data pipeline and model output range.")
             if self.loss_type == "mse":
-                total += self.loss_fn(pred, y).item() * len(x)
+                batch_loss = self.loss_fn(pred, y)
+            else:
+                batch_loss, _, _ = dilate_loss(y, pred, device=self.device)
+            if torch.isnan(batch_loss) or torch.isinf(batch_loss):
+                raise ValueError("NaN/Inf encountered in validation loss. Model produced unstable outputs.")
+            total += batch_loss.item() * len(x)
             n += len(x)
         self.model.train()
         return total / max(n, 1)

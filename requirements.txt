@@ -25,4 +25,7 @@ numba>=0.57
 seaborn>=0.13
 
 # Classical stats models (VARMAX etc.)
-statsmodels>=0.14 
+statsmodels>=0.14
+
+# Added joblib dependency
+joblib>=1.3 

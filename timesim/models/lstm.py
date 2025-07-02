@@ -10,10 +10,11 @@ class SimpleLSTM(nn.Module):
                  hidden_dim: int = 64,
                  num_layers: int = 2,
                  pred_len: int = 1,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0,
+                 out_dim: int | None = None):
         super().__init__()
         self.pred_len = pred_len
-        self.out_dim = input_dim  # predict same number of features
+        self.out_dim = out_dim or input_dim
 
         self.lstm = nn.LSTM(input_size=input_dim,
                             hidden_size=hidden_dim,

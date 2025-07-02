@@ -1,8 +1,14 @@
 dataset:
-  name: sine
+  name: myplant
   seq_len: 24
   pred_len: 12
   batch_size: 32
+  csv: datasets/wastewater.csv
+  index_col: date
+  variables:
+    control:   [IN_METAL_Q, T1_O2]      # C
+    exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]          # E
+    objective: [T1_PO4]           # O
 
 training:
   epochs: 10
@@ -11,8 +17,21 @@ training:
 
 model:
   type: lstm
+  d_model: 128
+  out_dim: 1
   hidden_dim: 64
   num_layers: 2
 
 misc:
-  device: cpu 
+  device: cpu
+
+model_io:
+  input_groups:  ["control", "exogenous"]
+  output_groups: ["objective"]
+
+# Default retraining parameters
+retrain:
+  method: sepp        # v1, v2, or sepp
+  epochs: 3
+  sepp_h_max: 64      # max autoregressive horizon
+  sepp_stride: 12     # step between start indices 

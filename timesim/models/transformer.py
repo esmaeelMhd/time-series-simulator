@@ -19,10 +19,11 @@ class SimpleTransformer(nn.Module):
                  num_layers: int = 3,
                  dim_feedforward: int = 128,
                  dropout: float = 0.1,
-                 pred_len: int = 1):
+                 pred_len: int = 1,
+                 out_dim: int | None = None):
         super().__init__()
         self.pred_len = pred_len
-        self.out_dim = input_dim  # predict same dimensionality
+        self.out_dim = out_dim or input_dim  # default: same as input
 
         self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_encoding = PositionalEncoding(d_model, dropout)
