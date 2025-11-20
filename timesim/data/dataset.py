@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -93,6 +93,9 @@ class GroupedTimeSeriesDataset(Dataset):
         if missing:
             raise ValueError(f"Columns missing in DataFrame: {missing}")
 
+        self.groups = groups
+        self.input_groups = input_groups
+        self.output_groups = output_groups
         self.input_cols = sum((groups[g] for g in input_groups), [])
         self.output_cols = sum((groups[g] for g in output_groups), [])
 
@@ -136,4 +139,69 @@ class GroupedTimeSeriesDataset(Dataset):
         horizon = self.values[idx + self.seq_len : idx + self.seq_len + self.pred_len]
         x = window[:, self.in_idx]
         y = horizon[:, self.out_idx]
-        return torch.tensor(x), torch.tensor(y) 
+        return torch.tensor(x), torch.tensor(y)
+    
+    def get_warmup_window(self, start_idx: int, warmup_len: int) -> Dict[str, np.ndarray]:
+        """Get warmup window for world model initialization.
+        
+        Parameters
+        ----------
+        start_idx : int
+            Starting index (must be >= warmup_len).
+        warmup_len : int
+            Length of warmup sequence.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - "controls": (warmup_len, control_dim)
+            - "exogenous": (warmup_len, exo_dim)
+            - "outputs": (warmup_len, output_dim)
+            - "inputs": (warmup_len, input_dim) - concatenated inputs
+        """
+        if start_idx < warmup_len:
+            raise ValueError(f"start_idx ({start_idx}) must be >= warmup_len ({warmup_len})")
+        
+        warmup = self.values[start_idx - warmup_len : start_idx]
+        
+        return {
+            "inputs": warmup[:, self.in_idx],
+            "outputs": warmup[:, self.out_idx],
+        }
+    
+    def get_rollout_slice(
+        self,
+        start_idx: int,
+        horizon: int,
+    ) -> Dict[str, np.ndarray]:
+        """Get data slice for rollout (controls, exogenous, targets).
+        
+        Parameters
+        ----------
+        start_idx : int
+            Starting index for the rollout.
+        horizon : int
+            Number of steps to roll out.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - "controls": (horizon, control_dim) - if controls in input
+            - "exogenous": (horizon, exo_dim) - if exogenous in input
+            - "targets": (horizon, output_dim)
+            - "inputs": (horizon, input_dim) - full inputs for convenience
+        """
+        if start_idx + horizon > len(self.values):
+            raise ValueError(
+                f"Rollout extends beyond dataset: start={start_idx}, "
+                f"horizon={horizon}, length={len(self.values)}"
+            )
+        
+        rollout = self.values[start_idx : start_idx + horizon]
+        
+        return {
+            "inputs": rollout[:, self.in_idx],
+            "targets": rollout[:, self.out_idx],
+        } 
