@@ -55,6 +55,8 @@ class LSTMWorldModel(WorldModelBase):
         num_layers: int = 2,
         dropout: float = 0.0,
         pred_len: int = 1,
+        control_dim: Optional[int] = None,
+        exo_dim: Optional[int] = None,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -62,6 +64,12 @@ class LSTMWorldModel(WorldModelBase):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.pred_len = pred_len
+        
+        # For step() method: if control_dim and exo_dim are provided,
+        # the LSTM expects control + exo + output concatenated
+        # Otherwise, input_dim should already include everything
+        self.control_dim = control_dim
+        self.exo_dim = exo_dim
         
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -121,13 +129,26 @@ class LSTMWorldModel(WorldModelBase):
         """
         h, c = state
         
-        # Concatenate inputs
+        # Concatenate inputs based on what's provided
+        # The input to LSTM should match input_dim from __init__
         if prev_output_t is not None:
+            # Autoregressive mode: concatenate control + exo + previous output
             input_t = torch.cat([control_t, exo_t, prev_output_t], dim=-1)
         else:
-            # If no previous output, assume it's zeros or not needed
-            # This handles the case where output_dim is not part of input
-            input_t = torch.cat([control_t, exo_t], dim=-1)
+            # Initial step or no feedback: just control + exo
+            # Pad with zeros for output dimension to match input_dim
+            batch_size = control_t.shape[0]
+            device = control_t.device
+            zero_output = torch.zeros(batch_size, self.output_dim, device=device)
+            input_t = torch.cat([control_t, exo_t, zero_output], dim=-1)
+        
+        # Verify dimension matches
+        if input_t.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Input dimension mismatch: expected {self.input_dim}, "
+                f"got {input_t.shape[-1]}. "
+                f"Make sure input_dim = control_dim + exo_dim + output_dim"
+            )
         
         # Add time dimension for LSTM
         input_t = input_t.unsqueeze(1)  # (B, 1, F)

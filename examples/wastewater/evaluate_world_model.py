@@ -135,8 +135,12 @@ def main():
     print("Loading model...")
     ModelCls = get_model(config["model"]["type"])
     
-    input_dim = len(sum((groups[g] for g in input_groups), []))
+    control_dim = len(groups.get("control", []))
+    exo_dim = len(groups.get("exogenous", []))
     output_dim = len(sum((groups[g] for g in output_groups), []))
+    
+    # For world models, input_dim = control + exogenous + output (for autoregressive feedback)
+    input_dim = control_dim + exo_dim + output_dim
     
     model = ModelCls(
         input_dim=input_dim,
@@ -145,6 +149,8 @@ def main():
         num_layers=config["model"].get("num_layers", 2),
         dropout=config["model"].get("dropout", 0.0),
         pred_len=config["dataset"]["pred_len"],
+        control_dim=control_dim,
+        exo_dim=exo_dim,
     )
     
     device = torch.device(config["misc"]["device"])
