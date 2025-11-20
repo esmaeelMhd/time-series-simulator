@@ -73,9 +73,14 @@ def batch_rollout(
         
         # Get warmup window
         warmup_data = dataset.get_warmup_window(start_idx, warmup_len)
+        # For world models, concatenate inputs (control+exo) and outputs for full sequence
+        warmup_full = np.concatenate([
+            warmup_data["inputs"],
+            warmup_data["outputs"]
+        ], axis=-1)
         warmup_inputs = torch.tensor(
-            warmup_data["inputs"], dtype=torch.float32, device=device
-        ).unsqueeze(0)  # (1, warmup_len, input_dim)
+            warmup_full, dtype=torch.float32, device=device
+        ).unsqueeze(0)  # (1, warmup_len, control_dim+exo_dim+output_dim)
         
         # Get rollout data
         rollout_data = dataset.get_rollout_slice(start_idx, horizon)
