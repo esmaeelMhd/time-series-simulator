@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Literal, Callable
+import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from ..data.dataset import GroupedTimeSeriesDataset
 from ..data.sampling import SamplingStrategy, RandomStartFixedHorizon
@@ -56,7 +58,10 @@ class WorldModelTrainer:
     optimizer : torch.optim.Optimizer, optional
         Optimizer to use. If None, creates Adam with lr=1e-3.
     device : torch.device or str, default "cpu"
-        Device for training.
+        Device for training. Ignored if use_gpu=True.
+    use_gpu : bool, default False
+        If True, automatically use GPU if available, otherwise use CPU.
+        Takes precedence over device parameter.
     early_stopping : bool, default False
         Whether to use early stopping.
     patience : int, default 5
@@ -82,6 +87,7 @@ class WorldModelTrainer:
         one_step_weight: float = 0.5,
         optimizer: Optional[torch.optim.Optimizer] = None,
         device: torch.device | str = "cpu",
+        use_gpu: bool = False,
         early_stopping: bool = False,
         patience: int = 5,
         run_dir: Optional[str | Path] = None,
@@ -97,7 +103,17 @@ class WorldModelTrainer:
         self.teacher_forcing_ratio = teacher_forcing_ratio
         
         # Device setup
-        self.device = torch.device(device)
+        if use_gpu:
+            # Automatically use GPU if available
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                self.device = torch.device("cpu")
+                print("Warning: use_gpu=True but CUDA is not available. Using CPU instead.")
+        else:
+            # Use the specified device
+            self.device = torch.device(device)
         self.model.to(self.device)
         
         # Sampling strategy
@@ -309,34 +325,82 @@ class WorldModelTrainer:
             dataset_len = len(self.dataset.values) - self.warmup_len
             steps_per_epoch = max(1, dataset_len // self.batch_size)
         
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"Starting training: {epochs} epochs, {steps_per_epoch} steps/epoch")
+            print(f"Batch size: {self.batch_size}, Training mode: {self.training_mode}")
+            print(f"{'='*70}\n")
+        
         train_losses = []
         val_losses = []
+        start_time = time.time()
+        epoch_times = []
         
         for epoch in range(1, epochs + 1):
+            epoch_start_time = time.time()
+            
             # Training
+            self.model.train()
             epoch_losses = []
-            for _ in range(steps_per_epoch):
+            
+            if verbose:
+                # Create progress bar for training steps
+                pbar = tqdm(
+                    range(steps_per_epoch),
+                    desc=f"Epoch {epoch}/{epochs} [Train]",
+                    unit="step",
+                    leave=False,
+                    ncols=100,
+                )
+            else:
+                pbar = range(steps_per_epoch)
+            
+            for step in pbar:
                 batch_loss = self._train_step()
                 epoch_losses.append(batch_loss)
+                
+                if verbose:
+                    # Update progress bar with current loss
+                    current_avg_loss = np.mean(epoch_losses)
+                    pbar.set_postfix({"loss": f"{current_avg_loss:.4f}"})
             
             train_loss = np.mean(epoch_losses)
             train_losses.append(train_loss)
             
             # Validation
+            if verbose:
+                print(f"  Validating...", end=" ", flush=True)
+            val_start_time = time.time()
             val_loss = self._validate()
             val_losses.append(val_loss)
+            val_time = time.time() - val_start_time
             
-            # Logging
-            if verbose and (epoch == 1 or epoch == epochs or epoch % 5 == 0):
-                msg = f"[Epoch {epoch}/{epochs}] train={train_loss:.4f}"
+            if verbose:
+                print(f"done ({val_time:.2f}s)")
+            
+            epoch_time = time.time() - epoch_start_time
+            epoch_times.append(epoch_time)
+            elapsed_time = time.time() - start_time
+            avg_epoch_time = np.mean(epoch_times)
+            remaining_epochs = epochs - epoch
+            eta = avg_epoch_time * remaining_epochs if remaining_epochs > 0 else 0
+            
+            # Logging - now print every epoch when verbose
+            if verbose:
+                msg = f"[Epoch {epoch}/{epochs}] "
+                msg += f"train_loss={train_loss:.6f}"
                 if val_loss is not None:
-                    msg += f" | val={val_loss:.4f}"
+                    msg += f" | val_loss={val_loss:.6f}"
+                msg += f" | time={epoch_time:.2f}s"
+                if epoch > 1:
+                    msg += f" | ETA={eta:.1f}s"
                 print(msg)
             
             if self.writer is not None:
                 self.writer.add_scalar("Loss/train", train_loss, epoch)
                 if val_loss is not None:
                     self.writer.add_scalar("Loss/val", val_loss, epoch)
+                self.writer.add_scalar("Time/epoch", epoch_time, epoch)
             
             if self.metrics_path is not None:
                 with open(self.metrics_path, "a", encoding="utf-8") as f:
@@ -347,8 +411,26 @@ class WorldModelTrainer:
                 self.early_stopping(val_loss)
                 if self.early_stopping.early_stop:
                     if verbose:
+                        print(f"\n{'='*70}")
                         print("Early stopping triggered.")
+                        if self.early_stopping.best_loss is not None:
+                            print(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
+                        print(f"Stopped at epoch {epoch}/{epochs}")
+                        print(f"{'='*70}\n")
                     break
+        
+        total_time = time.time() - start_time
+        
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"Training completed!")
+            print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
+            print(f"Average epoch time: {np.mean(epoch_times):.2f}s")
+            if len(train_losses) > 0:
+                print(f"Final train loss: {train_losses[-1]:.6f}")
+                if val_losses[-1] is not None:
+                    print(f"Final val loss: {val_losses[-1]:.6f}")
+            print(f"{'='*70}\n")
         
         return train_losses, val_losses
     

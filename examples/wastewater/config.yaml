@@ -61,6 +61,7 @@ misc:
   device: cpu
   seed: 42
   run_dir: runs/wastewater/lstm
+  use_gpu: true
 
 model_io:
   input_groups:  ["control", "exogenous"]

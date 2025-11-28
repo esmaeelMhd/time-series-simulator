@@ -180,6 +180,7 @@ def main():
         ),
         device=config["misc"]["device"],
         early_stopping=config["training"].get("early_stopping", False),
+        use_gpu=config["misc"].get("use_gpu", False),
         patience=config["training"].get("patience", 5),
         run_dir=run_dir,
         writer=tb_writer,
