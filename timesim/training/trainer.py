@@ -1,4 +1,11 @@
-"""Unified trainer for world models with multi-step rollout training."""
+"""Unified trainer for world models with multi-step rollout training.
+
+HOT PATH: The training loop (_train_step, _validate) runs every step/epoch.
+Performance optimizations applied:
+- Batched rollouts for uniform horizons
+- Vectorized mask operations
+- Minimal allocations in training loop
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,11 @@
-"""Loss functions for world model training."""
+"""Loss functions for world model training.
+
+HOT PATH: Loss computation happens every training step.
+Optimizations:
+- Use vectorized PyTorch operations (no Python loops)
+- Avoid intermediate tensor allocations
+- Use in-place operations where safe
+"""
 
 from __future__ import annotations
 

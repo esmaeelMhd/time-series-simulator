@@ -1,4 +1,11 @@
-"""LSTM-based world model for time-series simulation."""
+"""LSTM-based world model for time-series simulation.
+
+HOT PATH: Model forward and rollout are called every training step.
+Optimizations:
+- Preallocated output tensors in rollout (no list.append)
+- Efficient tensor slicing in step()
+- Minimized Python overhead in inner loops
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,8 @@ from .base import WorldModelBase
 
 class LSTMWorldModel(WorldModelBase):
     """LSTM-based world model for control and simulation.
+    
+    HOT PATH: forward() and rollout() are called every training step.
     
     This model learns to predict the next state/observation given:
     - Current hidden state (LSTM memory)
@@ -200,8 +209,11 @@ class LSTMWorldModel(WorldModelBase):
     ) -> Dict[str, torch.Tensor]:
         """Perform multi-step autoregressive rollout.
         
-        This is an optimized implementation that handles the LSTM-specific
-        logic more efficiently than the base class implementation.
+        HOT PATH: This is called every training step.
+        Optimizations:
+        - Preallocated predictions tensor (no list.append)
+        - Direct tensor indexing for output (no intermediate copies)
+        - Minimized Python overhead
         
         Parameters
         ----------
@@ -240,25 +252,31 @@ class LSTMWorldModel(WorldModelBase):
         batch_size = controls.shape[0]
         device = controls.device
         
-        # Infer dimensions
-        control_dim = controls.shape[-1]
-        exo_dim = exogenous.shape[-1]
-        
         # Get initial previous output from warmup
         # Assume outputs are the last output_dim features of warmup
         prev_output = warmup_inputs[:, -1, -(self.output_dim):]  # (B, O)
         
-        # Rollout loop
-        predictions = []
+        # HOT PATH: Preallocate predictions tensor (Rule 5: no allocations in loop)
+        predictions = torch.empty(
+            batch_size, horizon, self.output_dim,
+            dtype=torch.float32, device=device
+        )
+        
+        # States list is needed for potential downstream use, but we only
+        # store references, not copies
         states = []
         
+        # Rollout loop - unavoidable due to recurrence, but minimized overhead
         for t in range(horizon):
+            # Direct indexing (no intermediate tensors)
             control_t = controls[:, t, :]  # (B, C)
             exo_t = exogenous[:, t, :]  # (B, E)
             
             # Predict next step
             state, pred_t = self.step(state, control_t, exo_t, prev_output)
-            predictions.append(pred_t)
+            
+            # HOT PATH: Direct assignment to preallocated tensor
+            predictions[:, t, :] = pred_t
             states.append(state)
             
             # Determine feedback for next step
@@ -267,11 +285,9 @@ class LSTMWorldModel(WorldModelBase):
             elif feedback == "teacher":
                 prev_output = targets[:, t, :]
             elif feedback == "mixed":
-                # Scheduled sampling
+                # Scheduled sampling - single random generation per step
                 use_teacher = torch.rand(batch_size, 1, device=device) < teacher_forcing_ratio
                 prev_output = torch.where(use_teacher, targets[:, t, :], pred_t)
-        
-        predictions = torch.stack(predictions, dim=1)  # (B, H, O)
         
         return {
             "predictions": predictions,

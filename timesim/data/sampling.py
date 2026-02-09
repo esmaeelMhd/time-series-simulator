@@ -1,5 +1,11 @@
 """Sampling strategies for multi-step world model training.
 
+HOT PATH: Sampling is called every training step.
+Key optimizations:
+- Vectorized start_indices computation (no Python loops)
+- Preallocated numpy arrays with fixed dtypes
+- Batch random number generation
+
 These strategies determine which starting points and horizons to use when
 training a world model with multi-step rollouts. Different strategies are
 suitable for different domains and training objectives.
@@ -65,6 +71,11 @@ class RandomStartRandomHorizon:
     This is the most general strategy and provides maximum diversity in training.
     Good for learning robust dynamics across all time scales.
     
+    HOT PATH: Called every training step.
+    Optimizations:
+    - Vectorized start_indices computation (no Python loop)
+    - Single batch random number generation
+    
     Parameters
     ----------
     h_min : int
@@ -91,20 +102,27 @@ class RandomStartRandomHorizon:
         if rng is None:
             rng = np.random.default_rng()
         
-        # Sample horizons first
-        horizons = rng.integers(self.h_min, self.h_max + 1, size=batch_size)
+        # Sample horizons first (vectorized)
+        horizons = rng.integers(self.h_min, self.h_max + 1, size=batch_size, dtype=np.int64)
         
-        # Sample valid start indices for each horizon
-        start_indices = np.zeros(batch_size, dtype=np.int64)
-        for i in range(batch_size):
-            max_start = dataset_length - horizons[i]
-            min_start = warmup_len
-            if max_start < min_start:
-                raise ValueError(
-                    f"Dataset too short: need at least {warmup_len + horizons[i]} "
-                    f"timesteps but only have {dataset_length}"
-                )
-            start_indices[i] = rng.integers(min_start, max_start + 1)
+        # Validate that dataset is long enough for max horizon
+        if dataset_length - self.h_max < warmup_len:
+            raise ValueError(
+                f"Dataset too short: need at least {warmup_len + self.h_max} "
+                f"timesteps but only have {dataset_length}"
+            )
+        
+        # HOT PATH: Vectorized start_indices computation
+        # max_start[i] = dataset_length - horizons[i]
+        # min_start = warmup_len (constant)
+        # start_indices[i] ~ Uniform[min_start, max_start[i]]
+        max_starts = dataset_length - horizons  # (batch_size,)
+        
+        # Generate uniform random in [0, 1) and scale to [min_start, max_start]
+        # start = min_start + floor(random * (max_start - min_start + 1))
+        ranges = max_starts - warmup_len + 1  # Number of valid positions per item
+        random_offsets = rng.random(batch_size)  # (batch_size,) in [0, 1)
+        start_indices = warmup_len + (random_offsets * ranges).astype(np.int64)
         
         return start_indices, horizons
 
@@ -241,6 +259,11 @@ class GeometricHorizonSampling:
     (e.g., 1, 2, 4, 8, 16, 32, 64 steps). This is useful for training models
     that need to learn both short-term and long-term dynamics.
     
+    HOT PATH: Called every training step.
+    Optimizations:
+    - Vectorized start_indices computation (no Python loop)
+    - Precomputed geometric horizon sequence
+    
     Based on the SEPP (See Every Possible Path) approach in the original code.
     
     Parameters
@@ -260,13 +283,13 @@ class GeometricHorizonSampling:
         self.pred_len = pred_len
         self.h_max = h_max
         
-        # Compute geometric sequence of horizons
-        self.horizons = []
+        # Compute geometric sequence of horizons (done once at init)
+        horizons_list = []
         h = pred_len
         while h <= h_max:
-            self.horizons.append(h)
+            horizons_list.append(h)
             h *= 2
-        self.horizons = np.array(self.horizons, dtype=np.int64)
+        self.horizons = np.array(horizons_list, dtype=np.int64)
     
     def sample(
         self,
@@ -278,21 +301,22 @@ class GeometricHorizonSampling:
         if rng is None:
             rng = np.random.default_rng()
         
-        # Sample horizons from the geometric sequence
+        # Validate dataset length for max horizon
+        if dataset_length - self.h_max < warmup_len:
+            raise ValueError(
+                f"Dataset too short: need at least {warmup_len + self.h_max} "
+                f"timesteps but only have {dataset_length}"
+            )
+        
+        # Sample horizons from the geometric sequence (vectorized)
         horizon_indices = rng.choice(len(self.horizons), size=batch_size, replace=True)
         horizons = self.horizons[horizon_indices]
         
-        # Sample valid start indices for each horizon
-        start_indices = np.zeros(batch_size, dtype=np.int64)
-        for i in range(batch_size):
-            max_start = dataset_length - horizons[i]
-            min_start = warmup_len
-            if max_start < min_start:
-                raise ValueError(
-                    f"Dataset too short: need at least {warmup_len + horizons[i]} "
-                    f"timesteps but only have {dataset_length}"
-                )
-            start_indices[i] = rng.integers(min_start, max_start + 1)
+        # HOT PATH: Vectorized start_indices computation
+        max_starts = dataset_length - horizons  # (batch_size,)
+        ranges = max_starts - warmup_len + 1
+        random_offsets = rng.random(batch_size)
+        start_indices = warmup_len + (random_offsets * ranges).astype(np.int64)
         
         return start_indices, horizons
 

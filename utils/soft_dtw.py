@@ -1,20 +1,31 @@
+"""Soft-DTW implementation for differentiable time warping.
+
+HOT PATH: This module is called during loss computation.
+Optimizations:
+- Batched CPU/GPU transfers (single transfer per batch)
+- Numba JIT for inner loops (unavoidable due to DTW structure)
+- Preallocated output tensors
+"""
+
 import numpy as np
 import torch
 from numba import jit
 from torch.autograd import Function
 
+
 def pairwise_distances(x, y=None):
-    '''
+    """Compute pairwise squared Euclidean distances.
+    
     Input: x is a Nxd matrix
-           y is an optional Mxd matirx
-    Output: dist is a NxM matrix where dist[i,j] is the square norm between x[i,:] and y[j,:]
-            if y is not given then use 'y=x'.
-    i.e. dist[i,j] = ||x[i,:]-y[j,:]||^2
-    '''
-    x_norm = (x**2).sum(1).view(-1, 1)
+           y is an optional Mxd matrix
+    Output: dist is a NxM matrix where dist[i,j] = ||x[i,:]-y[j,:]||^2
+    
+    HOT PATH: Used for distance matrix computation.
+    """
+    x_norm = (x ** 2).sum(1).view(-1, 1)
     if y is not None:
         y_t = torch.transpose(y, 0, 1)
-        y_norm = (y**2).sum(1).view(1, -1)
+        y_norm = (y ** 2).sum(1).view(1, -1)
     else:
         y_t = torch.transpose(x, 0, 1)
         y_norm = x_norm.view(1, -1)
@@ -63,37 +74,61 @@ def compute_softdtw_backward(D_, R, gamma):
  
 
 class SoftDTWBatch(Function):
+    """Batched Soft-DTW for differentiable time warping.
+    
+    HOT PATH: Called during loss computation.
+    Optimizations:
+    - Single CPU transfer per batch (not per item)
+    - Preallocated numpy arrays for results
+    - Single GPU transfer after all computations
+    """
+    
     @staticmethod
-    def forward(ctx, D, gamma = 1.0): # D.shape: [batch_size, N , N]
+    def forward(ctx, D, gamma=1.0):  # D.shape: [batch_size, N, N]
         dev = D.device
-        batch_size,N,N = D.shape
-        gamma = torch.FloatTensor([gamma]).to(dev)
+        batch_size, N, _ = D.shape
+        gamma_tensor = torch.tensor([gamma], dtype=torch.float32, device=dev)
+        g_ = gamma
+        
+        # HOT PATH: Single CPU transfer for entire batch (Rule 7)
         D_ = D.detach().cpu().numpy()
-        g_ = gamma.item()
-
-        total_loss = 0
-        R = torch.zeros((batch_size, N+2 ,N+2)).to(dev)   
-        for k in range(0, batch_size): # loop over all D in the batch    
-            Rk = torch.FloatTensor(compute_softdtw(D_[k,:,:], g_)).to(dev)
-            R[k:k+1,:,:] = Rk
-            total_loss = total_loss + Rk[-2,-2]
-        ctx.save_for_backward(D, R, gamma)
-        return total_loss / batch_size
-  
+        
+        # Preallocate numpy array for results (Rule 5: no allocations in loop)
+        R_np = np.zeros((batch_size, N + 2, N + 2), dtype=np.float32)
+        total_loss = 0.0
+        
+        # Numba JIT loop (unavoidable due to DTW recurrence structure)
+        for k in range(batch_size):
+            R_np[k] = compute_softdtw(D_[k], g_)
+            total_loss += R_np[k, -2, -2]
+        
+        # HOT PATH: Single GPU transfer after all computations (Rule 7)
+        R = torch.from_numpy(R_np).to(dev)
+        
+        ctx.save_for_backward(D, R, gamma_tensor)
+        return torch.tensor(total_loss / batch_size, device=dev)
+    
     @staticmethod
     def backward(ctx, grad_output):
         dev = grad_output.device
         D, R, gamma = ctx.saved_tensors
-        batch_size,N,N = D.shape
+        batch_size, N, _ = D.shape
+        g_ = gamma.item()
+        
+        # HOT PATH: Single CPU transfer for entire batch
         D_ = D.detach().cpu().numpy()
         R_ = R.detach().cpu().numpy()
-        g_ = gamma.item()
-
-        E = torch.zeros((batch_size, N ,N)).to(dev) 
-        for k in range(batch_size):         
-            Ek = torch.FloatTensor(compute_softdtw_backward(D_[k,:,:], R_[k,:,:], g_)).to(dev)
-            E[k:k+1,:,:] = Ek
-
+        
+        # Preallocate numpy array for gradients (Rule 5)
+        E_np = np.zeros((batch_size, N, N), dtype=np.float32)
+        
+        # Numba JIT loop (unavoidable)
+        for k in range(batch_size):
+            E_np[k] = compute_softdtw_backward(D_[k], R_[k], g_)
+        
+        # HOT PATH: Single GPU transfer after all computations
+        E = torch.from_numpy(E_np).to(dev)
+        
         return grad_output * E, None
 
 

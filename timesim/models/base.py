@@ -1,5 +1,11 @@
 """Abstract base class for world models (simulators) for control.
 
+HOT PATH: Model rollout is called every training step.
+Optimizations in subclasses should follow:
+- Preallocate output tensors (no list.append in rollout loops)
+- Minimize tensor allocations in step()
+- Use direct tensor indexing
+
 A world model learns the dynamics of a system:
     s_{t+1} = f(s_t, u_t, e_t)
 
@@ -93,6 +99,11 @@ class WorldModelBase(nn.Module, ABC):
     ) -> Dict[str, torch.Tensor]:
         """Perform multi-step autoregressive rollout.
         
+        HOT PATH: This is called every training step.
+        Optimizations:
+        - Preallocated predictions tensor (no list.append)
+        - Direct tensor assignment
+        
         This is the key method for training world models with multi-step losses.
         
         Parameters
@@ -154,28 +165,42 @@ class WorldModelBase(nn.Module, ABC):
         controls = rollout_inputs["controls"]  # (B, H, C)
         exogenous = rollout_inputs["exogenous"]  # (B, H, E)
         batch_size = controls.shape[0]
+        device = controls.device
         
         # Get last output from warmup as initial prev_output
         if "outputs" in warmup_seq:
             prev_output = warmup_seq["outputs"][:, -1, :]  # (B, O)
+            output_dim = prev_output.shape[-1]
         else:
             # Extract from concatenated inputs (assume outputs are last)
-            output_dim = targets.shape[-1] if targets is not None else None
+            # Try model attribute first, then targets
+            output_dim = getattr(self, 'output_dim', None)
             if output_dim is None:
-                raise ValueError("Cannot infer output_dim without targets or warmup outputs")
+                output_dim = targets.shape[-1] if targets is not None else None
+            if output_dim is None:
+                raise ValueError(
+                    "Cannot infer output_dim. Provide warmup 'outputs', "
+                    "set model.output_dim, or pass targets."
+                )
             prev_output = warmup_inputs[:, -1, -output_dim:]
         
-        # Rollout loop
-        predictions = []
+        # HOT PATH: Preallocate predictions tensor (Rule 5: no allocations in loop)
+        predictions = torch.empty(
+            batch_size, horizon, output_dim,
+            dtype=torch.float32, device=device
+        )
         states = []
         
+        # Rollout loop - recurrence is unavoidable, but minimize overhead
         for t in range(horizon):
             control_t = controls[:, t, :]  # (B, C)
             exo_t = exogenous[:, t, :]  # (B, E)
             
             # Predict next step
             state, pred_t = self.step(state, control_t, exo_t, prev_output)
-            predictions.append(pred_t)
+            
+            # HOT PATH: Direct assignment to preallocated tensor
+            predictions[:, t, :] = pred_t
             states.append(state)
             
             # Determine what to use as prev_output for next step
@@ -185,10 +210,8 @@ class WorldModelBase(nn.Module, ABC):
                 prev_output = targets[:, t, :]
             elif feedback == "mixed":
                 # Scheduled sampling: randomly choose between model and teacher
-                use_teacher = torch.rand(batch_size, 1, device=pred_t.device) < teacher_forcing_ratio
+                use_teacher = torch.rand(batch_size, 1, device=device) < teacher_forcing_ratio
                 prev_output = torch.where(use_teacher, targets[:, t, :], pred_t)
-        
-        predictions = torch.stack(predictions, dim=1)  # (B, H, O)
         
         return {
             "predictions": predictions,

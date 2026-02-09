@@ -2,36 +2,57 @@
 dataset:
   name: myplant
   seq_len: 24
-  pred_len: 12
-  batch_size: 32
+  pred_len: 1
+  batch_size: 16
   csv: datasets/wastewater.csv
   index_col: date
   variables:
-    control:   [IN_METAL_Q, T1_O2]      # C
-    exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]          # E
-    objective: [T1_PO4]           # O
+    control:   [IN_METAL_Q, T1_O2]                                          # C
+    exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]  # E
+    objective: [T1_PO4]                                                      # O
   slice:
-    first_n: 3000        # use only the first 3 k rows
-    # --- OR ---
-    # start: '2021-08-01'
-    # end:   '2021-08-10'
-# ---------- model -------------
-model:
-  type: lstm
-  hidden_dim: 32
-  num_layers: 1
+    first_n: 1000        # use only the first 1k rows for quick tests
+
 # ---------- model I/O ---------
 model_io:
-  input_groups:  ["control"]     # irrelevant for sine
-  output_groups: ["objective"]
+  input_groups:  ["control"]      # what goes into the model input
+  output_groups: ["objective"]    # what the model predicts
+
+# ---------- models to compare ----------
+models:
+  - type: lstm
+    hidden_dim: 32
+    num_layers: 1
+  - type: dlinear
+    kernel_size: 13
+  - type: nlinear
+  - type: tft
+    hidden_dim: 32
+    n_heads: 4
+    num_lstm_layers: 1
+  - type: transformer
+    d_model: 32
+    nhead: 4
+    num_layers: 1
+  - type: xgboost
+    n_estimators: 50
+    max_depth: 4
+
 # ---------- training ----------
 training:
-  epochs: 2                        # just two epochs
-# ---------- retrain -----------
-retrain:
-  method: sepp
-  epochs: 10
-  sepp_h_max: 12                # 2× pred_len
-  sepp_stride: 6                # = pred_len
-  patience: 3
-  sim_points: 4
+  epochs: 3
+  learning_rate: 0.001
+  warmup_len: 24
+  loss_type: mse
+  mode: multi_step
+  sampling_horizon: 1
+
+# ---------- evaluation ----------
+evaluation:
+  horizon: 12            # rollout horizon for comparison
+  n_windows: 4           # number of validation windows
+
+# ---------- misc ----------
+misc:
+  device: cpu
+  seed: 42

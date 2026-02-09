@@ -1,4 +1,12 @@
-"""Multi-environment rollout utilities for world model training."""
+"""Multi-environment rollout utilities for world model training.
+
+HOT PATH: This module contains performance-critical rollout code.
+Key optimizations applied:
+- Batched tensor operations instead of Python loops
+- Preallocated buffers for predictions
+- Single data conversion at batch boundaries
+- Vectorized padding operations
+"""
 
 from __future__ import annotations
 
@@ -10,6 +18,80 @@ import torch
 from ..data.dataset import GroupedTimeSeriesDataset
 from ..data.sampling import SamplingStrategy
 from ..models.base import WorldModelBase
+
+
+def _prepare_batch_data(
+    dataset: GroupedTimeSeriesDataset,
+    start_indices: np.ndarray,
+    horizons: np.ndarray,
+    warmup_len: int,
+    max_horizon: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Prepare batched data for rollout with a single conversion to tensors.
+    
+    HOT PATH: This function extracts data for all batch items at once,
+    avoiding per-item Python loops and tensor conversions.
+    
+    Parameters
+    ----------
+    dataset : GroupedTimeSeriesDataset
+        Dataset containing the time-series data.
+    start_indices : np.ndarray
+        Starting indices, shape (batch_size,).
+    horizons : np.ndarray
+        Horizon lengths, shape (batch_size,).
+    warmup_len : int
+        Length of warmup sequence.
+    max_horizon : int
+        Maximum horizon for padding.
+    device : torch.device
+        Target device for tensors.
+    
+    Returns
+    -------
+    dict
+        Dictionary with batched tensors ready for rollout.
+    """
+    batch_size = len(start_indices)
+    input_dim = len(dataset.in_idx)
+    output_dim = len(dataset.out_idx)
+    
+    # Preallocate numpy arrays for batch data (avoid list appends)
+    warmup_inputs = np.zeros((batch_size, warmup_len, input_dim), dtype=np.float32)
+    warmup_outputs = np.zeros((batch_size, warmup_len, output_dim), dtype=np.float32)
+    rollout_inputs = np.zeros((batch_size, max_horizon, input_dim), dtype=np.float32)
+    rollout_targets = np.zeros((batch_size, max_horizon, output_dim), dtype=np.float32)
+    
+    # Extract data for each batch item (unavoidable due to variable positions)
+    # But we do all numpy operations first, then a single tensor conversion
+    values = dataset.values
+    in_idx = dataset.in_idx
+    out_idx = dataset.out_idx
+    
+    for i in range(batch_size):
+        start_idx = int(start_indices[i])
+        horizon = int(horizons[i])
+        
+        # Warmup window: [start_idx - warmup_len : start_idx]
+        warmup_slice = values[start_idx - warmup_len : start_idx]
+        warmup_inputs[i] = warmup_slice[:, in_idx]
+        warmup_outputs[i] = warmup_slice[:, out_idx]
+        
+        # Rollout window: [start_idx : start_idx + horizon]
+        rollout_slice = values[start_idx : start_idx + horizon]
+        rollout_inputs[i, :horizon] = rollout_slice[:, in_idx]
+        rollout_targets[i, :horizon] = rollout_slice[:, out_idx]
+    
+    # Single batch conversion to tensors (Rule 7: avoid repeated conversions)
+    # Concatenate warmup inputs and outputs for world model format
+    warmup_full = np.concatenate([warmup_inputs, warmup_outputs], axis=-1)
+    
+    return {
+        "warmup_full": torch.from_numpy(warmup_full).to(device),
+        "rollout_inputs": torch.from_numpy(rollout_inputs).to(device),
+        "rollout_targets": torch.from_numpy(rollout_targets).to(device),
+    }
 
 
 def batch_rollout(
@@ -24,9 +106,11 @@ def batch_rollout(
 ) -> Dict[str, torch.Tensor]:
     """Perform batched multi-environment rollouts.
     
-    This function samples multiple starting points and horizons, then performs
-    rollouts in parallel. This is the core of the "see every possible path"
-    training approach.
+    HOT PATH: This function is called every training step.
+    Optimizations:
+    - Batch data preparation with single numpy->tensor conversion
+    - True batched rollout when horizons are uniform
+    - Minimized Python loop overhead
     
     Parameters
     ----------
@@ -63,76 +147,88 @@ def batch_rollout(
     """
     device = torch.device(device)
     batch_size = len(start_indices)
+    max_horizon = int(horizons.max())
     
-    predictions_list = []
-    targets_list = []
+    # Compute dimension info once (Rule 4: minimize repeated calls)
+    control_cols = dataset.groups.get("control", [])
+    exo_cols = dataset.groups.get("exogenous", [])
+    control_dim = len([c for c in dataset.input_cols if c in control_cols])
+    exo_dim = len([c for c in dataset.input_cols if c in exo_cols])
     
-    for i in range(batch_size):
-        start_idx = int(start_indices[i])
-        horizon = int(horizons[i])
+    if control_dim + exo_dim == 0:
+        control_dim = len(dataset.in_idx)
+        exo_dim = 0
+    
+    # Prepare batch data with single conversion (HOT PATH optimization)
+    batch_data = _prepare_batch_data(
+        dataset, start_indices, horizons, warmup_len, max_horizon, device
+    )
+    
+    warmup_full = batch_data["warmup_full"]  # (B, warmup_len, input+output)
+    rollout_inputs_all = batch_data["rollout_inputs"]  # (B, max_horizon, input)
+    rollout_targets_all = batch_data["rollout_targets"]  # (B, max_horizon, output)
+    
+    # Split rollout inputs into controls and exogenous
+    controls = rollout_inputs_all[:, :, :control_dim]  # (B, max_horizon, C)
+    if exo_dim > 0:
+        exogenous = rollout_inputs_all[:, :, control_dim:control_dim+exo_dim]
+    else:
+        exogenous = torch.zeros(batch_size, max_horizon, 0, device=device)
+    
+    # Check if all horizons are the same (enables true batched rollout)
+    uniform_horizon = (horizons == horizons[0]).all()
+    
+    if uniform_horizon:
+        # HOT PATH: True batched rollout - single model.rollout call
+        horizon = int(horizons[0])
+        targets_for_feedback = rollout_targets_all[:, :horizon] if feedback in ["teacher", "mixed"] else None
         
-        # Get warmup window
-        warmup_data = dataset.get_warmup_window(start_idx, warmup_len)
-        # For world models, concatenate inputs (control+exo) and outputs for full sequence
-        warmup_full = np.concatenate([
-            warmup_data["inputs"],
-            warmup_data["outputs"]
-        ], axis=-1)
-        warmup_inputs = torch.tensor(
-            warmup_full, dtype=torch.float32, device=device
-        ).unsqueeze(0)  # (1, warmup_len, control_dim+exo_dim+output_dim)
-        
-        # Get rollout data
-        rollout_data = dataset.get_rollout_slice(start_idx, horizon)
-        rollout_inputs_np = rollout_data["inputs"]  # (horizon, input_dim)
-        targets_np = rollout_data["targets"]  # (horizon, output_dim)
-        
-        # Split inputs into controls and exogenous
-        # For now, assume all inputs are controls+exogenous
-        # TODO: Make this more flexible based on dataset structure
-        control_dim = len([c for c in dataset.input_cols if c in dataset.groups.get("control", [])])
-        exo_dim = len([c for c in dataset.input_cols if c in dataset.groups.get("exogenous", [])])
-        
-        if control_dim + exo_dim == 0:
-            # Fallback: split evenly or use all as controls
-            control_dim = rollout_inputs_np.shape[-1]
-            exo_dim = 0
-        
-        controls = torch.tensor(
-            rollout_inputs_np[:, :control_dim], dtype=torch.float32, device=device
-        ).unsqueeze(0)  # (1, horizon, control_dim)
-        
-        if exo_dim > 0:
-            exogenous = torch.tensor(
-                rollout_inputs_np[:, control_dim:control_dim+exo_dim],
-                dtype=torch.float32, device=device
-            ).unsqueeze(0)  # (1, horizon, exo_dim)
-        else:
-            exogenous = torch.zeros(1, horizon, 0, device=device)
-        
-        targets = torch.tensor(
-            targets_np, dtype=torch.float32, device=device
-        ).unsqueeze(0)  # (1, horizon, output_dim)
-        
-        # Perform rollout
         rollout_result = model.rollout(
-            warmup_seq={"inputs": warmup_inputs},
-            rollout_inputs={"controls": controls, "exogenous": exogenous},
+            warmup_seq={"inputs": warmup_full},
+            rollout_inputs={"controls": controls[:, :horizon], "exogenous": exogenous[:, :horizon]},
             horizon=horizon,
             feedback=feedback,
             teacher_forcing_ratio=teacher_forcing_ratio,
-            targets=targets if feedback in ["teacher", "mixed"] else None,
+            targets=targets_for_feedback,
         )
         
-        predictions = rollout_result["predictions"].squeeze(0)  # (horizon, output_dim)
-        predictions_list.append(predictions)
-        targets_list.append(targets.squeeze(0))
+        predictions = rollout_result["predictions"]  # (B, horizon, output)
+        targets = rollout_targets_all[:, :horizon]
+        
+        # Convert to list format for compatibility (no copy, just views)
+        predictions_list = [predictions[i] for i in range(batch_size)]
+        targets_list = [targets[i] for i in range(batch_size)]
+    else:
+        # Variable horizons: need per-item rollouts (less common case)
+        predictions_list = []
+        targets_list = []
+        
+        for i in range(batch_size):
+            horizon = int(horizons[i])
+            
+            # Slice pre-prepared tensors (no conversion, just indexing)
+            warmup_i = warmup_full[i:i+1]  # (1, warmup_len, F)
+            controls_i = controls[i:i+1, :horizon]  # (1, horizon, C)
+            exogenous_i = exogenous[i:i+1, :horizon]  # (1, horizon, E)
+            targets_i = rollout_targets_all[i:i+1, :horizon]  # (1, horizon, O)
+            
+            rollout_result = model.rollout(
+                warmup_seq={"inputs": warmup_i},
+                rollout_inputs={"controls": controls_i, "exogenous": exogenous_i},
+                horizon=horizon,
+                feedback=feedback,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                targets=targets_i if feedback in ["teacher", "mixed"] else None,
+            )
+            
+            predictions_list.append(rollout_result["predictions"].squeeze(0))
+            targets_list.append(targets_i.squeeze(0))
     
     return {
         "predictions": predictions_list,
         "targets": targets_list,
-        "horizons": torch.tensor(horizons, dtype=torch.long),
-        "start_indices": torch.tensor(start_indices, dtype=torch.long),
+        "horizons": torch.as_tensor(horizons, dtype=torch.long, device=device),
+        "start_indices": torch.as_tensor(start_indices, dtype=torch.long, device=device),
     }
 
 
@@ -149,9 +245,11 @@ def batch_rollout_padded(
 ) -> Dict[str, torch.Tensor]:
     """Perform batched rollouts with padding to uniform horizon.
     
-    This is a convenience wrapper around batch_rollout that pads all
-    rollouts to the maximum horizon length. This makes it easier to
-    compute batched losses.
+    HOT PATH: This is called every training step.
+    Optimizations:
+    - Vectorized mask creation using torch.arange broadcasting
+    - Efficient padding using pre-allocated tensors
+    - Fast path for uniform horizons (no per-item loop)
     
     Parameters
     ----------
@@ -195,25 +293,41 @@ def batch_rollout_padded(
     batch_size = len(predictions_list)
     max_horizon = int(horizons.max())
     output_dim = predictions_list[0].shape[-1]
-    device = predictions_list[0].device
+    dev = predictions_list[0].device
     
-    # Create padded tensors
-    predictions_padded = torch.full(
-        (batch_size, max_horizon, output_dim),
-        pad_value, dtype=torch.float32, device=device
-    )
-    targets_padded = torch.full(
-        (batch_size, max_horizon, output_dim),
-        pad_value, dtype=torch.float32, device=device
-    )
-    mask = torch.zeros(batch_size, max_horizon, dtype=torch.bool, device=device)
+    # Check if all horizons are uniform (fast path)
+    uniform_horizon = (horizons == horizons[0]).all()
     
-    # Fill in actual values
-    for i in range(batch_size):
-        h = int(horizons[i])
-        predictions_padded[i, :h] = predictions_list[i]
-        targets_padded[i, :h] = targets_list[i]
-        mask[i, :h] = True
+    if uniform_horizon:
+        # HOT PATH: Fast path - just stack tensors (no padding needed)
+        predictions_padded = torch.stack(predictions_list, dim=0)
+        targets_padded = torch.stack(targets_list, dim=0)
+        mask = torch.ones(batch_size, max_horizon, dtype=torch.bool, device=dev)
+    else:
+        # Variable horizons: need padding
+        # Preallocate output tensors (Rule 5: no allocations in loop)
+        predictions_padded = torch.full(
+            (batch_size, max_horizon, output_dim),
+            pad_value, dtype=torch.float32, device=dev
+        )
+        targets_padded = torch.full(
+            (batch_size, max_horizon, output_dim),
+            pad_value, dtype=torch.float32, device=dev
+        )
+        
+        # Vectorized mask creation (Rule 2: no Python loops for data ops)
+        # mask[i, j] = True if j < horizons[i]
+        time_indices = torch.arange(max_horizon, device=dev).unsqueeze(0)  # (1, max_horizon)
+        horizon_expanded = horizons_tensor.unsqueeze(1)  # (batch_size, 1)
+        mask = time_indices < horizon_expanded  # (batch_size, max_horizon)
+        
+        # Fill in actual values using indexing
+        # This loop is unavoidable due to variable lengths, but we avoid
+        # creating new tensors inside - just assignment
+        for i in range(batch_size):
+            h = int(horizons[i])
+            predictions_padded[i, :h] = predictions_list[i]
+            targets_padded[i, :h] = targets_list[i]
     
     return {
         "predictions": predictions_padded,
