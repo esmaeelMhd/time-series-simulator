@@ -1,3 +1,9 @@
+# ─────────────────────────────────────────────────────────────────────
+#  base.yml  –  full training config
+#  Same structure as test_small.yml but with full data and more epochs.
+# ─────────────────────────────────────────────────────────────────────
+
+# ---------- dataset ----------
 dataset:
   name: myplant
   seq_len: 24
@@ -6,32 +12,70 @@ dataset:
   csv: datasets/wastewater.csv
   index_col: date
   variables:
-    control:   [IN_METAL_Q, T1_O2]      # C
-    exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]          # E
-    objective: [T1_PO4]           # O
+    control:   [IN_METAL_Q, T1_O2]
+    exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]
+    objective: [T1_PO4]
+  # no slice → use full dataset
 
-training:
-  epochs: 10
-  loss: mse
-  learning_rate: 0.001
-
-model:
-  type: lstm
-  d_model: 128
-  out_dim: 1
-  hidden_dim: 64
-  num_layers: 2
-
-misc:
-  device: cpu
-
+# ---------- model I/O ----------
 model_io:
   input_groups:  ["control", "exogenous"]
   output_groups: ["objective"]
 
-# Default retraining parameters
-retrain:
-  method: sepp        # v1, v2, or sepp
-  epochs: 3
-  sepp_h_max: 64      # max autoregressive horizon
-  sepp_stride: 12     # step between start indices 
+# ---------- models to compare ----------
+models:
+  - type: lstm
+    hidden_dim: 128
+    num_layers: 2
+  - type: dlinear
+    kernel_size: 25
+  - type: nlinear
+  - type: tft
+    hidden_dim: 64
+    n_heads: 4
+    num_lstm_layers: 2
+  - type: transformer
+    d_model: 128
+    nhead: 4
+    num_layers: 2
+  - type: xgboost
+    n_estimators: 200
+    max_depth: 6
+
+# ---------- training defaults ----------
+training:
+  epochs: 10
+  learning_rate: 0.001
+  warmup_len: 24
+  loss_type: mse
+  mode: multi_step
+  sampling_horizon: 12
+
+# ---------- training rounds ----------
+# Flexible: include only the rounds you need.
+#   train only   → keep only the "train" entry
+#   retrain only → keep only the "retrain" entry (+ optional checkpoint_dir)
+#   both         → keep both entries (train first, then retrain)
+#
+# For retrain-only from a previous run, add:
+#   checkpoint_dir: runs/myplant/compare_XXXXXXXX_XXXXXX
+training_rounds:
+  - name: train
+    epochs: 10
+    learning_rate: 0.001
+    models: [lstm, dlinear, nlinear, tft, transformer, xgboost]
+
+# ---------- evaluation ----------
+evaluation:
+  horizon: 24
+  n_windows: 8
+
+# ---------- simulation ----------
+simulation:
+  horizon: null           # null = use all available validation data
+  start_idx: 0
+
+# ---------- misc ----------
+misc:
+  device: cpu
+  seed: 42
