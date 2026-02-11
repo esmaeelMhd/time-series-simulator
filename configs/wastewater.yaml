@@ -1,25 +1,27 @@
 # ─────────────────────────────────────────────────────────────────────
-#  base.yml  –  full training config
-#  Same structure as test_small.yml but with full data and more epochs.
+#  wastewater.yaml  –  full config for wastewater treatment dataset
+#
+#  Extends default.yaml with dataset info, model definitions, and
+#  training rounds.  Override training/eval/sim/misc here as needed.
 # ─────────────────────────────────────────────────────────────────────
+_base: default.yaml
 
 # ---------- dataset ----------
 dataset:
-  name: myplant
-  seq_len: 24
-  pred_len: 1
-  batch_size: 32
+  name: wastewater
   csv: datasets/wastewater.csv
   index_col: date
+  seq_len: 24
+  pred_len: 12
+  batch_size: 32
   variables:
     control:   [IN_METAL_Q, T1_O2]
     exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]
     objective: [T1_PO4]
-  # no slice → use full dataset
 
 # ---------- model I/O ----------
 model_io:
-  input_groups:  ["control", "exogenous", "objective"]
+  input_groups: ["control", "exogenous"]
   output_groups: ["objective"]
 
 # ---------- models to compare ----------
@@ -42,41 +44,13 @@ models:
     n_estimators: 200
     max_depth: 6
 
-# ---------- training defaults ----------
-training:
-  epochs: 10
-  learning_rate: 0.001
-  warmup_len: 24
-  loss_type: mse
-  mode: multi_step
-  sampling_horizon: 12
-
 # ---------- training rounds ----------
-# Flexible: include only the rounds you need.
-#   train only   → keep only the "train" entry
-#   retrain only → keep only the "retrain" entry (+ optional checkpoint_dir)
-#   both         → keep both entries (train first, then retrain)
-#
-# For retrain-only from a previous run, add:
-#   checkpoint_dir: runs/myplant/compare_XXXXXXXX_XXXXXX
 training_rounds:
   - name: train
     epochs: 10
     learning_rate: 0.001
     models: [lstm, dlinear, nlinear, tft, transformer, xgboost]
-    
 
-# ---------- evaluation ----------
-evaluation:
-  horizon: 24
-  n_windows: 8
-
-# ---------- simulation ----------
-simulation:
-  horizon: null           # null = use all available validation data
-  start_idx: 0
-
-# ---------- misc ----------
-misc:
-  device: gpu
-  seed: 42
+# ---------- overrides ----------
+training:
+  sampling_horizon: 12

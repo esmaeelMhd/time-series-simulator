@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────
+#  wastewater.small.yaml  –  quick smoke-test variant
+#
+#  Extends wastewater.yaml with smaller data, fewer epochs, smaller
+#  models.  Same structure — just faster.
+# ─────────────────────────────────────────────────────────────────────
+_base: wastewater.yaml
+
+# ---------- dataset overrides ----------
+dataset:
+  batch_size: 16
+  pred_len: 1
+  slice:
+    first_n: 1000
+
+# ---------- smaller models ----------
+models:
+  - type: lstm
+    hidden_dim: 32
+    num_layers: 1
+  - type: dlinear
+    kernel_size: 13
+  - type: nlinear
+  - type: tft
+    hidden_dim: 32
+    n_heads: 4
+    num_lstm_layers: 1
+  - type: transformer
+    d_model: 32
+    nhead: 4
+    num_layers: 1
+  - type: xgboost
+    n_estimators: 50
+    max_depth: 4
+
+# ---------- training rounds ----------
+training_rounds:
+  - name: train
+    epochs: 3
+    learning_rate: 0.001
+    models: [lstm, dlinear, nlinear, tft, transformer, xgboost]
+  - name: retrain
+    epochs: 2
+    learning_rate: 0.0005
+    models: [lstm, transformer, xgboost]
+
+# ---------- overrides ----------
+training:
+  sampling_horizon: 1
+
+evaluation:
+  horizon: 12
+  n_windows: 4
+
+simulation:
+  horizon: 100
+  start_idx: 0
+
+model_io:
+  input_groups: ["control"]
+  output_groups: ["objective"]

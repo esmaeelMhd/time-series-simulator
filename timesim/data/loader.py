@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
@@ -90,7 +92,7 @@ def build_grouped_dataloaders(df: pd.DataFrame,
                               batch_size: int = 32,
                               train_split: float = 0.8,
                               device: str | torch.device = "cpu",
-                              existing_scaler = None) -> Tuple[DataLoader, DataLoader, 'MinMaxScaler']:
+                              existing_scaler = None) -> Tuple[DataLoader, DataLoader, object]:
     from .dataset import GroupedTimeSeriesDataset
     n_total = len(df)
     n_train = int(n_total * train_split)

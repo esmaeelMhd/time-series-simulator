@@ -31,6 +31,7 @@ XGBoost (sklearn-style):
 """
 
 from .base import WorldModelBase
+from .factory import build_model, count_parameters, NEURAL_MODELS
 from .lstm import LSTMWorldModel, SimpleLSTM
 from .transformer import SimpleTransformer, TransformerWorldModel
 from .dlinear import DLinear, DLinearWorldModel
@@ -155,6 +156,11 @@ __all__ = [
     # XGBoost (optional)
     "XGBoostForecaster",
     "XGBoostEnsemble",
+    
+    # Factory
+    "build_model",
+    "count_parameters",
+    "NEURAL_MODELS",
     
     # Utilities
     "get_model",

@@ -1,0 +1,123 @@
+# ─────────────────────────────────────────────────────────────────────
+#  default.yaml  –  shared defaults for ALL datasets
+#
+#  Dataset-specific configs extend this via  _base: default.yaml
+#  Every configurable parameter in the timesim package lives here
+#  with a sensible default.  Override only what you need in your
+#  dataset config.
+# ─────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+#  TRAINING
+# ══════════════════════════════════════════════════════════════════════
+training:
+  epochs: 10
+  learning_rate: 0.001
+  optimizer: adam                     # adam | sgd | adamw
+  warmup_len: 24                     # context / burn-in length for rollouts
+  sampling_horizon: 12               # horizon used by sampling strategy
+
+  # Loss
+  loss_type: mse                     # mse | mae | huber
+  loss_weighting: uniform            # uniform | linear | exponential
+  loss_weight_scale: 1.0             # scale factor for exponential weighting
+
+  # Training mode
+  mode: multi_step                   # multi_step | one_step | combined
+  one_step_weight: 0.5               # weight for one-step loss in combined mode
+  feedback: model                    # model | teacher | mixed
+  teacher_forcing_ratio: 0.0         # probability of teacher-forcing (0 = none)
+
+  # Early stopping
+  early_stopping: false
+  patience: 5
+  min_delta: 0.0                     # minimum improvement to reset patience
+
+# ══════════════════════════════════════════════════════════════════════
+#  DATA
+# ══════════════════════════════════════════════════════════════════════
+data:
+  train_split: 0.8
+  shuffle_train: true
+  drop_last: true
+  scale: true                        # apply MinMaxScaler
+  add_time_features: false           # append time-based features
+  index_col: date                    # name of datetime index column
+  parse_dates: true
+
+# ══════════════════════════════════════════════════════════════════════
+#  EVALUATION
+# ══════════════════════════════════════════════════════════════════════
+evaluation:
+  horizon: 24                        # rollout evaluation horizon
+  n_windows: 8                       # number of validation windows
+
+# ══════════════════════════════════════════════════════════════════════
+#  SIMULATION  (recursive step-by-step)
+# ══════════════════════════════════════════════════════════════════════
+simulation:
+  horizon: null                      # null → use all available val data
+  start_idx: 0
+
+# ══════════════════════════════════════════════════════════════════════
+#  MODEL DEFAULTS  (fallbacks when not overridden per-model)
+# ══════════════════════════════════════════════════════════════════════
+model_defaults:
+  lstm:
+    hidden_dim: 64
+    num_layers: 2
+    dropout: 0.0
+  dlinear:
+    kernel_size: 25
+    individual: false
+  nlinear:
+    individual: false
+  tft:
+    hidden_dim: 64
+    n_heads: 4
+    num_lstm_layers: 2
+    dropout: 0.1
+  transformer:
+    d_model: 64
+    nhead: 4
+    num_layers: 2
+    dim_feedforward: 128
+    dropout: 0.1
+  xgboost:
+    n_estimators: 100
+    max_depth: 6
+    learning_rate: 0.1
+    n_jobs: -1
+    early_stopping_rounds: 10
+    objective: "reg:squarederror"
+
+# ══════════════════════════════════════════════════════════════════════
+#  PLOTTING
+# ══════════════════════════════════════════════════════════════════════
+plotting:
+  style: "seaborn-v0_8-whitegrid"
+  dpi: 150
+  font_size: 10
+  legend_font_size: 9
+  model_colors:
+    - "#2E86AB"
+    - "#E94F37"
+    - "#2CA58D"
+    - "#F18F01"
+    - "#A23B72"
+    - "#84BC9C"
+    - "#BC5D2E"
+    - "#6F2DBD"
+
+# ══════════════════════════════════════════════════════════════════════
+#  OUTPUT
+# ══════════════════════════════════════════════════════════════════════
+output:
+  runs_dir: runs                     # base directory for all run artifacts
+
+# ══════════════════════════════════════════════════════════════════════
+#  MISC
+# ══════════════════════════════════════════════════════════════════════
+misc:
+  device: cpu
+  seed: 42
