@@ -11,7 +11,7 @@
 #  TRAINING
 # ══════════════════════════════════════════════════════════════════════
 training:
-  epochs: 10
+  epochs: 50
   learning_rate: 0.001
   optimizer: adam                     # adam | sgd | adamw
   warmup_len: 24                     # context / burn-in length for rollouts
@@ -29,9 +29,9 @@ training:
   teacher_forcing_ratio: 0.0         # probability of teacher-forcing (0 = none)
 
   # Early stopping
-  early_stopping: false
+  early_stopping: true
   patience: 5
-  min_delta: 0.0                     # minimum improvement to reset patience
+  min_delta: 0.001                     # minimum improvement to reset patience
 
 # ══════════════════════════════════════════════════════════════════════
 #  DATA
@@ -49,8 +49,8 @@ data:
 #  EVALUATION
 # ══════════════════════════════════════════════════════════════════════
 evaluation:
-  horizon: 24                        # rollout evaluation horizon
-  n_windows: 8                       # number of validation windows
+  horizon: 180                        # rollout evaluation horizon
+  n_windows: 8                        # number of validation windows
 
 # ══════════════════════════════════════════════════════════════════════
 #  SIMULATION  (recursive step-by-step)
