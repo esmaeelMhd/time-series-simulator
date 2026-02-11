@@ -228,6 +228,10 @@ def main():
         for rc in training_rounds:
             if "models" not in rc:
                 rc["models"] = model_names
+        # CLI override: --models applies to every round
+        if args.models:
+            for rc in training_rounds:
+                rc["models"] = model_names
 
     # ── Print banner ──────────────────────────────────────────────────
     round_desc = " → ".join(rc.get("name", "?") for rc in training_rounds)
