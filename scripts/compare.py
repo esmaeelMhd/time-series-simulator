@@ -157,7 +157,9 @@ def main():
 
     seq_len = config["dataset"]["seq_len"]
     pred_len = config["dataset"]["pred_len"]
-    input_dim = len(input_cols) + len(output_cols)
+    # Use union to avoid double-counting when output_cols are in input_groups
+    all_input_features = set(input_cols) | set(output_cols)
+    input_dim = len(all_input_features)
     output_dim = len(output_cols)
 
     control_cols = groups.get("control", [])

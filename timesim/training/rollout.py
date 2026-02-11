@@ -57,9 +57,19 @@ def _prepare_batch_data(
     input_dim = len(dataset.in_idx)
     output_dim = len(dataset.out_idx)
     
+    # Determine which output indices are NOT already covered by input indices.
+    # When output_groups overlap with input_groups (e.g. "objective" in both),
+    # out_idx entries already appear in in_idx.  We must NOT duplicate them in
+    # warmup_full, otherwise the tensor dimension won't match the model's
+    # input_dim (= len(union(in_idx, out_idx))).
+    in_idx_set = set(dataset.in_idx)
+    extra_out_idx = [idx for idx in dataset.out_idx if idx not in in_idx_set]
+    extra_out_dim = len(extra_out_idx)
+    
     # Preallocate numpy arrays for batch data (avoid list appends)
     warmup_inputs = np.zeros((batch_size, warmup_len, input_dim), dtype=np.float32)
-    warmup_outputs = np.zeros((batch_size, warmup_len, output_dim), dtype=np.float32)
+    if extra_out_dim > 0:
+        warmup_extra_out = np.zeros((batch_size, warmup_len, extra_out_dim), dtype=np.float32)
     rollout_inputs = np.zeros((batch_size, max_horizon, input_dim), dtype=np.float32)
     rollout_targets = np.zeros((batch_size, max_horizon, output_dim), dtype=np.float32)
     
@@ -76,7 +86,8 @@ def _prepare_batch_data(
         # Warmup window: [start_idx - warmup_len : start_idx]
         warmup_slice = values[start_idx - warmup_len : start_idx]
         warmup_inputs[i] = warmup_slice[:, in_idx]
-        warmup_outputs[i] = warmup_slice[:, out_idx]
+        if extra_out_dim > 0:
+            warmup_extra_out[i] = warmup_slice[:, extra_out_idx]
         
         # Rollout window: [start_idx : start_idx + horizon]
         rollout_slice = values[start_idx : start_idx + horizon]
@@ -84,8 +95,12 @@ def _prepare_batch_data(
         rollout_targets[i, :horizon] = rollout_slice[:, out_idx]
     
     # Single batch conversion to tensors (Rule 7: avoid repeated conversions)
-    # Concatenate warmup inputs and outputs for world model format
-    warmup_full = np.concatenate([warmup_inputs, warmup_outputs], axis=-1)
+    # Build warmup_full: input columns + any output columns not already in inputs.
+    # This ensures warmup_full dim == model's input_dim == len(union(in_idx, out_idx))
+    if extra_out_dim > 0:
+        warmup_full = np.concatenate([warmup_inputs, warmup_extra_out], axis=-1)
+    else:
+        warmup_full = warmup_inputs
     
     return {
         "warmup_full": torch.from_numpy(warmup_full).to(device),
@@ -164,7 +179,7 @@ def batch_rollout(
         dataset, start_indices, horizons, warmup_len, max_horizon, device
     )
     
-    warmup_full = batch_data["warmup_full"]  # (B, warmup_len, input+output)
+    warmup_full = batch_data["warmup_full"]  # (B, warmup_len, model_input_dim)
     rollout_inputs_all = batch_data["rollout_inputs"]  # (B, max_horizon, input)
     rollout_targets_all = batch_data["rollout_targets"]  # (B, max_horizon, output)
     

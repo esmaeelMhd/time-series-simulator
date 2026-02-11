@@ -91,11 +91,17 @@ def evaluate_neural_model(
             horizon_data = val_data[warmup_end:horizon_end]
 
             warmup_inputs = warmup_data[:, val_dataset.in_idx]
-            warmup_outputs = warmup_data[:, val_dataset.out_idx]
             horizon_inputs = horizon_data[:, val_dataset.in_idx]
             horizon_outputs = horizon_data[:, val_dataset.out_idx]
 
-            warmup_full = np.concatenate([warmup_inputs, warmup_outputs], axis=-1)
+            # Only append output columns not already in input columns
+            in_idx_set = set(val_dataset.in_idx)
+            extra_out_idx = [i for i in val_dataset.out_idx if i not in in_idx_set]
+            if extra_out_idx:
+                extra_out = warmup_data[:, extra_out_idx]
+                warmup_full = np.concatenate([warmup_inputs, extra_out], axis=-1)
+            else:
+                warmup_full = warmup_inputs
             warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
 
             controls_np = horizon_inputs[:, :control_dim]
@@ -194,12 +200,19 @@ def simulate_recursive_neural(
     predictions = np.zeros((sim_horizon, output_dim), dtype=np.float32)
     ground_truths = np.zeros((sim_horizon, output_dim), dtype=np.float32)
 
+    # Only append output columns not already in input columns
+    in_idx_set = set(in_idx)
+    extra_out_idx = [i for i in out_idx if i not in in_idx_set]
+
     with torch.no_grad():
         for t in range(sim_horizon):
             real_idx = start_idx + seq_len + t
             input_feats = window[:, in_idx]
-            output_feats = window[:, out_idx]
-            full_input = np.concatenate([input_feats, output_feats], axis=-1)
+            if extra_out_idx:
+                extra_out = window[:, extra_out_idx]
+                full_input = np.concatenate([input_feats, extra_out], axis=-1)
+            else:
+                full_input = input_feats
 
             x = torch.from_numpy(full_input).float().unsqueeze(0).to(device)
             pred = model.forward(x)
