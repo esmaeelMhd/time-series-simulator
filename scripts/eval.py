@@ -160,6 +160,9 @@ def main():
     plot_cfg = config.get("plotting", {})
     output_cfg = config.get("output", {})
     runs_dir = Path(output_cfg.get("runs_dir", "runs"))
+    run_name = output_cfg.get("run_name", None)
+    if isinstance(run_name, str):
+        run_name = run_name.strip() or None
 
     # ── Dimensions ────────────────────────────────────────────────────
     groups = config["dataset"]["variables"]
@@ -199,6 +202,8 @@ def main():
     # ── Locate model directory & checkpoint ───────────────────────────
     dataset_name = config["dataset"]["name"]
     run_dir = runs_dir / dataset_name
+    if run_name is not None:
+        run_dir = run_dir / run_name
     model_dir = run_dir / model_type
 
     if not model_dir.exists():

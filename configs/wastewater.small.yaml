@@ -6,6 +6,11 @@
 # ─────────────────────────────────────────────────────────────────────
 _base: wastewater.yaml
 
+# ---------- output ----------
+output:
+  runs_dir: runs
+  run_name: small
+
 # ---------- dataset overrides ----------
 dataset:
   batch_size: 16
@@ -46,7 +51,9 @@ training_rounds:
 
 # ---------- overrides ----------
 training:
-  sampling_horizon: 1
+  sampling:
+    horizon: 12                       # for random_fixed / daily_fixed
+
 
 evaluation:
   horizon: 12
@@ -59,3 +66,7 @@ simulation:
 model_io:
   input_groups: ["control"]
   output_groups: ["objective"]
+
+# ---------- misc ---------------
+misc:
+  device: cpu

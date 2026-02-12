@@ -51,6 +51,10 @@ class WorldModelTrainer:
         Number of rollouts per training batch.
     loss_type : {"mse", "mae", "huber"}, default "mse"
         Base loss function type.
+    loss_weighting : {"uniform", "linear", "exponential"}, default "uniform"
+        Time-step weighting scheme for multi-step loss.
+    loss_weight_scale : float, default 1.0
+        Scale factor for weighted multi-step losses.
     training_mode : {"multi_step", "one_step", "combined"}, default "multi_step"
         Training mode:
         - "multi_step": Pure autoregressive rollout loss
@@ -73,6 +77,8 @@ class WorldModelTrainer:
         Whether to use early stopping.
     patience : int, default 5
         Patience for early stopping.
+    min_delta : float, default 0.0
+        Minimum validation improvement to reset early-stopping patience.
     run_dir : str or Path, optional
         Directory for saving outputs and logs.
     writer : SummaryWriter, optional
@@ -88,6 +94,8 @@ class WorldModelTrainer:
         warmup_len: int = 24,
         batch_size: int = 32,
         loss_type: Literal["mse", "mae", "huber"] = "mse",
+        loss_weighting: Literal["uniform", "linear", "exponential"] = "uniform",
+        loss_weight_scale: float = 1.0,
         training_mode: Literal["multi_step", "one_step", "combined"] = "multi_step",
         feedback: Literal["model", "teacher", "mixed"] = "model",
         teacher_forcing_ratio: float = 0.0,
@@ -97,6 +105,7 @@ class WorldModelTrainer:
         use_gpu: bool = False,
         early_stopping: bool = False,
         patience: int = 5,
+        min_delta: float = 0.0,
         run_dir: Optional[str | Path] = None,
         writer: Optional["SummaryWriter"] = None,
     ):
@@ -134,15 +143,26 @@ class WorldModelTrainer:
         if training_mode == "one_step":
             self.loss_fn = OneStepLoss(loss_type=loss_type)
         elif training_mode == "multi_step":
-            self.loss_fn = MultiStepLoss(loss_type=loss_type)
+            self.loss_fn = MultiStepLoss(
+                loss_type=loss_type,
+                weighting=loss_weighting,
+                weight_scale=loss_weight_scale,
+            )
         elif training_mode == "combined":
             self.loss_fn = CombinedLoss(
                 one_step_weight=one_step_weight,
                 multi_step_weight=1.0 - one_step_weight,
                 loss_type=loss_type,
+                multi_step_weighting=loss_weighting,
+                multi_step_weight_scale=loss_weight_scale,
             )
         else:
             raise ValueError(f"Unknown training mode: {training_mode}")
+        self._val_multi_step_loss = MultiStepLoss(
+            loss_type=loss_type,
+            weighting=loss_weighting,
+            weight_scale=loss_weight_scale,
+        )
         
         # Optimizer
         if optimizer is None:
@@ -151,7 +171,10 @@ class WorldModelTrainer:
             self.optimizer = optimizer
         
         # Early stopping
-        self.early_stopping = EarlyStopping(patience=patience) if early_stopping else None
+        self.early_stopping = (
+            EarlyStopping(patience=patience, min_delta=min_delta)
+            if early_stopping else None
+        )
         
         # Logging
         self.run_dir = Path(run_dir) if run_dir else None
@@ -293,8 +316,7 @@ class WorldModelTrainer:
             # Compute loss
             if self.training_mode == "combined":
                 # For validation, just use multi-step loss
-                loss_fn = MultiStepLoss(loss_type="mse")
-                loss = loss_fn(predictions_masked, targets_masked)
+                loss = self._val_multi_step_loss(predictions_masked, targets_masked)
             else:
                 loss = self.loss_fn(predictions_masked, targets_masked)
             
@@ -608,4 +630,3 @@ class Trainer(nn.Module):
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.to(self.device)
         self.model.eval()
-

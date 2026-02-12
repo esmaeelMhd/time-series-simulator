@@ -199,6 +199,8 @@ class CombinedLoss(nn.Module):
         Base loss function type.
     multi_step_weighting : {"uniform", "linear", "exponential"}
         Weighting scheme for multi-step loss.
+    multi_step_weight_scale : float, default 1.0
+        Scale factor for the multi-step weighting scheme.
     """
     
     def __init__(
@@ -207,6 +209,7 @@ class CombinedLoss(nn.Module):
         multi_step_weight: float = 0.5,
         loss_type: Literal["mse", "mae", "huber"] = "mse",
         multi_step_weighting: Literal["uniform", "linear", "exponential"] = "uniform",
+        multi_step_weight_scale: float = 1.0,
     ):
         super().__init__()
         self.one_step_weight = one_step_weight
@@ -216,6 +219,7 @@ class CombinedLoss(nn.Module):
         self.multi_step_loss = MultiStepLoss(
             loss_type=loss_type,
             weighting=multi_step_weighting,
+            weight_scale=multi_step_weight_scale,
         )
     
     def forward(
@@ -311,4 +315,3 @@ def dilate_loss(
     loss = alpha * loss_shape + (1 - alpha) * (loss_temporal + gamma)
     
     return loss, loss_shape, loss_temporal
-

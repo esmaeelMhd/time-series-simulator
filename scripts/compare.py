@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Compare trained world models (no training -- evaluation and plotting only).
 
-Loads saved checkpoints and scalers from ``<runs_dir>/<dataset>/``, runs
+Loads saved checkpoints and scalers from ``<runs_dir>/<dataset>[/<run_name>]/``, runs
 evaluation and recursive simulation on every available checkpoint,
 and produces:
 
-- Per-model outputs in ``<runs_dir>/<dataset>/<model>/``:
+- Per-model outputs in ``<runs_dir>/<dataset>[/<run_name>]/<model>/``:
   ``<round>_forecast.png``, ``<round>_simulation.png/.csv``
 
-- Cross-model comparisons in ``<runs_dir>/<dataset>/figures/``:
+- Cross-model comparisons in ``<runs_dir>/<dataset>[/<run_name>]/figures/``:
   ``comparison_forecast.png``, ``comparison_losses.png``,
   ``comparison_metrics.png``, ``simulation_trajectory.png``,
   ``comparison_results.csv``, ``simulation_metrics.csv``
@@ -135,6 +135,9 @@ def main():
     plot_cfg = config.get("plotting", {})
     output_cfg = config.get("output", {})
     runs_dir = Path(output_cfg.get("runs_dir", "runs"))
+    run_name = output_cfg.get("run_name", None)
+    if isinstance(run_name, str):
+        run_name = run_name.strip() or None
 
     # ── Model info ────────────────────────────────────────────────────
     models_cfg_list = config.get("models", [])
@@ -177,6 +180,8 @@ def main():
     # ── Run directory ─────────────────────────────────────────────────
     dataset_name = config["dataset"]["name"]
     run_dir = runs_dir / dataset_name
+    if run_name is not None:
+        run_dir = run_dir / run_name
     figs_dir = run_dir / "figures"
     figs_dir.mkdir(parents=True, exist_ok=True)
 

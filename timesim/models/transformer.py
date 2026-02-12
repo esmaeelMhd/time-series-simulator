@@ -179,16 +179,33 @@ class TransformerWorldModel(WorldModelBase):
         # Predict from current state
         pred = self.model(state)[:, 0, :]  # Take first prediction step
 
-        # Build next input from control + exo + output feedback
-        if prev_output_t is not None:
-            next_input = torch.cat([control_t, exo_t, prev_output_t], dim=-1)
-        else:
-            next_input = torch.cat([control_t, exo_t, pred], dim=-1)
+        # Sliding-window update uses current prediction as next output features.
+        # Teacher/mixed corrections are applied in rollout().
+        next_input = torch.cat([control_t, exo_t, pred], dim=-1)
 
         # Update state by sliding window
         new_state = torch.cat([state[:, 1:, :], next_input.unsqueeze(1)], dim=1)
 
         return new_state, pred
+
+    def rollout(
+        self,
+        warmup_seq: Dict[str, torch.Tensor],
+        rollout_inputs: Dict[str, torch.Tensor],
+        horizon: int,
+        feedback: Literal["model", "teacher", "mixed"] = "model",
+        teacher_forcing_ratio: float = 0.0,
+        targets: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Windowed rollout with aligned state updates."""
+        return self._rollout_windowed_feedback(
+            warmup_seq=warmup_seq,
+            rollout_inputs=rollout_inputs,
+            horizon=horizon,
+            feedback=feedback,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            targets=targets,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard forward pass for compatibility.
@@ -203,4 +220,4 @@ class TransformerWorldModel(WorldModelBase):
         torch.Tensor
             Predictions of shape (batch, pred_len, output_dim).
         """
-        return self.model(x) 
+        return self.model(x)

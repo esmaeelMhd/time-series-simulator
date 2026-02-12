@@ -4,9 +4,9 @@
 Trains all models defined in the config using the training_rounds approach.
 Supports train-only, retrain-only (with checkpoint_dir), or both.
 
-Outputs are saved to ``<runs_dir>/<dataset>/<model>/`` with round-prefixed
+Outputs are saved to ``<runs_dir>/<dataset>[/<run_name>]/<model>/`` with round-prefixed
 artifact names (``train_checkpoint.pth``, ``retrain_loss.png``, etc.).
-The scaler is saved at ``<runs_dir>/<dataset>/scaler.pkl`` for reuse by
+The scaler is saved at ``<runs_dir>/<dataset>[/<run_name>]/scaler.pkl`` for reuse by
 ``compare.py`` or any evaluation script.
 
 Usage:
@@ -30,7 +30,13 @@ matplotlib.use("Agg")
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
-from timesim.data.sampling import RandomStartFixedHorizon
+from timesim.data.sampling import (
+    RandomStartFixedHorizon,
+    RandomStartRandomHorizon,
+    DailyFixedHorizon,
+    GeometricHorizonSampling,
+    StrideBasedSampling,
+)
 from timesim.training import WorldModelTrainer
 from timesim.utils.plotting import save_loss_plot, save_forecast_plot
 from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
@@ -58,6 +64,63 @@ except ImportError:
 # Training helpers
 # ─────────────────────────────────────────────────────────────────────
 
+def build_sampling_strategy(config, pred_len):
+    """Build sampling strategy from training config."""
+    tcfg = config["training"]
+    dcfg = config["dataset"]
+    scfg = tcfg.get("sampling", {})
+
+    strategy_name = str(
+        scfg.get("strategy", tcfg.get("sampling_strategy", "random_fixed"))
+    ).lower()
+
+    # Backward-compatible path for existing configs
+    legacy_horizon = int(tcfg.get("sampling_horizon", pred_len))
+
+    if strategy_name in {"random_fixed", "fixed"}:
+        horizon = int(scfg.get("horizon", legacy_horizon))
+        return RandomStartFixedHorizon(horizon=horizon), f"random_fixed(horizon={horizon})"
+
+    if strategy_name in {"random_random", "random"}:
+        h_min = int(scfg.get("h_min", 1))
+        h_max = int(scfg.get("h_max", legacy_horizon))
+        return RandomStartRandomHorizon(h_min=h_min, h_max=h_max), (
+            f"random_random(h_min={h_min}, h_max={h_max})"
+        )
+
+    if strategy_name in {"geometric", "geometric_horizon"}:
+        h_max = int(scfg.get("h_max", legacy_horizon))
+        return GeometricHorizonSampling(pred_len=pred_len, h_max=h_max), (
+            f"geometric(pred_len={pred_len}, h_max={h_max})"
+        )
+
+    if strategy_name in {"daily_fixed", "daily"}:
+        start_hour = int(scfg.get("start_hour", 0))
+        horizon = int(scfg.get("horizon", legacy_horizon))
+        samples_per_hour = int(scfg.get("samples_per_hour", dcfg.get("samples_per_hour", 1)))
+        return DailyFixedHorizon(
+            start_hour=start_hour,
+            horizon=horizon,
+            samples_per_hour=samples_per_hour,
+        ), (
+            "daily_fixed("
+            f"start_hour={start_hour}, horizon={horizon}, "
+            f"samples_per_hour={samples_per_hour})"
+        )
+
+    if strategy_name in {"stride", "stride_based"}:
+        stride = int(scfg.get("stride", 12))
+        h_max = int(scfg.get("h_max", legacy_horizon))
+        return StrideBasedSampling(stride=stride, h_max=h_max), (
+            f"stride(stride={stride}, h_max={h_max})"
+        )
+
+    raise ValueError(
+        f"Unknown sampling strategy '{strategy_name}'. "
+        "Use one of: random_fixed, random_random, geometric, daily_fixed, stride"
+    )
+
+
 def train_neural_model(model, train_dataset, val_dataset, config, device,
                        model_dir, lr_override=None, epochs_override=None):
     """Train a neural WorldModel. Returns (train_losses, val_losses)."""
@@ -70,9 +133,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     batch_size = config["dataset"]["batch_size"]
     lr = lr_override or tcfg.get("learning_rate", 1e-3)
     warmup_len = tcfg.get("warmup_len", seq_len)
-    sampling_horizon = tcfg.get("sampling_horizon", pred_len)
-
-    sampling = RandomStartFixedHorizon(horizon=sampling_horizon)
+    sampling, sampling_desc = build_sampling_strategy(config, pred_len)
 
     # Optimizer
     opt_name = tcfg.get("optimizer", "adam").lower()
@@ -83,6 +144,8 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    print(f"  Sampling strategy: {sampling_desc}")
+
     trainer = WorldModelTrainer(
         model=model,
         dataset=train_dataset,
@@ -91,11 +154,17 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         warmup_len=warmup_len,
         batch_size=batch_size,
         loss_type=tcfg.get("loss_type", "mse"),
+        loss_weighting=tcfg.get("loss_weighting", "uniform"),
+        loss_weight_scale=tcfg.get("loss_weight_scale", 1.0),
         training_mode=tcfg.get("mode", "multi_step"),
         feedback=tcfg.get("feedback", "model"),
         teacher_forcing_ratio=tcfg.get("teacher_forcing_ratio", 0.0),
+        one_step_weight=tcfg.get("one_step_weight", 0.5),
         optimizer=optimizer,
         device=device,
+        early_stopping=tcfg.get("early_stopping", False),
+        patience=tcfg.get("patience", 5),
+        min_delta=tcfg.get("min_delta", 0.0),
         run_dir=model_dir,
     )
 
@@ -191,6 +260,9 @@ def main():
     plot_cfg = config.get("plotting", {})
     output_cfg = config.get("output", {})
     runs_dir = Path(output_cfg.get("runs_dir", "runs"))
+    run_name = output_cfg.get("run_name", None)
+    if isinstance(run_name, str):
+        run_name = run_name.strip() or None
 
     # ── Determine models ──────────────────────────────────────────────
     models_cfg_list = config.get("models", [])
@@ -248,6 +320,7 @@ def main():
     print(f"  Output cols  : {output_cols}")
     print(f"  input_dim={input_dim}  output_dim={output_dim}")
     print(f"  seq_len={seq_len}  pred_len={pred_len}")
+    print(f"  Run name     : {run_name if run_name is not None else '(default)'}")
     print("=" * 70 + "\n")
 
     # ── Eval / simulation dimensions ──────────────────────────────────
@@ -266,6 +339,8 @@ def main():
     # ── Output directory ──────────────────────────────────────────────
     dataset_name = config["dataset"]["name"]
     out_dir = runs_dir / dataset_name
+    if run_name is not None:
+        out_dir = out_dir / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Save resolved config

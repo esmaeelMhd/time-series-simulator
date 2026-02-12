@@ -15,7 +15,16 @@ training:
   learning_rate: 0.001
   optimizer: adam                     # adam | sgd | adamw
   warmup_len: 24                     # context / burn-in length for rollouts
-  sampling_horizon: 12               # horizon used by sampling strategy
+  sampling_strategy: random_fixed    # random_fixed | random_random | geometric | daily_fixed | stride
+  sampling_horizon: 12               # backward-compatible alias for fixed-horizon sampling
+  sampling:
+    strategy: random_fixed
+    horizon: 12                      # for random_fixed / daily_fixed
+    h_min: 1                         # for random_random
+    h_max: 24                        # for random_random / geometric / stride
+    stride: 12                       # for stride
+    start_hour: 0                    # for daily_fixed
+    samples_per_hour: 1              # for daily_fixed (e.g., 30 for 2-min data)
 
   # Loss
   loss_type: mse                     # mse | mae | huber
@@ -114,6 +123,7 @@ plotting:
 # ══════════════════════════════════════════════════════════════════════
 output:
   runs_dir: runs                     # base directory for all run artifacts
+  run_name: null                     # optional subfolder under runs/<dataset>/
 
 # ══════════════════════════════════════════════════════════════════════
 #  MISC
