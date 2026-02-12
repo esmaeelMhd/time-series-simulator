@@ -54,3 +54,7 @@ training_rounds:
 # ---------- overrides ----------
 training:
   sampling_horizon: 12
+
+# ---------- misc ---------------
+misc:
+  device: cuda
