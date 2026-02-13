@@ -32,8 +32,9 @@ model_io:
 # ---------- models to compare ----------
 models:
   - type: lstm
-    hidden_dim: 128
-    num_layers: 2
+    hidden_dim: 32
+    num_layers: 1
+    dropout: 0.3
   - type: dlinear
     kernel_size: 25
   - type: nlinear
