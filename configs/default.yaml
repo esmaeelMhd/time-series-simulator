@@ -44,6 +44,18 @@ training:
   min_delta: 0.001                     # minimum improvement to reset patience
 
 # ══════════════════════════════════════════════════════════════════════
+#  OPTIMIZATION (Optuna)
+# ══════════════════════════════════════════════════════════════════════
+optimization:
+  n_trials: 30                       # Optuna trials per model
+  timeout: null                      # seconds per model; null = no timeout
+  epochs: 5                          # training epochs per trial
+  steps_per_epoch: 200               # null -> auto; set int for fast tuning
+  direction: minimize                # minimize validation loss
+  seed: 42
+  models: null                       # null -> use config.models list
+
+# ══════════════════════════════════════════════════════════════════════
 #  DATA
 # ══════════════════════════════════════════════════════════════════════
 data:
