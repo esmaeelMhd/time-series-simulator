@@ -12,6 +12,7 @@
 # ══════════════════════════════════════════════════════════════════════
 training:
   epochs: 50
+  steps_per_epoch: null              # null => auto from dataset size; set int to cap epoch cost
   learning_rate: 0.001
   optimizer: adam                     # adam | sgd | adamw
   warmup_len: 24                     # context / burn-in length for rollouts

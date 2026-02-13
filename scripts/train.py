@@ -122,7 +122,8 @@ def build_sampling_strategy(config, pred_len):
 
 
 def train_neural_model(model, train_dataset, val_dataset, config, device,
-                       model_dir, lr_override=None, epochs_override=None):
+                       model_dir, lr_override=None, epochs_override=None,
+                       steps_per_epoch_override=None):
     """Train a neural WorldModel. Returns (train_losses, val_losses)."""
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -130,6 +131,11 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     pred_len = config["dataset"]["pred_len"]
     tcfg = config["training"]
     epochs = epochs_override or tcfg["epochs"]
+    steps_per_epoch = (
+        steps_per_epoch_override
+        if steps_per_epoch_override is not None
+        else tcfg.get("steps_per_epoch", None)
+    )
     batch_size = config["dataset"]["batch_size"]
     lr = lr_override or tcfg.get("learning_rate", 1e-3)
     warmup_len = tcfg.get("warmup_len", seq_len)
@@ -168,7 +174,11 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         run_dir=model_dir,
     )
 
-    train_losses, val_losses = trainer.fit(epochs=epochs, verbose=True)
+    train_losses, val_losses = trainer.fit(
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        verbose=True,
+    )
     return train_losses, val_losses
 
 
@@ -229,6 +239,8 @@ def parse_args():
                         help="Override: train only these model types")
     parser.add_argument("--epochs", type=int,
                         help="Override epochs for all rounds")
+    parser.add_argument("--steps-per-epoch", type=int,
+                        help="Override steps per epoch for all rounds")
     parser.add_argument("--device", type=str,
                         help="Override device (cpu / cuda)")
     return parser.parse_args()
@@ -398,16 +410,23 @@ def main():
         round_epochs = round_cfg.get("epochs", config["training"]["epochs"])
         round_lr = round_cfg.get("learning_rate",
                                  config["training"].get("learning_rate", 1e-3))
+        round_steps_per_epoch = round_cfg.get(
+            "steps_per_epoch",
+            config["training"].get("steps_per_epoch", None)
+        )
         round_model_types = round_cfg.get("models", model_names)
         checkpoint_dir = round_cfg.get("checkpoint_dir", None)
 
         # Apply --epochs CLI override to every round
         if args.epochs:
             round_epochs = args.epochs
+        if args.steps_per_epoch is not None:
+            round_steps_per_epoch = args.steps_per_epoch
 
         print(f"\n{'═' * 70}")
         print(f"  ROUND: {round_name.upper()} "
               f"({round_epochs} epochs, LR={round_lr})")
+        print(f"  Steps/epoch: {round_steps_per_epoch if round_steps_per_epoch is not None else 'auto'}")
         print(f"  Models: {round_model_types}")
         if checkpoint_dir:
             print(f"  Loading checkpoints from: {checkpoint_dir}")
@@ -472,6 +491,7 @@ def main():
                         model_dir,
                         lr_override=round_lr,
                         epochs_override=round_epochs,
+                        steps_per_epoch_override=round_steps_per_epoch,
                     )
                     torch.save(model.state_dict(),
                                model_dir / f"{round_name}_checkpoint.pth")
