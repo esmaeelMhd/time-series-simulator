@@ -2,6 +2,7 @@
 numpy
 pandas
 torch>=1.13
+optuna>=3.5
 
 # Configuration
 omegaconf

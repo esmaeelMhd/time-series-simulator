@@ -17,6 +17,7 @@ else:
         "numpy",
         "pandas",
         "torch>=1.13",
+        "optuna>=3.5",
         "omegaconf",
         "matplotlib>=3.7",
         "scikit-learn>=1.3",
@@ -64,7 +65,7 @@ setup(
         "console_scripts": [
             "timesim-train=timesim.cli.train:main",
             "timesim-retrain=timesim.cli.retrain:main",
+            "timesim-optimize=timesim.cli.optimize:main",
         ],
     },
 )
-

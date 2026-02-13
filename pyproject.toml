@@ -28,6 +28,7 @@ dependencies = [
     "numpy",
     "pandas",
     "torch>=1.13",
+    "optuna>=3.5",
     "omegaconf",
     "matplotlib>=3.7",
     "scikit-learn>=1.3",
@@ -60,6 +61,7 @@ all = [
 [project.scripts]
 timesim-train = "timesim.cli.train:main"
 timesim-retrain = "timesim.cli.retrain:main"
+timesim-optimize = "timesim.cli.optimize:main"
 
 [project.urls]
 Homepage = "https://github.com/yourusername/time-series-simulator"
@@ -103,4 +105,3 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
-

@@ -52,6 +52,7 @@ optimization:
   epochs: 5                          # training epochs per trial
   steps_per_epoch: 200               # null -> auto; set int for fast tuning
   direction: minimize                # minimize validation loss
+  search_space_profile: fast_gpu     # fast_gpu | wide
   seed: 42
   models: null                       # null -> use config.models list
 
