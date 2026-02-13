@@ -42,6 +42,8 @@ training:
   early_stopping: true
   patience: 5
   min_delta: 0.001                     # minimum improvement to reset patience
+  use_optuna_best_params: false        # if true, load per-model best_params from Optuna summary
+  optuna_summary_path: null            # null -> <runs_dir>/<dataset>/<run_name>/optuna/summary.yaml
 
 # ══════════════════════════════════════════════════════════════════════
 #  OPTIMIZATION (Optuna)

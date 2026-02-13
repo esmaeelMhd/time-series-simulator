@@ -63,6 +63,8 @@ simulation:
 
 # ---------- overrides ----------
 training:
+  use_optuna_best_params: true
+  # optuna_summary_path: null  # optional override; defaults to runs/<dataset>/<run_name>/optuna/summary.yaml
   warmup_len: 24
   sampling_strategy: random_fixed    # random_fixed | random_random | geometric | daily_fixed | stride
   sampling:
