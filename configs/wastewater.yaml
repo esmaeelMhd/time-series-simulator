@@ -9,7 +9,7 @@ _base: default.yaml
 # ---------- output ----------
 output:
   runs_dir: runs
-  run_name: full
+  run_name: full_with_time
 
 # ---------- dataset ----------
 dataset:

@@ -513,7 +513,23 @@ def main():
 
         return objective_xgb
 
+    summary_path = optuna_root / "summary.yaml"
     all_summary: Dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            with open(summary_path, "r", encoding="utf-8") as f:
+                loaded_summary = yaml.safe_load(f) or {}
+            if isinstance(loaded_summary, dict):
+                all_summary = loaded_summary
+            else:
+                print(
+                    f"Warning: existing summary is not a mapping ({summary_path}); "
+                    "starting from empty summary."
+                )
+        except Exception as exc:
+            print(f"Warning: failed to read existing summary ({summary_path}): {exc}")
+            all_summary = {}
+
     for model_type in model_names:
         print(f"\n--- Optimizing {model_type} ---")
         if model_type == "xgboost" and not HAS_XGBOOST:
@@ -569,7 +585,6 @@ def main():
         print(f"Best value: {best['best_value']:.6f}")
         print(f"Best params: {best['best_params']}")
 
-    summary_path = optuna_root / "summary.yaml"
     with open(summary_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(_sanitize_for_yaml(all_summary), f, sort_keys=False)
 
