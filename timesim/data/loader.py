@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 from pathlib import Path
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional, Any
 from .dataset import TimeSeriesDataset
 import pandas as pd
 
@@ -92,6 +92,8 @@ def build_grouped_dataloaders(df: pd.DataFrame,
                               batch_size: int = 32,
                               train_split: float = 0.8,
                               device: str | torch.device = "cpu",
+                              add_time: bool = False,
+                              time_features_cfg: Optional[Dict[str, Any]] = None,
                               existing_scaler = None) -> Tuple[DataLoader, DataLoader, object]:
     from .dataset import GroupedTimeSeriesDataset
     n_total = len(df)
@@ -100,8 +102,14 @@ def build_grouped_dataloaders(df: pd.DataFrame,
     train_df = df.iloc[:n_train]
     val_df = df.iloc[n_train - seq_len:]
 
-    train_ds = GroupedTimeSeriesDataset(train_df, groups, input_groups, output_groups, seq_len, pred_len, scaler=existing_scaler)
-    val_ds = GroupedTimeSeriesDataset(val_df, groups, input_groups, output_groups, seq_len, pred_len, scaler=train_ds.scaler)
+    train_ds = GroupedTimeSeriesDataset(
+        train_df, groups, input_groups, output_groups, seq_len, pred_len,
+        add_time=add_time, time_features_cfg=time_features_cfg, scaler=existing_scaler
+    )
+    val_ds = GroupedTimeSeriesDataset(
+        val_df, groups, input_groups, output_groups, seq_len, pred_len,
+        add_time=add_time, time_features_cfg=time_features_cfg, scaler=train_ds.scaler
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=True)

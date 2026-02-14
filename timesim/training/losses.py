@@ -9,11 +9,99 @@ Optimizations:
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+LossType = Literal["mse", "mae", "huber", "shape"]
+
+_DEFAULT_SHAPE_LOSS_CFG: Dict[str, float] = {
+    "w_level": 0.5,
+    "w_slope": 0.3,
+    "w_curvature": 0.1,
+    "w_stats": 0.1,
+    "robust_beta": 1.0,
+}
+
+
+def _merged_shape_cfg(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    out = dict(_DEFAULT_SHAPE_LOSS_CFG)
+    if cfg:
+        for k in out:
+            if k in cfg:
+                out[k] = float(cfg[k])
+    return out
+
+
+def _weighted_time_mean(step_losses: torch.Tensor, weights: Optional[torch.Tensor]) -> torch.Tensor:
+    """Average losses over time with optional per-step weights.
+
+    step_losses shape: (batch, horizon)
+    """
+    if step_losses.numel() == 0:
+        return torch.zeros((), dtype=step_losses.dtype, device=step_losses.device)
+    if weights is None:
+        return step_losses.mean()
+    return (step_losses * weights.unsqueeze(0)).mean()
+
+
+def _shape_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    cfg: Dict[str, float],
+    time_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fast DTW-like surrogate: level + slope + curvature + summary stats.
+
+    Complexity is linear in horizon and fully vectorized.
+    """
+    beta = max(1e-6, cfg["robust_beta"])
+    w_level = cfg["w_level"]
+    w_slope = cfg["w_slope"]
+    w_curv = cfg["w_curvature"]
+    w_stats = cfg["w_stats"]
+
+    # Level term: robust point-wise fit
+    level_steps = F.smooth_l1_loss(predictions, targets, beta=beta, reduction="none").mean(dim=-1)
+    loss_level = _weighted_time_mean(level_steps, time_weights)
+
+    # Slope term: first-derivative dynamics matching
+    if predictions.shape[1] > 1:
+        dp = predictions[:, 1:, :] - predictions[:, :-1, :]
+        dt = targets[:, 1:, :] - targets[:, :-1, :]
+        slope_steps = F.smooth_l1_loss(dp, dt, beta=beta, reduction="none").mean(dim=-1)
+        slope_w = time_weights[1:] if time_weights is not None else None
+        loss_slope = _weighted_time_mean(slope_steps, slope_w)
+    else:
+        loss_slope = torch.zeros_like(loss_level)
+
+    # Curvature term: second-derivative dynamics matching
+    if predictions.shape[1] > 2:
+        d2p = dp[:, 1:, :] - dp[:, :-1, :]
+        d2t = dt[:, 1:, :] - dt[:, :-1, :]
+        curv_steps = F.smooth_l1_loss(d2p, d2t, beta=beta, reduction="none").mean(dim=-1)
+        curv_w = time_weights[2:] if time_weights is not None else None
+        loss_curv = _weighted_time_mean(curv_steps, curv_w)
+    else:
+        loss_curv = torch.zeros_like(loss_level)
+
+    # Cheap long-term shape statistics (trend/amplitude summary)
+    pred_mean = predictions.mean(dim=1)
+    targ_mean = targets.mean(dim=1)
+    pred_std = predictions.std(dim=1, unbiased=False)
+    targ_std = targets.std(dim=1, unbiased=False)
+    loss_stats = 0.5 * F.mse_loss(pred_mean, targ_mean) + 0.5 * F.mse_loss(pred_std, targ_std)
+
+    denom = max(1e-8, w_level + w_slope + w_curv + w_stats)
+    total = (
+        w_level * loss_level +
+        w_slope * loss_slope +
+        w_curv * loss_curv +
+        w_stats * loss_stats
+    ) / denom
+    return total
 
 
 class OneStepLoss(nn.Module):
@@ -24,13 +112,18 @@ class OneStepLoss(nn.Module):
     
     Parameters
     ----------
-    loss_type : {"mse", "mae", "huber"}
+    loss_type : {"mse", "mae", "huber", "shape"}
         Type of loss function.
     """
     
-    def __init__(self, loss_type: Literal["mse", "mae", "huber"] = "mse"):
+    def __init__(
+        self,
+        loss_type: LossType = "mse",
+        shape_loss_cfg: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__()
         self.loss_type = loss_type
+        self.shape_loss_cfg = _merged_shape_cfg(shape_loss_cfg)
         
         if loss_type == "mse":
             self.loss_fn = nn.MSELoss()
@@ -38,6 +131,8 @@ class OneStepLoss(nn.Module):
             self.loss_fn = nn.L1Loss()
         elif loss_type == "huber":
             self.loss_fn = nn.HuberLoss()
+        elif loss_type == "shape":
+            self.loss_fn = None
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
     
@@ -60,6 +155,8 @@ class OneStepLoss(nn.Module):
         torch.Tensor
             Scalar loss value.
         """
+        if self.loss_type == "shape":
+            return _shape_loss(predictions, targets, self.shape_loss_cfg)
         return self.loss_fn(predictions, targets)
 
 
@@ -71,7 +168,7 @@ class MultiStepLoss(nn.Module):
     
     Parameters
     ----------
-    loss_type : {"mse", "mae", "huber"}
+    loss_type : {"mse", "mae", "huber", "shape"}
         Base loss function type.
     weighting : {"uniform", "linear", "exponential"}
         How to weight losses across time steps:
@@ -84,14 +181,16 @@ class MultiStepLoss(nn.Module):
     
     def __init__(
         self,
-        loss_type: Literal["mse", "mae", "huber"] = "mse",
+        loss_type: LossType = "mse",
         weighting: Literal["uniform", "linear", "exponential"] = "uniform",
         weight_scale: float = 1.0,
+        shape_loss_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.loss_type = loss_type
         self.weighting = weighting
         self.weight_scale = weight_scale
+        self.shape_loss_cfg = _merged_shape_cfg(shape_loss_cfg)
         
         if loss_type == "mse":
             self.base_loss = F.mse_loss
@@ -99,6 +198,8 @@ class MultiStepLoss(nn.Module):
             self.base_loss = F.l1_loss
         elif loss_type == "huber":
             self.base_loss = F.huber_loss
+        elif loss_type == "shape":
+            self.base_loss = None
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
     
@@ -161,24 +262,27 @@ class MultiStepLoss(nn.Module):
         batch_size, horizon, output_dim = predictions.shape
         device = predictions.device
         
-        # Compute per-step losses
-        # Shape: (batch_size, horizon, output_dim)
-        step_losses = (predictions - targets) ** 2 if self.loss_type == "mse" else torch.abs(predictions - targets)
-        
-        # Average over output dimensions: (batch_size, horizon)
-        step_losses = step_losses.mean(dim=-1)
-        
         # Get time-step weights
         if weights is None:
             weights = self._compute_weights(horizon, device)
-        
-        # Weight and average over time: (batch_size,)
+
+        if self.loss_type == "shape":
+            return _shape_loss(predictions, targets, self.shape_loss_cfg, time_weights=weights)
+
+        # Compute per-step losses: (batch_size, horizon, output_dim)
+        if self.loss_type == "mse":
+            step_losses = (predictions - targets) ** 2
+        elif self.loss_type == "mae":
+            step_losses = torch.abs(predictions - targets)
+        elif self.loss_type == "huber":
+            step_losses = F.smooth_l1_loss(predictions, targets, reduction="none")
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+
+        # Average over output dimensions: (batch_size, horizon)
+        step_losses = step_losses.mean(dim=-1)
         weighted_losses = step_losses * weights.unsqueeze(0)
-        
-        # Average over batch
-        loss = weighted_losses.mean()
-        
-        return loss
+        return weighted_losses.mean()
 
 
 class CombinedLoss(nn.Module):
@@ -195,7 +299,7 @@ class CombinedLoss(nn.Module):
         Weight for one-step loss (lambda in the paper).
     multi_step_weight : float, default 0.5
         Weight for multi-step loss (1 - lambda).
-    loss_type : {"mse", "mae", "huber"}
+    loss_type : {"mse", "mae", "huber", "shape"}
         Base loss function type.
     multi_step_weighting : {"uniform", "linear", "exponential"}
         Weighting scheme for multi-step loss.
@@ -207,19 +311,24 @@ class CombinedLoss(nn.Module):
         self,
         one_step_weight: float = 0.5,
         multi_step_weight: float = 0.5,
-        loss_type: Literal["mse", "mae", "huber"] = "mse",
+        loss_type: LossType = "mse",
         multi_step_weighting: Literal["uniform", "linear", "exponential"] = "uniform",
         multi_step_weight_scale: float = 1.0,
+        shape_loss_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.one_step_weight = one_step_weight
         self.multi_step_weight = multi_step_weight
         
-        self.one_step_loss = OneStepLoss(loss_type=loss_type)
+        self.one_step_loss = OneStepLoss(
+            loss_type=loss_type,
+            shape_loss_cfg=shape_loss_cfg,
+        )
         self.multi_step_loss = MultiStepLoss(
             loss_type=loss_type,
             weighting=multi_step_weighting,
             weight_scale=multi_step_weight_scale,
+            shape_loss_cfg=shape_loss_cfg,
         )
     
     def forward(

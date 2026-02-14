@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence, Tuple, Dict
+from typing import Sequence, Tuple, Dict, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -20,7 +20,8 @@ class TimeSeriesDataset(Dataset):
                  seq_len: int,
                  pred_len: int,
                  scale: bool = True,
-                 add_time: bool = False):
+                 add_time: bool = False,
+                 time_features_cfg: Optional[Dict[str, Any]] = None):
         if isinstance(series, np.ndarray):
             series = pd.DataFrame(series)
         self.series = series.copy()
@@ -30,7 +31,9 @@ class TimeSeriesDataset(Dataset):
         if add_time:
             if not isinstance(self.series.index, pd.DatetimeIndex):
                 raise ValueError("Time features requested but index is not DateTime")
-            self.series = add_time_features(self.series)
+            tf_cfg = dict(time_features_cfg or {})
+            tf_cfg.pop("enabled", None)
+            self.series = add_time_features(self.series, **tf_cfg)
 
         self.scaler = None
         if scale:
@@ -85,6 +88,7 @@ class GroupedTimeSeriesDataset(Dataset):
                  pred_len: int,
                  scale: bool = True,
                  add_time: bool = False,
+                 time_features_cfg: Optional[Dict[str, Any]] = None,
                  scaler: 'MinMaxScaler | None' = None):
 
         # Validate columns
@@ -98,6 +102,7 @@ class GroupedTimeSeriesDataset(Dataset):
         self.output_groups = output_groups
         self.input_cols = sum((groups[g] for g in input_groups), [])
         self.output_cols = sum((groups[g] for g in output_groups), [])
+        self.time_feature_cols: list[str] = []
 
         # Reorder DF so that input/output order is preserved for later plotting
         needed_cols = list(dict.fromkeys(self.input_cols + self.output_cols))
@@ -106,7 +111,12 @@ class GroupedTimeSeriesDataset(Dataset):
         if add_time:
             if not isinstance(df.index, pd.DatetimeIndex):
                 raise ValueError("Time features requested but index is not DateTime")
-            df = add_time_features(df)
+            cols_before = list(df.columns)
+            tf_cfg = dict(time_features_cfg or {})
+            tf_cfg.pop("enabled", None)
+            df = add_time_features(df, **tf_cfg)
+            self.time_feature_cols = [c for c in df.columns if c not in cols_before]
+            self.input_cols = list(dict.fromkeys(self.input_cols + self.time_feature_cols))
 
         self.seq_len = seq_len
         self.pred_len = pred_len

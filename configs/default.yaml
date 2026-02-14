@@ -28,9 +28,15 @@ training:
     samples_per_hour: 1              # for daily_fixed (e.g., 30 for 2-min data)
 
   # Loss
-  loss_type: mse                     # mse | mae | huber
+  loss_type: mse                     # mse | mae | huber | shape
   loss_weighting: uniform            # uniform | linear | exponential
   loss_weight_scale: 1.0             # scale factor for exponential weighting
+  shape_loss:
+    w_level: 0.5                     # pointwise fit term
+    w_slope: 0.3                     # first-derivative (trend) term
+    w_curvature: 0.1                 # second-derivative term
+    w_stats: 0.1                     # mean/std summary term
+    robust_beta: 1.0                 # smooth-l1 transition; smaller -> more robust
 
   # Training mode
   mode: multi_step                   # multi_step | one_step | combined
@@ -42,8 +48,13 @@ training:
   early_stopping: true
   patience: 5
   min_delta: 0.001                     # minimum improvement to reset patience
+
+  # Hyperparameters and fast training
   use_optuna_best_params: false        # if true, load per-model best_params from Optuna summary
   optuna_summary_path: null            # null -> <runs_dir>/<dataset>/<run_name>/optuna/summary.yaml
+  use_amp: false                       # mixed precision (cuda only); faster on tensor cores
+  use_compile: false                   # torch.compile model for potential speedup
+  compile_mode: default                # default | reduce-overhead | max-autotune
 
 # ══════════════════════════════════════════════════════════════════════
 #  OPTIMIZATION (Optuna)
@@ -57,6 +68,14 @@ optimization:
   search_space_profile: fast_gpu     # fast_gpu | wide
   seed: 42
   models: null                       # null -> use config.models list
+  fast_mode: false                   # if true, use fast_* settings below by default
+  fast_epochs: 1                     # epochs per trial in fast mode
+  fast_steps_per_epoch: 40           # steps per epoch in fast mode
+  fast_sampling_horizon: 24          # override sampling horizon in fast mode
+  fast_training_mode: one_step       # one_step | multi_step | combined for fast mode
+  enable_pruning: true               # prune weak trials early
+  pruner_startup_trials: 5           # full trials before pruning starts
+  pruner_warmup_steps: 1             # epochs reported before pruning eligibility
 
 # ══════════════════════════════════════════════════════════════════════
 #  DATA
@@ -66,7 +85,11 @@ data:
   shuffle_train: true
   drop_last: true
   scale: true                        # apply MinMaxScaler
-  add_time_features: false           # append time-based features
+  add_time_features: false           # legacy switch; same as data.time_features.enabled
+  time_features:
+    enabled: false
+    features: [hour]                 # hour | day_of_week | day_of_month | month | day_of_year | week_of_year
+    encoding: cyclical               # raw | cyclical | both | onehot
   index_col: date                    # name of datetime index column
   parse_dates: true
 

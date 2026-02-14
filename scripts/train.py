@@ -31,6 +31,7 @@ matplotlib.use("Agg")
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.data.stamps import get_time_feature_columns
 from timesim.data.sampling import (
     RandomStartFixedHorizon,
     RandomStartRandomHorizon,
@@ -167,6 +168,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     warmup_len = tcfg.get("warmup_len", seq_len)
     sampling, sampling_desc = build_sampling_strategy(config, pred_len)
     loss_type = training_overrides.get("loss_type", tcfg.get("loss_type", "mse"))
+    shape_loss_cfg = tcfg.get("shape_loss", None)
     loss_weighting = training_overrides.get("loss_weighting", tcfg.get("loss_weighting", "uniform"))
     loss_weight_scale = training_overrides.get("loss_weight_scale", tcfg.get("loss_weight_scale", 1.0))
     training_mode = training_overrides.get("mode", tcfg.get("mode", "multi_step"))
@@ -175,6 +177,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         "teacher_forcing_ratio", tcfg.get("teacher_forcing_ratio", 0.0)
     )
     one_step_weight = training_overrides.get("one_step_weight", tcfg.get("one_step_weight", 0.5))
+    use_amp = bool(tcfg.get("use_amp", False))
 
     # Optimizer
     opt_name = str(
@@ -199,12 +202,14 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         loss_type=loss_type,
         loss_weighting=loss_weighting,
         loss_weight_scale=loss_weight_scale,
+        shape_loss_cfg=shape_loss_cfg,
         training_mode=training_mode,
         feedback=feedback,
         teacher_forcing_ratio=teacher_forcing_ratio,
         one_step_weight=one_step_weight,
         optimizer=optimizer,
         device=device,
+        use_amp=use_amp,
         early_stopping=tcfg.get("early_stopping", False),
         patience=tcfg.get("patience", 5),
         min_delta=tcfg.get("min_delta", 0.0),
@@ -259,6 +264,26 @@ def _split_optuna_params(
     model_overrides = {k: v for k, v in best_params.items() if k in model_keys}
     training_overrides = {k: v for k, v in best_params.items() if k in TRAINING_PARAM_KEYS}
     return model_overrides, training_overrides
+
+
+def _maybe_compile_model(model, config: Dict[str, Any]):
+    """Optionally compile a model with torch.compile when configured."""
+    if getattr(model, "_timesim_compiled", False):
+        return model
+    tcfg = config.get("training", {})
+    if not bool(tcfg.get("use_compile", False)):
+        return model
+    if not hasattr(torch, "compile"):
+        print("  Warning: torch.compile not available in this torch build.")
+        return model
+    compile_mode = str(tcfg.get("compile_mode", "default"))
+    try:
+        compiled = torch.compile(model, mode=compile_mode)
+        setattr(compiled, "_timesim_compiled", True)
+        return compiled
+    except Exception as exc:
+        print(f"  Warning: torch.compile failed, using eager mode ({exc})")
+        return model
 
 
 def prepare_xgboost_data(dataset, seq_len):
@@ -371,6 +396,10 @@ def main():
 
     # ── Config sub-dicts ──────────────────────────────────────────────
     data_cfg = config.get("data", {})
+    add_time_features = bool(data_cfg.get("add_time_features", False))
+    time_features_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
     model_defaults_cfg = config.get("model_defaults", {})
     plot_cfg = config.get("plotting", {})
     output_cfg = config.get("output", {})
@@ -403,6 +432,13 @@ def main():
     # Use union to avoid double-counting when output_cols are in input_groups
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
+    if add_time_features:
+        input_dim += len(
+            get_time_feature_columns(
+                features=time_features_cfg.get("features"),
+                encoding=time_features_cfg.get("encoding", "cyclical"),
+            )
+        )
     output_dim = len(output_cols)
 
     # ── Training rounds ───────────────────────────────────────────────
@@ -434,6 +470,8 @@ def main():
     print(f"  Input cols   : {input_cols}")
     print(f"  Output cols  : {output_cols}")
     print(f"  input_dim={input_dim}  output_dim={output_dim}")
+    if add_time_features:
+        print(f"  Time features: enabled ({time_features_cfg})")
     print(f"  seq_len={seq_len}  pred_len={pred_len}")
     print(f"  Run name     : {run_name if run_name is not None else '(default)'}")
     print("=" * 70 + "\n")
@@ -496,6 +534,8 @@ def main():
         seq_len=seq_len, pred_len=pred_len,
         batch_size=config["dataset"]["batch_size"],
         train_split=train_split,
+        add_time=add_time_features,
+        time_features_cfg=time_features_cfg,
     )
 
     train_dataset = train_loader.dataset
@@ -601,6 +641,8 @@ def main():
                     per_model_cfg=mc,
                     model_defaults_cfg=model_defaults_cfg,
                     overrides=model_overrides)
+            if model_type in NEURAL_MODELS:
+                model = _maybe_compile_model(model, config)
 
             tag = "RETRAIN" if is_retrain else "TRAIN"
             print(f"\n{'─' * 70}")

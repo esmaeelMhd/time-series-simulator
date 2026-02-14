@@ -10,7 +10,7 @@ Performance optimizations applied:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Literal, Callable
+from typing import Optional, Literal, Callable, Dict, Any
 import time
 
 import numpy as np
@@ -49,7 +49,7 @@ class WorldModelTrainer:
         Length of warmup sequence for state initialization.
     batch_size : int, default 32
         Number of rollouts per training batch.
-    loss_type : {"mse", "mae", "huber"}, default "mse"
+    loss_type : {"mse", "mae", "huber", "shape"}, default "mse"
         Base loss function type.
     loss_weighting : {"uniform", "linear", "exponential"}, default "uniform"
         Time-step weighting scheme for multi-step loss.
@@ -93,9 +93,10 @@ class WorldModelTrainer:
         sampling_strategy: Optional[SamplingStrategy] = None,
         warmup_len: int = 24,
         batch_size: int = 32,
-        loss_type: Literal["mse", "mae", "huber"] = "mse",
+        loss_type: Literal["mse", "mae", "huber", "shape"] = "mse",
         loss_weighting: Literal["uniform", "linear", "exponential"] = "uniform",
         loss_weight_scale: float = 1.0,
+        shape_loss_cfg: Optional[Dict[str, Any]] = None,
         training_mode: Literal["multi_step", "one_step", "combined"] = "multi_step",
         feedback: Literal["model", "teacher", "mixed"] = "model",
         teacher_forcing_ratio: float = 0.0,
@@ -103,6 +104,7 @@ class WorldModelTrainer:
         optimizer: Optional[torch.optim.Optimizer] = None,
         device: torch.device | str = "cpu",
         use_gpu: bool = False,
+        use_amp: bool = False,
         early_stopping: bool = False,
         patience: int = 5,
         min_delta: float = 0.0,
@@ -117,6 +119,7 @@ class WorldModelTrainer:
         self.training_mode = training_mode
         self.feedback = feedback
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.use_amp = use_amp
         
         # Device setup
         if use_gpu:
@@ -131,6 +134,12 @@ class WorldModelTrainer:
             # Use the specified device
             self.device = torch.device(device)
         self.model.to(self.device)
+        self.amp_enabled = bool(self.use_amp and self.device.type == "cuda")
+        try:
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        except Exception:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
+
         
         # Sampling strategy
         if sampling_strategy is None:
@@ -141,12 +150,16 @@ class WorldModelTrainer:
         
         # Loss function
         if training_mode == "one_step":
-            self.loss_fn = OneStepLoss(loss_type=loss_type)
+            self.loss_fn = OneStepLoss(
+                loss_type=loss_type,
+                shape_loss_cfg=shape_loss_cfg,
+            )
         elif training_mode == "multi_step":
             self.loss_fn = MultiStepLoss(
                 loss_type=loss_type,
                 weighting=loss_weighting,
                 weight_scale=loss_weight_scale,
+                shape_loss_cfg=shape_loss_cfg,
             )
         elif training_mode == "combined":
             self.loss_fn = CombinedLoss(
@@ -155,6 +168,7 @@ class WorldModelTrainer:
                 loss_type=loss_type,
                 multi_step_weighting=loss_weighting,
                 multi_step_weight_scale=loss_weight_scale,
+                shape_loss_cfg=shape_loss_cfg,
             )
         else:
             raise ValueError(f"Unknown training mode: {training_mode}")
@@ -162,6 +176,7 @@ class WorldModelTrainer:
             loss_type=loss_type,
             weighting=loss_weighting,
             weight_scale=loss_weight_scale,
+            shape_loss_cfg=shape_loss_cfg,
         )
         
         # Optimizer
@@ -220,56 +235,66 @@ class WorldModelTrainer:
         )
         
         # Perform batched rollouts
-        if self.training_mode == "combined":
-            # Need both teacher-forced and model-feedback rollouts
-            result_teacher = batch_rollout_padded(
-                self.model, self.dataset, start_indices, horizons,
-                self.warmup_len, feedback="teacher", device=self.device
-            )
-            result_model = batch_rollout_padded(
-                self.model, self.dataset, start_indices, horizons,
-                self.warmup_len, feedback="model", device=self.device
-            )
-            
-            predictions_teacher = result_teacher["predictions"]
-            predictions_model = result_model["predictions"]
-            targets = result_teacher["targets"]
-            mask = result_teacher["mask"]
-            
-            # Compute loss
-            self.optimizer.zero_grad()
-            loss, info = self.loss_fn(predictions_teacher, predictions_model, targets)
-            
-        else:
-            # Single rollout mode
-            result = batch_rollout_padded(
-                self.model, self.dataset, start_indices, horizons,
-                self.warmup_len, feedback=self.feedback,
-                teacher_forcing_ratio=self.teacher_forcing_ratio,
-                device=self.device
-            )
-            
-            predictions = result["predictions"]
-            targets = result["targets"]
-            mask = result["mask"]
-            
-            # Mask out padded values for loss computation
-            # Expand mask to match output dimensions
-            mask_expanded = mask.unsqueeze(-1).expand_as(predictions)
-            predictions_masked = predictions * mask_expanded
-            targets_masked = targets * mask_expanded
-            
-            # Compute loss
-            self.optimizer.zero_grad()
-            loss = self.loss_fn(predictions_masked, targets_masked)
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=self.amp_enabled,
+        ):
+            if self.training_mode == "combined":
+                # Need both teacher-forced and model-feedback rollouts
+                result_teacher = batch_rollout_padded(
+                    self.model, self.dataset, start_indices, horizons,
+                    self.warmup_len, feedback="teacher", device=self.device
+                )
+                result_model = batch_rollout_padded(
+                    self.model, self.dataset, start_indices, horizons,
+                    self.warmup_len, feedback="model", device=self.device
+                )
+                
+                predictions_teacher = result_teacher["predictions"]
+                predictions_model = result_model["predictions"]
+                targets = result_teacher["targets"]
+                mask = result_teacher["mask"]
+                
+                # Compute loss
+                self.optimizer.zero_grad(set_to_none=True)
+                loss, info = self.loss_fn(predictions_teacher, predictions_model, targets)
+                
+            else:
+                # Single rollout mode
+                result = batch_rollout_padded(
+                    self.model, self.dataset, start_indices, horizons,
+                    self.warmup_len, feedback=self.feedback,
+                    teacher_forcing_ratio=self.teacher_forcing_ratio,
+                    device=self.device
+                )
+                
+                predictions = result["predictions"]
+                targets = result["targets"]
+                mask = result["mask"]
+                
+                # Mask out padded values for loss computation
+                # Expand mask to match output dimensions
+                mask_expanded = mask.unsqueeze(-1).expand_as(predictions)
+                predictions_masked = predictions * mask_expanded
+                targets_masked = targets * mask_expanded
+                
+                # Compute loss
+                self.optimizer.zero_grad(set_to_none=True)
+                loss = self.loss_fn(predictions_masked, targets_masked)
         
         # Guard against NaN/Inf
         if torch.isnan(loss) or torch.isinf(loss):
             raise ValueError("NaN/Inf in training loss. Check data and model stability.")
         
         # Backward pass
-        loss.backward()
-        self.optimizer.step()
+        if self.amp_enabled:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
         
         return loss.item()
     
@@ -299,26 +324,31 @@ class WorldModelTrainer:
                 rng=self.rng,
             )
             
-            result = batch_rollout_padded(
-                self.model, self.val_dataset, start_indices, horizons,
-                self.warmup_len, feedback="model", device=self.device
-            )
-            
-            predictions = result["predictions"]
-            targets = result["targets"]
-            mask = result["mask"]
-            
-            # Mask out padded values
-            mask_expanded = mask.unsqueeze(-1).expand_as(predictions)
-            predictions_masked = predictions * mask_expanded
-            targets_masked = targets * mask_expanded
-            
-            # Compute loss
-            if self.training_mode == "combined":
-                # For validation, just use multi-step loss
-                loss = self._val_multi_step_loss(predictions_masked, targets_masked)
-            else:
-                loss = self.loss_fn(predictions_masked, targets_masked)
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.amp_enabled,
+            ):
+                result = batch_rollout_padded(
+                    self.model, self.val_dataset, start_indices, horizons,
+                    self.warmup_len, feedback="model", device=self.device
+                )
+                
+                predictions = result["predictions"]
+                targets = result["targets"]
+                mask = result["mask"]
+                
+                # Mask out padded values
+                mask_expanded = mask.unsqueeze(-1).expand_as(predictions)
+                predictions_masked = predictions * mask_expanded
+                targets_masked = targets * mask_expanded
+                
+                # Compute loss
+                if self.training_mode == "combined":
+                    # For validation, just use multi-step loss
+                    loss = self._val_multi_step_loss(predictions_masked, targets_masked)
+                else:
+                    loss = self.loss_fn(predictions_masked, targets_masked)
             
             val_losses.append(loss.item())
         

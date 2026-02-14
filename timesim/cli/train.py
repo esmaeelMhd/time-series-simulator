@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 from timesim.data.loader import generate_sine_dataset, build_dataloaders
+from timesim.data.stamps import get_time_feature_columns
 from timesim.models import get_model
 from timesim.engine.trainer import Trainer
 from timesim.utils.config import load_config
@@ -56,6 +57,10 @@ def main():
     # 3) Build dataset & loaders (placeholder: sine waves for now)
     # -------------------------------------------------------
     dataset_cfg = cfg.get("dataset", {})
+    add_time_features = bool(cfg.get("data", {}).get("add_time_features", False))
+    time_features_cfg = cfg.get("data", {}).get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
     seq_len = cfg.get("seq_len") or dataset_cfg.get("seq_len", 24)
     pred_len = cfg.get("pred_len") or dataset_cfg.get("pred_len", 12)
     batch_size = cfg.get("batch_size") or dataset_cfg.get("batch_size", 32)
@@ -92,6 +97,8 @@ def main():
                                                              seq_len=seq_len,
                                                              pred_len=pred_len,
                                                              batch_size=batch_size,
+                                                             add_time=add_time_features,
+                                                             time_features_cfg=time_features_cfg,
                                                              device=device)
 
         # Save fitted scaler for future use
@@ -107,6 +114,13 @@ def main():
         input_dim = series.shape[1]
     else:
         input_dim = len(sum((groups[g] for g in input_groups), []))
+        if add_time_features:
+            input_dim += len(
+                get_time_feature_columns(
+                    features=time_features_cfg.get("features"),
+                    encoding=time_features_cfg.get("encoding", "cyclical"),
+                )
+            )
 
     out_dim = len(output_groups) if df_raw is not None else input_dim
     model_kwargs = dict(input_dim=input_dim, pred_len=pred_len)

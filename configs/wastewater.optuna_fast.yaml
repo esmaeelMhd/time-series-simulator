@@ -1,0 +1,34 @@
+_base: wastewater.yaml
+
+# Fast Optuna-only config.
+# Use this for optimization, then train with configs/wastewater.yaml.
+output:
+  run_name: full
+
+data:
+  add_time_features: true
+  time_features:
+    enabled: true
+    features: [hour, day_of_week, month]
+    encoding: cyclical
+
+optimization:
+  fast_mode: true
+  n_trials: 30
+  epochs: 1
+  steps_per_epoch: 40
+  timeout: null
+  search_space_profile: fast_gpu
+  fast_sampling_horizon: 32
+  enable_pruning: true
+
+training:
+  # Keep optimization representative, but much cheaper than horizon=360.
+  # loss_type: shape
+  mode: one_step
+  use_amp: true
+  use_compile: false                # false for very short trials (epochs=1); compile overhead may outweigh benefits
+  compile_mode: reduce-overhead
+  sampling:
+    strategy: random_fixed
+    horizon: 32

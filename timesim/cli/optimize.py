@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ import yaml
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.data.stamps import get_time_feature_columns
 from timesim.data.sampling import (
     RandomStartFixedHorizon,
     RandomStartRandomHorizon,
@@ -68,10 +69,25 @@ def parse_args():
                    help="Override device (cpu / cuda)")
     p.add_argument("--seed", type=int, default=None,
                    help="Override random seed")
+    p.add_argument(
+        "--fast-mode",
+        dest="fast_mode",
+        action="store_true",
+        help="Use fast-mode defaults for cheaper Optuna trials",
+    )
+    p.add_argument(
+        "--no-fast-mode",
+        dest="fast_mode",
+        action="store_false",
+        help="Disable fast-mode defaults",
+    )
+    p.set_defaults(fast_mode=None)
     return p.parse_args()
 
 
-def _build_sampling_strategy(config: Dict[str, Any], pred_len: int):
+def _build_sampling_strategy(
+    config: Dict[str, Any], pred_len: int, horizon_override: Optional[int] = None
+):
     tcfg = config["training"]
     dcfg = config["dataset"]
     scfg = tcfg.get("sampling", {})
@@ -82,7 +98,10 @@ def _build_sampling_strategy(config: Dict[str, Any], pred_len: int):
     legacy_horizon = int(tcfg.get("sampling_horizon", pred_len))
 
     if strategy_name in {"random_fixed", "fixed"}:
-        horizon = int(scfg.get("horizon", legacy_horizon))
+        horizon = int(
+            horizon_override if horizon_override is not None
+            else scfg.get("horizon", legacy_horizon)
+        )
         return RandomStartFixedHorizon(horizon=horizon)
     if strategy_name in {"random_random", "random"}:
         h_min = int(scfg.get("h_min", 1))
@@ -94,7 +113,10 @@ def _build_sampling_strategy(config: Dict[str, Any], pred_len: int):
     if strategy_name in {"daily_fixed", "daily"}:
         return DailyFixedHorizon(
             start_hour=int(scfg.get("start_hour", 0)),
-            horizon=int(scfg.get("horizon", legacy_horizon)),
+            horizon=int(
+                horizon_override if horizon_override is not None
+                else scfg.get("horizon", legacy_horizon)
+            ),
             samples_per_hour=int(scfg.get("samples_per_hour", dcfg.get("samples_per_hour", 1))),
         )
     if strategy_name in {"stride", "stride_based"}:
@@ -224,6 +246,24 @@ def _sanitize_for_yaml(obj: Any):
     return obj
 
 
+def _maybe_compile_model(model, config: Dict[str, Any]):
+    """Optionally compile a model with torch.compile."""
+    if getattr(model, "_timesim_compiled", False):
+        return model
+    tcfg = config.get("training", {})
+    if not bool(tcfg.get("use_compile", False)):
+        return model
+    if not hasattr(torch, "compile"):
+        return model
+    compile_mode = str(tcfg.get("compile_mode", "default"))
+    try:
+        compiled = torch.compile(model, mode=compile_mode)
+        setattr(compiled, "_timesim_compiled", True)
+        return compiled
+    except Exception:
+        return model
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -266,6 +306,17 @@ def main():
 
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
+    add_time_features = bool(config.get("data", {}).get("add_time_features", False))
+    time_features_cfg = config.get("data", {}).get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
+    if add_time_features:
+        input_dim += len(
+            get_time_feature_columns(
+                features=time_features_cfg.get("features"),
+                encoding=time_features_cfg.get("encoding", "cyclical"),
+            )
+        )
     output_dim = len(output_cols)
 
     models_cfg_list = config.get("models", [])
@@ -281,14 +332,33 @@ def main():
 
     n_trials = int(args.n_trials if args.n_trials is not None else ocfg.get("n_trials", 30))
     timeout = args.timeout if args.timeout is not None else ocfg.get("timeout", None)
-    trial_epochs = int(args.epochs if args.epochs is not None else ocfg.get("epochs", 5))
-    trial_steps = (
-        args.steps_per_epoch if args.steps_per_epoch is not None
-        else ocfg.get("steps_per_epoch", tcfg.get("steps_per_epoch", None))
+    fast_mode = (
+        args.fast_mode
+        if args.fast_mode is not None
+        else bool(ocfg.get("fast_mode", False))
     )
+    if fast_mode:
+        trial_epochs = int(args.epochs if args.epochs is not None else ocfg.get("fast_epochs", 1))
+        trial_steps = (
+            args.steps_per_epoch if args.steps_per_epoch is not None
+            else ocfg.get("fast_steps_per_epoch", 40)
+        )
+        sampling_horizon_override = int(ocfg.get("fast_sampling_horizon", 24))
+        training_mode = str(ocfg.get("fast_training_mode", "one_step"))
+    else:
+        trial_epochs = int(args.epochs if args.epochs is not None else ocfg.get("epochs", 5))
+        trial_steps = (
+            args.steps_per_epoch if args.steps_per_epoch is not None
+            else ocfg.get("steps_per_epoch", tcfg.get("steps_per_epoch", None))
+        )
+        sampling_horizon_override = None
+        training_mode = str(tcfg.get("mode", "multi_step"))
     sampler_seed = int(ocfg.get("seed", seed))
     direction = str(ocfg.get("direction", "minimize"))
     search_space_profile = str(ocfg.get("search_space_profile", "fast_gpu"))
+    enable_pruning = bool(ocfg.get("enable_pruning", True))
+    pruner_startup_trials = int(ocfg.get("pruner_startup_trials", 5))
+    pruner_warmup_steps = int(ocfg.get("pruner_warmup_steps", 1))
 
     print("\n" + "=" * 70)
     print("  OPTUNA HYPERPARAMETER OPTIMIZATION")
@@ -303,6 +373,8 @@ def main():
     print(f"  Timeout/model   : {timeout if timeout is not None else 'none'}")
     print(f"  Device          : {device}")
     print(f"  Search profile  : {search_space_profile}")
+    print(f"  Fast mode       : {fast_mode}")
+    print(f"  Pruning         : {enable_pruning}")
     print("=" * 70 + "\n")
 
     # Build data once and reuse across all trials/models.
@@ -322,10 +394,14 @@ def main():
         pred_len=pred_len,
         batch_size=batch_size,
         train_split=train_split,
+        add_time=add_time_features,
+        time_features_cfg=time_features_cfg,
     )
     train_dataset = train_loader.dataset
     val_dataset = val_loader.dataset
-    sampling_strategy = _build_sampling_strategy(config, pred_len)
+    sampling_strategy = _build_sampling_strategy(
+        config, pred_len, horizon_override=sampling_horizon_override
+    )
 
     def make_objective(model_type: str):
         per_model_cfg = models_cfg_map.get(model_type, {"type": model_type})
@@ -357,6 +433,7 @@ def main():
                     model_defaults_cfg=model_defaults_cfg,
                     overrides=model_overrides,
                 )
+                model = _maybe_compile_model(model, config)
 
                 if optimizer_name == "adamw":
                     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -373,29 +450,41 @@ def main():
                     loss_type=tcfg.get("loss_type", "mse"),
                     loss_weighting=tcfg.get("loss_weighting", "uniform"),
                     loss_weight_scale=tcfg.get("loss_weight_scale", 1.0),
-                    training_mode=tcfg.get("mode", "multi_step"),
+                    shape_loss_cfg=tcfg.get("shape_loss", None),
+                    training_mode=training_mode,
                     feedback=tcfg.get("feedback", "model"),
                     teacher_forcing_ratio=teacher_forcing_ratio,
                     one_step_weight=one_step_weight,
                     optimizer=optimizer,
                     device=device,
+                    use_amp=bool(tcfg.get("use_amp", False)),
                     early_stopping=tcfg.get("early_stopping", False),
                     patience=tcfg.get("patience", 5),
                     min_delta=tcfg.get("min_delta", 0.0),
                     run_dir=None,  # avoid trial artifact overhead
                 )
 
-                _, val_losses = trainer.fit(
-                    epochs=trial_epochs,
-                    steps_per_epoch=trial_steps,
-                    verbose=False,
-                )
-                val_finite = [v for v in val_losses if v is not None and np.isfinite(v)]
-                if not val_finite:
+                best_score = float("inf")
+                final_val = None
+                for ep in range(trial_epochs):
+                    _, val_losses = trainer.fit(
+                        epochs=1,
+                        steps_per_epoch=trial_steps,
+                        verbose=False,
+                    )
+                    val_finite = [v for v in val_losses if v is not None and np.isfinite(v)]
+                    if val_finite:
+                        final_val = float(val_finite[-1])
+                        best_score = min(best_score, final_val)
+                        trial.report(final_val, step=ep)
+                        if enable_pruning and trial.should_prune():
+                            raise optuna.TrialPruned()
+                if not np.isfinite(best_score):
                     return float("inf")
 
-                score = float(min(val_finite))
-                trial.set_user_attr("final_val_loss", float(val_finite[-1]))
+                score = float(best_score)
+                if final_val is not None:
+                    trial.set_user_attr("final_val_loss", final_val)
                 trial.set_user_attr("best_val_loss", score)
                 return score
             return objective
@@ -438,10 +527,18 @@ def main():
         study_name = f"{dataset_name}_{run_name or 'default'}_{model_type}"
 
         sampler = optuna.samplers.TPESampler(seed=sampler_seed)
+        if enable_pruning:
+            pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=pruner_startup_trials,
+                n_warmup_steps=pruner_warmup_steps,
+            )
+        else:
+            pruner = optuna.pruners.NopPruner()
         study = optuna.create_study(
             study_name=study_name,
             direction=direction,
             sampler=sampler,
+            pruner=pruner,
             storage=storage,
             load_if_exists=True,
         )

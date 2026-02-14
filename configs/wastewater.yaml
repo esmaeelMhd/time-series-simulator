@@ -24,6 +24,13 @@ dataset:
     exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]
     objective: [T1_PO4]
 
+data:
+  add_time_features: true
+  time_features:
+    enabled: true
+    features: [hour, day_of_week, month]
+    encoding: cyclical
+
 # ---------- model I/O ----------
 model_io:
   input_groups: ["control", "exogenous", "objective"]
@@ -63,6 +70,14 @@ simulation:
 
 # ---------- overrides ----------
 training:
+  # Optional DTW-like fast shape-aware objective:
+  # loss_type: shape
+  # shape_loss:
+  #   w_level: 0.5
+  #   w_slope: 0.3
+  #   w_curvature: 0.1
+  #   w_stats: 0.1
+  #   robust_beta: 1.0
   use_optuna_best_params: true
   # optuna_summary_path: null  # optional override; defaults to runs/<dataset>/<run_name>/optuna/summary.yaml
   warmup_len: 24
