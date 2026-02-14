@@ -104,10 +104,27 @@ def evaluate_neural_model(
                 warmup_full = warmup_inputs
             warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
 
-            controls_np = horizon_inputs[:, :control_dim]
+            # Split rollout inputs by semantic column roles (same logic as training).
+            # Keep controls separate; route all other known non-output inputs
+            # (including time features) through exogenous.
+            control_cols = set(val_dataset.groups.get("control", []))
+            output_cols = set(val_dataset.output_cols)
+            control_positions = [
+                i for i, col in enumerate(val_dataset.input_cols)
+                if col in control_cols
+            ]
+            known_exo_positions = [
+                i for i, col in enumerate(val_dataset.input_cols)
+                if (col not in control_cols and col not in output_cols)
+            ]
+            controls_np = (
+                horizon_inputs[:, control_positions]
+                if control_positions
+                else np.zeros((eval_horizon, 0), dtype=np.float32)
+            )
             exo_np = (
-                horizon_inputs[:, control_dim : control_dim + exo_dim]
-                if exo_dim > 0
+                horizon_inputs[:, known_exo_positions]
+                if known_exo_positions
                 else np.zeros((eval_horizon, 0), dtype=np.float32)
             )
 

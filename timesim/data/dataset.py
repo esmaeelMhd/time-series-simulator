@@ -38,8 +38,12 @@ class TimeSeriesDataset(Dataset):
         self.scaler = None
         if scale:
             self.scaler = MinMaxScaler().fit(self.series.values)
-            scaled = self.scaler.transform(self.series.values)
-            self.series.iloc[:, :] = scaled
+            scaled = self.scaler.transform(self.series.values).astype(np.float32, copy=False)
+            self.series = pd.DataFrame(
+                scaled,
+                index=self.series.index,
+                columns=self.series.columns,
+            )
 
         self.values = self.series.values.astype(np.float32)
 
@@ -126,10 +130,12 @@ class GroupedTimeSeriesDataset(Dataset):
             if scaler is not None:
                 # Use provided scaler
                 self.scaler = scaler
-                df.iloc[:, :] = self.scaler.transform(df.values)
+                scaled = self.scaler.transform(df.values).astype(np.float32, copy=False)
+                df = pd.DataFrame(scaled, index=df.index, columns=df.columns)
             else:
                 self.scaler = MinMaxScaler().fit(df.values)
-                df.iloc[:, :] = self.scaler.transform(df.values)
+                scaled = self.scaler.transform(df.values).astype(np.float32, copy=False)
+                df = pd.DataFrame(scaled, index=df.index, columns=df.columns)
         else:
             self.scaler = None
 

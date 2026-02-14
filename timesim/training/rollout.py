@@ -164,15 +164,21 @@ def batch_rollout(
     batch_size = len(start_indices)
     max_horizon = int(horizons.max())
     
-    # Compute dimension info once (Rule 4: minimize repeated calls)
-    control_cols = dataset.groups.get("control", [])
-    exo_cols = dataset.groups.get("exogenous", [])
-    control_dim = len([c for c in dataset.input_cols if c in control_cols])
-    exo_dim = len([c for c in dataset.input_cols if c in exo_cols])
-    
-    if control_dim + exo_dim == 0:
-        control_dim = len(dataset.in_idx)
-        exo_dim = 0
+    # Build feature positions from semantic column names.
+    # Controls are kept separate; all other known input features (excluding
+    # output/target columns) are fed through the exogenous path.
+    control_cols = set(dataset.groups.get("control", []))
+    output_cols = set(dataset.output_cols)
+    control_positions = [
+        i for i, col in enumerate(dataset.input_cols)
+        if col in control_cols
+    ]
+    known_exo_positions = [
+        i for i, col in enumerate(dataset.input_cols)
+        if (col not in control_cols and col not in output_cols)
+    ]
+    control_dim = len(control_positions)
+    exo_dim = len(known_exo_positions)
     
     # Prepare batch data with single conversion (HOT PATH optimization)
     batch_data = _prepare_batch_data(
@@ -184,9 +190,15 @@ def batch_rollout(
     rollout_targets_all = batch_data["rollout_targets"]  # (B, max_horizon, output)
     
     # Split rollout inputs into controls and exogenous
-    controls = rollout_inputs_all[:, :, :control_dim]  # (B, max_horizon, C)
+    if control_dim > 0:
+        control_idx = torch.as_tensor(control_positions, dtype=torch.long, device=device)
+        controls = torch.index_select(rollout_inputs_all, dim=2, index=control_idx)
+    else:
+        controls = torch.zeros(batch_size, max_horizon, 0, device=device)
+
     if exo_dim > 0:
-        exogenous = rollout_inputs_all[:, :, control_dim:control_dim+exo_dim]
+        exo_idx = torch.as_tensor(known_exo_positions, dtype=torch.long, device=device)
+        exogenous = torch.index_select(rollout_inputs_all, dim=2, index=exo_idx)
     else:
         exogenous = torch.zeros(batch_size, max_horizon, 0, device=device)
     
@@ -392,4 +404,3 @@ def rollout_autoregressive(
             x = torch.cat([x, step], dim=1)[:, 1:, :]  # slide window
     
     return torch.cat(preds, dim=1)  # (B, h_max, F_out)
-
