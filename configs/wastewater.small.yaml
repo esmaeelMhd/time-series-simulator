@@ -51,6 +51,7 @@ training_rounds:
 
 # ---------- overrides ----------
 training:
+  steps_per_epoch: null               # null → use all available train data
   sampling:
     horizon: 12                       # for random_fixed / daily_fixed
 

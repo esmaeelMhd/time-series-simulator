@@ -47,7 +47,12 @@ training:
   # Early stopping
   early_stopping: true
   patience: 5
-  min_delta: 0.001                     # minimum improvement to reset patience
+  min_delta: 0.0                       # minimum improvement to reset patience
+  checkpoint_simulation:
+    enabled: false                     # run monitoring simulation when checkpoint improves
+    n_rounds: 0                        # number of simulation snapshots per improved epoch
+    horizon: null                      # null -> fallback to simulation.horizon
+    start_idx: 0                       # first snapshot index; remaining snapshots use random indices
 
   # Hyperparameters and fast training
   use_optuna_best_params: false        # if true, load per-model best_params from Optuna summary

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -254,6 +256,10 @@ def _maybe_compile_model(model, config: Dict[str, Any]):
     if not bool(tcfg.get("use_compile", False)):
         return model
     if not hasattr(torch, "compile"):
+        return model
+    # On Windows, Inductor requires MSVC compiler toolchain (`cl`).
+    # If unavailable, avoid runtime compile failures and use eager mode.
+    if sys.platform.startswith("win") and shutil.which("cl") is None:
         return model
     compile_mode = str(tcfg.get("compile_mode", "default"))
     try:

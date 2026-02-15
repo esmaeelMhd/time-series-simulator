@@ -13,10 +13,27 @@ class EarlyStopping:
         self.early_stop = False
 
     def __call__(self, val_loss: float):
-        if self.best_loss is None or val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
+        # Ignore invalid validations; do not mutate state.
+        if val_loss is None or not np.isfinite(val_loss):
+            return
+
+        if self.best_loss is None:
+            self.best_loss = float(val_loss)
             self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True 
+            return
+
+        # Significant improvement: update best and reset patience.
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = float(val_loss)
+            self.counter = 0
+            return
+
+        # Small improvement (< min_delta): still update best, but don't consume patience.
+        if val_loss < self.best_loss:
+            self.best_loss = float(val_loss)
+            return
+
+        # No improvement.
+        self.counter += 1
+        if self.counter >= self.patience:
+            self.early_stop = True

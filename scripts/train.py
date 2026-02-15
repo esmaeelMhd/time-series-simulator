@@ -16,10 +16,11 @@ Usage:
 """
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import yaml
 import numpy as np
@@ -149,7 +150,9 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
                        model_dir, lr_override=None, epochs_override=None,
                        steps_per_epoch_override=None,
                        optimizer_override=None,
-                       training_overrides=None):
+                       training_overrides=None,
+                       checkpoint_path=None,
+                       checkpoint_callback: Optional[Callable[[int, float], None]] = None):
     """Train a neural WorldModel. Returns (train_losses, val_losses)."""
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -220,6 +223,8 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         epochs=epochs,
         steps_per_epoch=steps_per_epoch,
         verbose=True,
+        checkpoint_path=checkpoint_path,
+        on_checkpoint_saved=checkpoint_callback,
     )
     return train_losses, val_losses
 
@@ -276,6 +281,11 @@ def _maybe_compile_model(model, config: Dict[str, Any]):
     if not hasattr(torch, "compile"):
         print("  Warning: torch.compile not available in this torch build.")
         return model
+    # On Windows, Inductor requires MSVC compiler toolchain (`cl`).
+    # If unavailable, avoid runtime compile failures and use eager mode.
+    if sys.platform.startswith("win") and shutil.which("cl") is None:
+        print("  Warning: torch.compile requested but MSVC 'cl' was not found; using eager mode.")
+        return model
     compile_mode = str(tcfg.get("compile_mode", "default"))
     try:
         compiled = torch.compile(model, mode=compile_mode)
@@ -326,6 +336,50 @@ def train_xgboost_model(model, train_dataset, val_dataset, config, model_dir):
     print(f"  train MSE={train_mse:.6f}  val MSE={val_mse:.6f}")
 
     return [train_mse], [val_mse]
+
+
+def _build_simulation_start_idx_schedule(
+    total_len: int,
+    seq_len: int,
+    sim_horizon: int,
+    n_rounds: int,
+    fixed_start_idx: int,
+    seed_base: int,
+    round_name: str,
+    model_type: str,
+) -> list[int]:
+    """Build start-index schedule: first fixed index, remaining random indices."""
+    if n_rounds <= 0:
+        return []
+    max_start_allowed = max(0, total_len - seq_len - sim_horizon)
+    fixed = int(np.clip(fixed_start_idx, 0, max_start_allowed))
+    schedule = [fixed]
+    if n_rounds == 1:
+        return schedule
+
+    model_round_salt = sum(ord(ch) for ch in f"{round_name}:{model_type}")
+    rng = np.random.default_rng(seed_base + model_round_salt)
+    candidate_starts = [i for i in range(max_start_allowed + 1) if i != fixed]
+    remaining = n_rounds - 1
+    if len(candidate_starts) >= remaining:
+        sampled = rng.choice(
+            np.asarray(candidate_starts, dtype=np.int64),
+            size=remaining,
+            replace=False,
+        ).tolist()
+    elif len(candidate_starts) > 0:
+        sampled = list(candidate_starts)
+        sampled.extend(
+            rng.choice(
+                np.asarray(candidate_starts, dtype=np.int64),
+                size=remaining - len(candidate_starts),
+                replace=True,
+            ).tolist()
+        )
+    else:
+        sampled = [fixed] * remaining
+    schedule.extend(int(s) for s in sampled)
+    return schedule
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -488,6 +542,14 @@ def main():
 
     sim_cfg = config.get("simulation", {})
     sim_start = sim_cfg.get("start_idx", 0)
+    checkpoint_sim_cfg = config.get("training", {}).get("checkpoint_simulation", {}) or {}
+    checkpoint_sim_enabled = bool(checkpoint_sim_cfg.get("enabled", False))
+    checkpoint_sim_rounds = int(checkpoint_sim_cfg.get("n_rounds", 0) or 0)
+    checkpoint_sim_rounds = max(0, checkpoint_sim_rounds)
+    checkpoint_sim_horizon_cfg = checkpoint_sim_cfg.get("horizon", None)
+    if checkpoint_sim_horizon_cfg is None:
+        checkpoint_sim_horizon_cfg = sim_cfg.get("horizon", None)
+    checkpoint_sim_start = int(checkpoint_sim_cfg.get("start_idx", sim_start))
 
     # ── Output directory ──────────────────────────────────────────────
     dataset_name = config["dataset"]["name"]
@@ -663,6 +725,64 @@ def main():
                 if model_type in NEURAL_MODELS:
                     effective_lr = model_lr
                     effective_optimizer = train_overrides.get("optimizer", None)
+                    checkpoint_callback = None
+                    if checkpoint_sim_enabled and checkpoint_sim_rounds > 0:
+                        monitor_state = {"plot_counter": 0}
+                        if checkpoint_sim_horizon_cfg is None:
+                            checkpoint_sim_horizon = len(val_dataset.values) - seq_len
+                        else:
+                            checkpoint_sim_horizon = int(checkpoint_sim_horizon_cfg)
+                        checkpoint_sim_horizon = max(0, checkpoint_sim_horizon)
+                        seed_base = int(config.get("misc", {}).get("seed", 42))
+                        start_idx_schedule = _build_simulation_start_idx_schedule(
+                            total_len=len(val_dataset.values),
+                            seq_len=seq_len,
+                            sim_horizon=checkpoint_sim_horizon,
+                            n_rounds=checkpoint_sim_rounds,
+                            fixed_start_idx=checkpoint_sim_start,
+                            seed_base=seed_base,
+                            round_name=round_name,
+                            model_type=model_type,
+                        )
+
+                        round_name_local = round_name
+                        model_type_local = model_type
+                        model_dir_local = model_dir
+                        simulation_plot_dir = model_dir_local / "simulations"
+                        print(
+                            "  Checkpoint simulation start_idx schedule: "
+                            f"{start_idx_schedule[:checkpoint_sim_rounds]}"
+                        )
+
+                        def checkpoint_callback(epoch_idx: int, improved_val_loss: float):
+                            if checkpoint_sim_horizon <= 0:
+                                return
+                            saved_this_epoch = 0
+                            # Save all configured simulation rounds for each
+                            # improved checkpoint epoch.
+                            for sim_start_idx in start_idx_schedule[:checkpoint_sim_rounds]:
+                                sim_result = simulate_recursive_neural(
+                                    model, val_dataset, seq_len,
+                                    checkpoint_sim_horizon, device,
+                                    start_idx=sim_start_idx,
+                                )
+                                if sim_result["n_steps"] <= 0:
+                                    continue
+                                monitor_state["plot_counter"] += 1
+                                sim_idx = monitor_state["plot_counter"]
+                                sim_plot_path = simulation_plot_dir / f"{round_name_local}_simulation_{sim_idx}.png"
+                                save_per_model_simulation_plot(
+                                    sim_result, output_cols, model_type_local,
+                                    sim_plot_path,
+                                    plot_cfg=plot_cfg,
+                                )
+                                saved_this_epoch += 1
+                            if saved_this_epoch > 0:
+                                print(
+                                    f"  Saved {saved_this_epoch} checkpoint simulation plots "
+                                    f"(epoch={epoch_idx}, val_loss={improved_val_loss:.6f})"
+                                )
+
                     train_losses, val_losses = train_neural_model(
                         model, train_dataset, val_dataset, config, device,
                         model_dir,
@@ -671,14 +791,58 @@ def main():
                         steps_per_epoch_override=round_steps_per_epoch,
                         optimizer_override=effective_optimizer,
                         training_overrides=train_overrides,
+                        checkpoint_path=model_dir / f"{round_name}_checkpoint.pth",
+                        checkpoint_callback=checkpoint_callback,
                     )
-                    torch.save(model.state_dict(),
-                               model_dir / f"{round_name}_checkpoint.pth")
                 else:
                     train_losses, val_losses = train_xgboost_model(
                         model, train_dataset, val_dataset, config, model_dir,
                     )
                     model.save(str(model_dir / f"{round_name}_model.pkl"))
+                    if checkpoint_sim_enabled and checkpoint_sim_rounds > 0:
+                        if checkpoint_sim_horizon_cfg is None:
+                            checkpoint_sim_horizon = len(val_dataset.values) - seq_len
+                        else:
+                            checkpoint_sim_horizon = int(checkpoint_sim_horizon_cfg)
+                        checkpoint_sim_horizon = max(0, checkpoint_sim_horizon)
+                        if checkpoint_sim_horizon > 0:
+                            seed_base = int(config.get("misc", {}).get("seed", 42))
+                            start_idx_schedule = _build_simulation_start_idx_schedule(
+                                total_len=len(val_dataset.values),
+                                seq_len=seq_len,
+                                sim_horizon=checkpoint_sim_horizon,
+                                n_rounds=checkpoint_sim_rounds,
+                                fixed_start_idx=checkpoint_sim_start,
+                                seed_base=seed_base,
+                                round_name=round_name,
+                                model_type=model_type,
+                            )
+                            simulation_plot_dir = model_dir / "simulations"
+                            print(
+                                "  Checkpoint simulation start_idx schedule: "
+                                f"{start_idx_schedule[:checkpoint_sim_rounds]}"
+                            )
+                            saved_xgb_sims = 0
+                            for sim_start_idx in start_idx_schedule[:checkpoint_sim_rounds]:
+                                sim_result = simulate_recursive_xgboost(
+                                    model, val_dataset, seq_len,
+                                    checkpoint_sim_horizon,
+                                    start_idx=sim_start_idx,
+                                )
+                                if sim_result["n_steps"] <= 0:
+                                    continue
+                                saved_xgb_sims += 1
+                                sim_plot_path = simulation_plot_dir / f"{round_name}_simulation_{saved_xgb_sims}.png"
+                                save_per_model_simulation_plot(
+                                    sim_result, output_cols, model_type,
+                                    sim_plot_path,
+                                    plot_cfg=plot_cfg,
+                                )
+                            if saved_xgb_sims > 0:
+                                print(
+                                    f"  Saved {saved_xgb_sims} checkpoint simulation plots "
+                                    "(post-fit xgboost)"
+                                )
 
                 elapsed = time.time() - t0
 

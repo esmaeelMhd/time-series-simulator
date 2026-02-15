@@ -359,6 +359,8 @@ class WorldModelTrainer:
         epochs: int = 10,
         steps_per_epoch: Optional[int] = None,
         verbose: bool = True,
+        checkpoint_path: Optional[str | Path] = None,
+        on_checkpoint_saved: Optional[Callable[[int, float], None]] = None,
     ) -> tuple[list[float], list[Optional[float]]]:
         """Train the world model.
         
@@ -371,6 +373,11 @@ class WorldModelTrainer:
             based on dataset size.
         verbose : bool, default True
             Whether to print progress.
+        checkpoint_path : str or Path, optional
+            If provided, save checkpoint only when validation loss improves.
+        on_checkpoint_saved : callable, optional
+            Callback invoked as ``on_checkpoint_saved(epoch, val_loss)`` when
+            an improved validation checkpoint is saved.
         
         Returns
         -------
@@ -394,9 +401,20 @@ class WorldModelTrainer:
         val_losses = []
         start_time = time.time()
         epoch_times = []
+        best_val_loss: Optional[float] = None
+        best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+        checkpoint_target: Optional[Path] = None
+        if checkpoint_path is not None:
+            checkpoint_target = Path(checkpoint_path)
+        elif self.run_dir:
+            checkpoint_target = self.run_dir / "best_checkpoint.pth"
+        if checkpoint_target is not None:
+            checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
         
         for epoch in range(1, epochs + 1):
             epoch_start_time = time.time()
+            if verbose:
+                print(f"Epoch {epoch}/{epochs}...")
             
             # Training
             self.model.train()
@@ -428,14 +446,41 @@ class WorldModelTrainer:
             
             # Validation
             if verbose:
-                print(f"  Validating...", end=" ", flush=True)
+                print("  Validating...", flush=True)
             val_start_time = time.time()
             val_loss = self._validate()
             val_losses.append(val_loss)
             val_time = time.time() - val_start_time
-            
             if verbose:
-                print(f"done ({val_time:.2f}s)")
+                print(f"  Validation done ({val_time:.2f}s)")
+            if val_loss is not None and np.isfinite(val_loss):
+                if best_val_loss is None or val_loss < best_val_loss:
+                    prev_best = best_val_loss
+                    best_val_loss = float(val_loss)
+                    # Keep a CPU copy so we can restore best weights after training.
+                    best_state_dict = {
+                        k: v.detach().cpu().clone()
+                        for k, v in self.model.state_dict().items()
+                    }
+                    if checkpoint_target is not None:
+                        torch.save(best_state_dict, checkpoint_target)
+                        if verbose:
+                            if prev_best is None:
+                                print(
+                                    f"  Saved checkpoint: {checkpoint_target} "
+                                    f"(val_loss={val_loss:.6f})"
+                                )
+                            else:
+                                print(
+                                    f"  Saved checkpoint: {checkpoint_target} "
+                                    f"(val_loss improved {prev_best:.6f} -> {val_loss:.6f})"
+                                )
+                        if on_checkpoint_saved is not None:
+                            try:
+                                on_checkpoint_saved(epoch, float(val_loss))
+                            except Exception as cb_exc:
+                                if verbose:
+                                    print(f"  Warning: checkpoint callback failed: {cb_exc}")
             
             epoch_time = time.time() - epoch_start_time
             epoch_times.append(epoch_time)
@@ -472,12 +517,26 @@ class WorldModelTrainer:
                     if verbose:
                         print(f"\n{'='*70}")
                         print("Early stopping triggered.")
+                        print(
+                            f"Reason: no validation improvement for "
+                            f"{self.early_stopping.counter} epoch(s) "
+                            f"(patience={self.early_stopping.patience})."
+                        )
+                        if val_loss is not None:
+                            print(f"Current validation loss: {val_loss:.6f}")
                         if self.early_stopping.best_loss is not None:
                             print(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
+                            if val_loss is not None:
+                                diff = float(val_loss) - float(self.early_stopping.best_loss)
+                                print(f"Validation gap vs best: {diff:+.6f}")
                         print(f"Stopped at epoch {epoch}/{epochs}")
                         print(f"{'='*70}\n")
                     break
-        
+
+        # Ensure caller gets the best validation model, not the final epoch model.
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
+
         total_time = time.time() - start_time
         
         if verbose:
@@ -489,6 +548,8 @@ class WorldModelTrainer:
                 print(f"Final train loss: {train_losses[-1]:.6f}")
                 if val_losses[-1] is not None:
                     print(f"Final val loss: {val_losses[-1]:.6f}")
+                if best_val_loss is not None:
+                    print(f"Best val loss: {best_val_loss:.6f}")
             print(f"{'='*70}\n")
         
         return train_losses, val_losses
@@ -640,6 +701,15 @@ class Trainer(nn.Module):
                 if self.early_stopping.early_stop:
                     if verbose:
                         print("Early stopping triggered.")
+                        print(
+                            f"Reason: no validation improvement for "
+                            f"{self.early_stopping.counter} epoch(s) "
+                            f"(patience={self.early_stopping.patience})."
+                        )
+                        if val_loss is not None:
+                            print(f"Current validation loss: {val_loss:.6f}")
+                        if self.early_stopping.best_loss is not None:
+                            print(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
                     break
             
             if self.writer is not None:
