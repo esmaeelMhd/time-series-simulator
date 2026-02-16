@@ -6,7 +6,7 @@ All plotting functions read style/dpi/colors from a ``plot_cfg`` dict
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -59,6 +59,35 @@ def _save(fig, out_path, plot_cfg: Optional[Dict] = None):
     plt.close(fig)
 
 
+def _build_controls_exogenous(
+    dataset,
+    horizon_inputs: np.ndarray,
+    horizon_len: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split input features into control and exogenous blocks."""
+    control_cols = set(dataset.groups.get("control", []))
+    output_cols = set(dataset.output_cols)
+    control_positions = [
+        i for i, col in enumerate(dataset.input_cols)
+        if col in control_cols
+    ]
+    known_exo_positions = [
+        i for i, col in enumerate(dataset.input_cols)
+        if (col not in control_cols and col not in output_cols)
+    ]
+    controls_np = (
+        horizon_inputs[:, control_positions]
+        if control_positions
+        else np.zeros((horizon_len, 0), dtype=np.float32)
+    )
+    exo_np = (
+        horizon_inputs[:, known_exo_positions]
+        if known_exo_positions
+        else np.zeros((horizon_len, 0), dtype=np.float32)
+    )
+    return controls_np, exo_np
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Evaluation (rollout)
 # ─────────────────────────────────────────────────────────────────────
@@ -66,6 +95,8 @@ def _save(fig, out_path, plot_cfg: Optional[Dict] = None):
 def evaluate_neural_model(
     model, val_dataset, warmup_len, eval_horizon,
     control_dim, exo_dim, device, n_windows=4,
+    probabilistic_cfg: Optional[Dict[str, Any]] = None,
+    return_info: bool = False,
 ):
     """Evaluate a neural model on multiple validation windows via rollout."""
     model.eval()
@@ -75,13 +106,28 @@ def evaluate_neural_model(
     min_required = warmup_len + eval_horizon
     if val_len < min_required:
         print(f"  Warning: val data too short ({val_len} < {min_required})")
+        if return_info:
+            return [], [], {
+                "is_probabilistic": False,
+                "rollout_nll": float("nan"),
+                "coverage_90": float("nan"),
+                "interval_width_90": float("nan"),
+            }
         return [], []
 
     max_start = val_len - min_required
     step = max(1, max_start // n_windows)
     start_indices = list(range(0, max_start, step))[:n_windows]
 
+    prob_cfg = probabilistic_cfg or {}
+    mc_samples = max(2, int(prob_cfg.get("mc_samples", 256)))
+    interval_level = float(prob_cfg.get("interval_level", 0.90))
+    is_prob_model = bool(getattr(model, "is_probabilistic", False) and hasattr(model, "rollout_mc"))
+
     gt_list, pred_list = [], []
+    nll_list: List[float] = []
+    coverage_list: List[float] = []
+    width_list: List[float] = []
     with torch.no_grad():
         for start_idx in start_indices:
             warmup_end = start_idx + warmup_len
@@ -104,28 +150,8 @@ def evaluate_neural_model(
                 warmup_full = warmup_inputs
             warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
 
-            # Split rollout inputs by semantic column roles (same logic as training).
-            # Keep controls separate; route all other known non-output inputs
-            # (including time features) through exogenous.
-            control_cols = set(val_dataset.groups.get("control", []))
-            output_cols = set(val_dataset.output_cols)
-            control_positions = [
-                i for i, col in enumerate(val_dataset.input_cols)
-                if col in control_cols
-            ]
-            known_exo_positions = [
-                i for i, col in enumerate(val_dataset.input_cols)
-                if (col not in control_cols and col not in output_cols)
-            ]
-            controls_np = (
-                horizon_inputs[:, control_positions]
-                if control_positions
-                else np.zeros((eval_horizon, 0), dtype=np.float32)
-            )
-            exo_np = (
-                horizon_inputs[:, known_exo_positions]
-                if known_exo_positions
-                else np.zeros((eval_horizon, 0), dtype=np.float32)
+            controls_np, exo_np = _build_controls_exogenous(
+                val_dataset, horizon_inputs, eval_horizon
             )
 
             controls_t = torch.from_numpy(controls_np).float().unsqueeze(0).to(device)
@@ -136,12 +162,45 @@ def evaluate_neural_model(
                 rollout_inputs={"controls": controls_t, "exogenous": exo_t},
                 horizon=eval_horizon,
             )
-
             predictions = result["predictions"].squeeze(0).cpu().numpy()
+
+            if is_prob_model:
+                dist_loc = result.get("dist_loc")
+                dist_scale = result.get("dist_scale")
+                dist_df = result.get("dist_df")
+                if dist_loc is not None and dist_scale is not None and dist_df is not None:
+                    y_t = torch.from_numpy(horizon_outputs).float().unsqueeze(0).to(device)
+                    dist = torch.distributions.StudentT(df=dist_df, loc=dist_loc, scale=dist_scale)
+                    nll = float((-dist.log_prob(y_t)).mean().item())
+                    nll_list.append(nll)
+
+                mc = model.rollout_mc(
+                    warmup_seq={"inputs": warmup_tensor},
+                    rollout_inputs={"controls": controls_t, "exogenous": exo_t},
+                    horizon=eval_horizon,
+                    n_samples=mc_samples,
+                    interval_level=interval_level,
+                )
+                predictions = mc["mean"].squeeze(0).cpu().numpy()
+                lower_np = mc["lower"].squeeze(0).cpu().numpy()
+                upper_np = mc["upper"].squeeze(0).cpu().numpy()
+                inside = (horizon_outputs >= lower_np) & (horizon_outputs <= upper_np)
+                coverage_list.append(float(np.mean(inside)))
+                width_list.append(float(np.mean(upper_np - lower_np)))
+
             gt_list.append(horizon_outputs)
             pred_list.append(predictions)
 
-    return gt_list, pred_list
+    if not return_info:
+        return gt_list, pred_list
+
+    info = {
+        "is_probabilistic": is_prob_model,
+        "rollout_nll": float(np.mean(nll_list)) if nll_list else float("nan"),
+        "coverage_90": float(np.mean(coverage_list)) if coverage_list else float("nan"),
+        "interval_width_90": float(np.mean(width_list)) if width_list else float("nan"),
+    }
+    return gt_list, pred_list, info
 
 
 def evaluate_xgboost_model(
@@ -199,6 +258,7 @@ def evaluate_xgboost_model(
 
 def simulate_recursive_neural(
     model, val_dataset, seq_len, sim_horizon, device, start_idx=0,
+    probabilistic_cfg: Optional[Dict[str, Any]] = None,
 ):
     """Environment-style recursive simulation for a neural model."""
     model.eval()
@@ -216,6 +276,46 @@ def simulate_recursive_neural(
     window = val_data[start_idx : start_idx + seq_len].copy()
     predictions = np.zeros((sim_horizon, output_dim), dtype=np.float32)
     ground_truths = np.zeros((sim_horizon, output_dim), dtype=np.float32)
+
+    if bool(getattr(model, "is_probabilistic", False) and hasattr(model, "rollout_mc")):
+        prob_cfg = probabilistic_cfg or {}
+        mc_samples = max(2, int(prob_cfg.get("mc_samples", 256)))
+        interval_level = float(prob_cfg.get("interval_level", 0.90))
+        warmup_data = val_data[start_idx : start_idx + seq_len]
+        horizon_data = val_data[start_idx + seq_len : start_idx + seq_len + sim_horizon]
+        warmup_inputs = warmup_data[:, in_idx]
+        horizon_inputs = horizon_data[:, in_idx]
+        ground_truths = horizon_data[:, out_idx]
+
+        in_idx_set = set(in_idx)
+        extra_out_idx = [i for i in out_idx if i not in in_idx_set]
+        if extra_out_idx:
+            extra_out = warmup_data[:, extra_out_idx]
+            warmup_full = np.concatenate([warmup_inputs, extra_out], axis=-1)
+        else:
+            warmup_full = warmup_inputs
+
+        controls_np, exo_np = _build_controls_exogenous(val_dataset, horizon_inputs, sim_horizon)
+        warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
+        controls_t = torch.from_numpy(controls_np).float().unsqueeze(0).to(device)
+        exo_t = torch.from_numpy(exo_np).float().unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            mc = model.rollout_mc(
+                warmup_seq={"inputs": warmup_tensor},
+                rollout_inputs={"controls": controls_t, "exogenous": exo_t},
+                horizon=sim_horizon,
+                n_samples=mc_samples,
+                interval_level=interval_level,
+            )
+        return {
+            "predictions": mc["mean"].squeeze(0).cpu().numpy(),
+            "ground_truths": ground_truths,
+            "lower": mc["lower"].squeeze(0).cpu().numpy(),
+            "upper": mc["upper"].squeeze(0).cpu().numpy(),
+            "interval_level": interval_level,
+            "n_steps": sim_horizon,
+        }
 
     # Only append output columns not already in input columns
     in_idx_set = set(in_idx)
@@ -297,6 +397,9 @@ def save_per_model_simulation_plot(sim_result, output_cols, model_name, out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
     gt = sim_result["ground_truths"]
     pred = sim_result["predictions"]
+    lower = sim_result.get("lower")
+    upper = sim_result.get("upper")
+    interval_level = float(sim_result.get("interval_level", 0.90))
     n_steps = sim_result["n_steps"]
     n_vars = len(output_cols)
     steps = np.arange(n_steps)
@@ -306,6 +409,16 @@ def save_per_model_simulation_plot(sim_result, output_cols, model_name, out_path
         ax.plot(steps, gt[:, v], color="#1B1B1E", linewidth=2, label="Ground Truth")
         ax.plot(steps, pred[:, v], color="#2E86AB", linewidth=1.3, linestyle="--",
                 alpha=0.85, label=model_name)
+        if lower is not None and upper is not None:
+            band_label = f"{int(interval_level * 100)}% interval"
+            ax.fill_between(
+                steps,
+                lower[:, v],
+                upper[:, v],
+                color="#2E86AB",
+                alpha=0.2,
+                label=band_label,
+            )
         ax.set_ylabel(output_cols[v])
         ax.legend(fontsize=cfg["legend_font_size"])
         ax.set_title(f"{output_cols[v]} – Trajectory", fontsize=10,
@@ -336,6 +449,9 @@ def save_per_model_simulation_csv(sim_result, output_cols, model_dir, round_name
         sim_data[f"gt_{col}"] = gt_s[:, v]
         sim_data[f"pred_{col}"] = pr_s[:, v]
         sim_data[f"abserr_{col}"] = np.abs(gt_s[:, v] - pr_s[:, v])
+        if "lower" in sim_result and "upper" in sim_result:
+            sim_data[f"lower_{col}"] = sim_result["lower"][:, v]
+            sim_data[f"upper_{col}"] = sim_result["upper"][:, v]
     sim_data["step_mse"] = np.mean((gt_s - pr_s) ** 2, axis=-1)
     pd.DataFrame(sim_data).to_csv(
         model_dir / f"{round_name}_simulation.csv",

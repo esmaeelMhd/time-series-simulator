@@ -208,28 +208,35 @@ def batch_rollout(
     if uniform_horizon:
         # HOT PATH: True batched rollout - single model.rollout call
         horizon = int(horizons[0])
-        targets_for_feedback = rollout_targets_all[:, :horizon] if feedback in ["teacher", "mixed"] else None
-        
+        targets_for_rollout = rollout_targets_all[:, :horizon]
+
         rollout_result = model.rollout(
             warmup_seq={"inputs": warmup_full},
             rollout_inputs={"controls": controls[:, :horizon], "exogenous": exogenous[:, :horizon]},
             horizon=horizon,
             feedback=feedback,
             teacher_forcing_ratio=teacher_forcing_ratio,
-            targets=targets_for_feedback,
+            targets=targets_for_rollout,
         )
-        
+
         predictions = rollout_result["predictions"]  # (B, horizon, output)
         targets = rollout_targets_all[:, :horizon]
-        
+
         # Convert to list format for compatibility (no copy, just views)
         predictions_list = [predictions[i] for i in range(batch_size)]
         targets_list = [targets[i] for i in range(batch_size)]
+        extra_lists: Dict[str, List[torch.Tensor]] = {}
+        for key, val in rollout_result.items():
+            if key in {"predictions", "states"}:
+                continue
+            if torch.is_tensor(val) and val.shape[0] == batch_size:
+                extra_lists[key] = [val[i] for i in range(batch_size)]
     else:
         # Variable horizons: need per-item rollouts (less common case)
         predictions_list = []
         targets_list = []
-        
+        extra_lists: Dict[str, List[torch.Tensor]] = {}
+
         for i in range(batch_size):
             horizon = int(horizons[i])
             
@@ -245,18 +252,27 @@ def batch_rollout(
                 horizon=horizon,
                 feedback=feedback,
                 teacher_forcing_ratio=teacher_forcing_ratio,
-                targets=targets_i if feedback in ["teacher", "mixed"] else None,
+                targets=targets_i,
             )
-            
+
             predictions_list.append(rollout_result["predictions"].squeeze(0))
             targets_list.append(targets_i.squeeze(0))
-    
-    return {
+            for key, val in rollout_result.items():
+                if key in {"predictions", "states"}:
+                    continue
+                if not torch.is_tensor(val):
+                    continue
+                val_squeezed = val.squeeze(0) if val.dim() > 0 else val
+                extra_lists.setdefault(key, []).append(val_squeezed)
+
+    out = {
         "predictions": predictions_list,
         "targets": targets_list,
         "horizons": torch.as_tensor(horizons, dtype=torch.long, device=device),
         "start_indices": torch.as_tensor(start_indices, dtype=torch.long, device=device),
     }
+    out.update(extra_lists)
+    return out
 
 
 def batch_rollout_padded(
@@ -316,6 +332,10 @@ def batch_rollout_padded(
     predictions_list = result["predictions"]
     targets_list = result["targets"]
     horizons_tensor = result["horizons"]
+    extra_keys = [
+        k for k in result.keys()
+        if k not in {"predictions", "targets", "horizons", "start_indices"}
+    ]
     
     batch_size = len(predictions_list)
     max_horizon = int(horizons.max())
@@ -330,6 +350,11 @@ def batch_rollout_padded(
         predictions_padded = torch.stack(predictions_list, dim=0)
         targets_padded = torch.stack(targets_list, dim=0)
         mask = torch.ones(batch_size, max_horizon, dtype=torch.bool, device=dev)
+        extras_padded: Dict[str, torch.Tensor] = {}
+        for key in extra_keys:
+            extra_list = result.get(key, [])
+            if extra_list and torch.is_tensor(extra_list[0]):
+                extras_padded[key] = torch.stack(extra_list, dim=0)
     else:
         # Variable horizons: need padding
         # Preallocate output tensors (Rule 5: no allocations in loop)
@@ -355,13 +380,44 @@ def batch_rollout_padded(
             h = int(horizons[i])
             predictions_padded[i, :h] = predictions_list[i]
             targets_padded[i, :h] = targets_list[i]
-    
-    return {
+
+        extras_padded = {}
+        for key in extra_keys:
+            extra_list = result.get(key, [])
+            if not extra_list or not torch.is_tensor(extra_list[0]):
+                continue
+            v0 = extra_list[0]
+            if v0.dim() == 1:
+                padded = torch.full(
+                    (batch_size, max_horizon),
+                    pad_value,
+                    dtype=v0.dtype,
+                    device=v0.device,
+                )
+                for i in range(batch_size):
+                    h = int(horizons[i])
+                    padded[i, :h] = extra_list[i]
+                extras_padded[key] = padded
+            elif v0.dim() == 2:
+                padded = torch.full(
+                    (batch_size, max_horizon, v0.shape[-1]),
+                    pad_value,
+                    dtype=v0.dtype,
+                    device=v0.device,
+                )
+                for i in range(batch_size):
+                    h = int(horizons[i])
+                    padded[i, :h, :] = extra_list[i]
+                extras_padded[key] = padded
+
+    out = {
         "predictions": predictions_padded,
         "targets": targets_padded,
         "mask": mask,
         "horizons": horizons_tensor,
     }
+    out.update(extras_padded)
+    return out
 
 
 def rollout_autoregressive(

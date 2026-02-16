@@ -216,6 +216,19 @@ def _suggest_overrides(
             "dim_feedforward": trial.suggest_categorical("dim_feedforward", ff_choices),
             "dropout": trial.suggest_float("dropout", 0.0, max_dropout, step=0.05),
         }
+    if model_type == "latent_ssm":
+        hidden_choices = [32, 64, 96, 128] if profile == "fast_gpu" else [32, 64, 96, 128, 160, 192]
+        latent_choices = [8, 16, 24, 32] if profile == "fast_gpu" else [8, 16, 24, 32, 48, 64]
+        max_layers = 2 if profile == "fast_gpu" else 3
+        max_dropout = 0.3 if profile == "fast_gpu" else 0.4
+        return {
+            "hidden_dim": trial.suggest_categorical("hidden_dim", hidden_choices),
+            "latent_dim": trial.suggest_categorical("latent_dim", latent_choices),
+            "num_layers": trial.suggest_int("num_layers", 1, max_layers),
+            "dropout": trial.suggest_float("dropout", 0.0, max_dropout, step=0.05),
+            "min_scale": trial.suggest_float("min_scale", 1e-5, 1e-3, log=True),
+            "min_df": trial.suggest_float("min_df", 2.01, 5.0),
+        }
     if model_type == "xgboost":
         if profile == "fast_gpu":
             n_estimators_low, n_estimators_high = 50, 300
@@ -344,10 +357,14 @@ def main():
         else bool(ocfg.get("fast_mode", False))
     )
     if fast_mode:
-        trial_epochs = int(args.epochs if args.epochs is not None else ocfg.get("fast_epochs", 1))
+        trial_epochs = int(
+            args.epochs
+            if args.epochs is not None
+            else ocfg.get("fast_epochs", ocfg.get("epochs", 1))
+        )
         trial_steps = (
             args.steps_per_epoch if args.steps_per_epoch is not None
-            else ocfg.get("fast_steps_per_epoch", 40)
+            else ocfg.get("fast_steps_per_epoch", ocfg.get("steps_per_epoch", 40))
         )
         sampling_horizon_override = int(ocfg.get("fast_sampling_horizon", 24))
         training_mode = str(ocfg.get("fast_training_mode", "one_step"))
@@ -419,6 +436,26 @@ def main():
                     lr = trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True)
                 else:
                     lr = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
+                prob_cfg_default = tcfg.get("probabilistic", {}) or {}
+                if model_type == "latent_ssm":
+                    # Keep rollout MSE contribution meaningful for trajectory quality.
+                    elbo_weight = trial.suggest_float("elbo_weight", 0.5, 2.0)
+                    kl_weight = trial.suggest_float("kl_weight", 0.05, 1.5)
+                    rollout_mse_weight = trial.suggest_float("rollout_mse_weight", 0.5, 3.0)
+                    kl_beta_start = trial.suggest_float("kl_beta_start", 0.0, 0.3)
+                    kl_beta_end = 1.0
+                    kl_warmup_epochs = trial.suggest_int(
+                        "kl_warmup_epochs",
+                        1,
+                        max(1, trial_epochs),
+                    )
+                else:
+                    elbo_weight = float(prob_cfg_default.get("elbo_weight", 1.0))
+                    kl_weight = float(prob_cfg_default.get("kl_weight", 1.0))
+                    rollout_mse_weight = float(prob_cfg_default.get("rollout_mse_weight", 1.0))
+                    kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
+                    kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
+                    kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
 
                 one_step_weight = tcfg.get("one_step_weight", 0.5)
                 if tcfg.get("mode", "multi_step") == "combined":
@@ -429,6 +466,11 @@ def main():
                     teacher_forcing_ratio = trial.suggest_float("teacher_forcing_ratio", 0.0, 0.6)
 
                 optimizer_name = trial.suggest_categorical("optimizer", ["adam", "adamw"])
+                if optimizer_name == "adamw":
+                    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+                else:
+                    # Keep Adam regularization mild to avoid over-penalizing dynamics.
+                    weight_decay = trial.suggest_float("weight_decay", 0.0, 1e-4)
                 model = build_model(
                     model_type,
                     input_dim,
@@ -442,9 +484,13 @@ def main():
                 model = _maybe_compile_model(model, config)
 
                 if optimizer_name == "adamw":
-                    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(), lr=lr, weight_decay=weight_decay
+                    )
                 else:
-                    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+                    optimizer = torch.optim.Adam(
+                        model.parameters(), lr=lr, weight_decay=weight_decay
+                    )
 
                 trainer = WorldModelTrainer(
                     model=model,
@@ -468,6 +514,16 @@ def main():
                     patience=tcfg.get("patience", 5),
                     min_delta=tcfg.get("min_delta", 0.0),
                     run_dir=None,  # avoid trial artifact overhead
+                    probabilistic_cfg={
+                        "objective": prob_cfg_default.get("objective", "elbo_plus_rollout_mse"),
+                        "elbo_weight": elbo_weight,
+                        "kl_weight": kl_weight,
+                        "rollout_mse_weight": rollout_mse_weight,
+                        "kl_warmup_enabled": bool(prob_cfg_default.get("kl_warmup_enabled", False)),
+                        "kl_beta_start": kl_beta_start,
+                        "kl_beta_end": kl_beta_end,
+                        "kl_warmup_epochs": kl_warmup_epochs,
+                    },
                 )
 
                 best_score = float("inf")

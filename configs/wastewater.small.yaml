@@ -1,9 +1,5 @@
-# ─────────────────────────────────────────────────────────────────────
-#  wastewater.small.yaml  –  quick smoke-test variant
-#
-#  Extends wastewater.yaml with smaller data, fewer epochs, smaller
-#  models.  Same structure — just faster.
-# ─────────────────────────────────────────────────────────────────────
+﻿# wastewater.small.yaml - quick smoke-test variant
+# Extends wastewater.yaml with smaller data/fewer epochs.
 _base: wastewater.yaml
 
 # ---------- output ----------
@@ -34,6 +30,13 @@ models:
     d_model: 32
     nhead: 4
     num_layers: 1
+  - type: latent_ssm
+    hidden_dim: 32
+    latent_dim: 8
+    num_layers: 1
+    dropout: 0.1
+    learning_rate: 0.0007
+    min_df: 2.2
   - type: xgboost
     n_estimators: 50
     max_depth: 4
@@ -43,22 +46,34 @@ training_rounds:
   - name: train
     epochs: 3
     learning_rate: 0.001
-    models: [lstm, dlinear, nlinear, tft, transformer, xgboost]
+    models: [lstm, dlinear, nlinear, tft, transformer, latent_ssm, xgboost]
   - name: retrain
     epochs: 2
     learning_rate: 0.0005
-    models: [lstm, transformer, xgboost]
+    models: [lstm, transformer, latent_ssm, xgboost]
 
 # ---------- overrides ----------
 training:
-  steps_per_epoch: null               # null → use all available train data
+  steps_per_epoch: null
   sampling:
-    horizon: 12                       # for random_fixed / daily_fixed
-
+    horizon: 12
+  probabilistic:
+    objective: elbo_plus_rollout_mse
+    elbo_weight: 1.0
+    kl_weight: 0.5
+    rollout_mse_weight: 2.0
+    kl_warmup_enabled: true
+    kl_beta_start: 0.0
+    kl_beta_end: 1.0
+    kl_warmup_epochs: 2
+    mc_train_samples: 4
 
 evaluation:
   horizon: 12
   n_windows: 4
+  probabilistic:
+    mc_samples: 64
+    interval_level: 0.90
 
 simulation:
   horizon: 100
@@ -68,6 +83,6 @@ model_io:
   input_groups: ["control"]
   output_groups: ["objective"]
 
-# ---------- misc ---------------
+# ---------- misc ----------
 misc:
   device: cpu

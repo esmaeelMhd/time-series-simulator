@@ -373,6 +373,86 @@ class CombinedLoss(nn.Module):
         return total_loss, info
 
 
+class ProbabilisticRolloutLoss(nn.Module):
+    """ELBO-style probabilistic rollout loss with optional rollout MSE term."""
+
+    def __init__(
+        self,
+        elbo_weight: float = 1.0,
+        kl_weight: float = 1.0,
+        rollout_mse_weight: float = 1.0,
+    ):
+        super().__init__()
+        self.elbo_weight = float(elbo_weight)
+        self.kl_weight = float(kl_weight)
+        self.rollout_mse_weight = float(rollout_mse_weight)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return x.mean()
+        mask_dims = mask.dim()
+        mask_f = mask.to(dtype=x.dtype)
+        while mask_f.dim() < x.dim():
+            mask_f = mask_f.unsqueeze(-1)
+        extra = 1
+        for d in range(mask_dims, x.dim()):
+            extra *= int(x.shape[d])
+        denom = (mask_f.sum() * float(extra)).clamp_min(1.0)
+        return (x * mask_f).sum() / denom
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        dist_loc: torch.Tensor,
+        dist_scale: torch.Tensor,
+        dist_df: torch.Tensor,
+        kl_terms: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kl_beta: float = 1.0,
+        mse_weight: Optional[float] = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        nll, kl, mse = self.compute_terms(
+            predictions=predictions,
+            targets=targets,
+            dist_loc=dist_loc,
+            dist_scale=dist_scale,
+            dist_df=dist_df,
+            kl_terms=kl_terms,
+            mask=mask,
+        )
+        mse_coeff = self.rollout_mse_weight if mse_weight is None else float(mse_weight)
+        total = self.elbo_weight * (nll + self.kl_weight * float(kl_beta) * kl) + mse_coeff * mse
+        info = {
+            "loss_total": float(total.detach().item()),
+            "nll": float(nll.detach().item()),
+            "kl": float(kl.detach().item()),
+            "mse": float(mse.detach().item()),
+            "kl_beta": float(kl_beta),
+            "mse_weight": float(mse_coeff),
+        }
+        return total, info
+
+    def compute_terms(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        dist_loc: torch.Tensor,
+        dist_scale: torch.Tensor,
+        dist_df: torch.Tensor,
+        kl_terms: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dist = torch.distributions.StudentT(df=dist_df, loc=dist_loc, scale=dist_scale)
+        nll_elem = -dist.log_prob(targets)
+        nll = self._masked_mean(nll_elem, mask)
+        kl = self._masked_mean(kl_terms, mask)
+        mse_elem = (predictions - targets) ** 2
+        mse = self._masked_mean(mse_elem, mask)
+        return nll, kl, mse
+
+
 def dilate_loss(
     target: torch.Tensor,
     prediction: torch.Tensor,

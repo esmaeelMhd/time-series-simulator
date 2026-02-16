@@ -171,8 +171,10 @@ def main():
     exo_dim = len([c for c in input_cols if c in exo_cols_list])
 
     warmup_len = config["training"].get("warmup_len", seq_len)
-    eval_horizon = config.get("evaluation", {}).get("horizon", max(pred_len, 12))
-    n_windows = config.get("evaluation", {}).get("n_windows", 4)
+    eval_cfg = config.get("evaluation", {}) or {}
+    eval_horizon = eval_cfg.get("horizon", max(pred_len, 12))
+    n_windows = eval_cfg.get("n_windows", 4)
+    prob_eval_cfg = eval_cfg.get("probabilistic", {}) or {}
 
     sim_cfg = config.get("simulation", {})
     sim_start = sim_cfg.get("start_idx", 0)
@@ -284,14 +286,22 @@ def main():
             # ── Evaluate ──────────────────────────────────────────
             try:
                 if model_type in NEURAL_MODELS:
-                    gt_list, pred_list = evaluate_neural_model(
+                    gt_list, pred_list, eval_info = evaluate_neural_model(
                         model, val_dataset, warmup_len, eval_horizon,
                         control_dim, exo_dim, device, n_windows,
+                        probabilistic_cfg=prob_eval_cfg,
+                        return_info=True,
                     )
                 else:
                     gt_list, pred_list = evaluate_xgboost_model(
                         model, val_dataset, seq_len, eval_horizon, n_windows,
                     )
+                    eval_info = {
+                        "is_probabilistic": False,
+                        "rollout_nll": float("nan"),
+                        "coverage_90": float("nan"),
+                        "interval_width_90": float("nan"),
+                    }
 
                 if gt_list and pred_list:
                     mean_mse = float(np.mean(
@@ -302,6 +312,13 @@ def main():
                     mean_mse = mean_mae = float("nan")
 
                 print(f"    Eval  MSE={mean_mse:.6f}  MAE={mean_mae:.6f}")
+                if bool(eval_info.get("is_probabilistic", False)):
+                    print(
+                        "    Eval  "
+                        f"NLL={eval_info.get('rollout_nll', float('nan')):.6f}  "
+                        f"Coverage@90={eval_info.get('coverage_90', float('nan')):.6f}  "
+                        f"Width@90={eval_info.get('interval_width_90', float('nan')):.6f}"
+                    )
 
                 if gt_list and pred_list:
                     save_forecast_plot(
@@ -315,6 +332,12 @@ def main():
                 print(f"    Eval ERROR: {exc}")
                 gt_list, pred_list = [], []
                 mean_mse = mean_mae = float("nan")
+                eval_info = {
+                    "is_probabilistic": False,
+                    "rollout_nll": float("nan"),
+                    "coverage_90": float("nan"),
+                    "interval_width_90": float("nan"),
+                }
 
             # ── Simulate ──────────────────────────────────────────
             sim_result = None
@@ -323,6 +346,7 @@ def main():
                     sim_result = simulate_recursive_neural(
                         model, val_dataset, seq_len, sim_horizon,
                         device, start_idx=sim_start,
+                        probabilistic_cfg=prob_eval_cfg,
                     )
                 else:
                     sim_result = simulate_recursive_xgboost(
@@ -362,6 +386,9 @@ def main():
                 "pred_list": pred_list,
                 "mean_mse": mean_mse,
                 "mean_mae": mean_mae,
+                "rollout_nll": float(eval_info.get("rollout_nll", float("nan"))),
+                "coverage_90": float(eval_info.get("coverage_90", float("nan"))),
+                "interval_width_90": float(eval_info.get("interval_width_90", float("nan"))),
                 "n_params": n_params,
                 "last_round_name": round_name,
                 "total_epochs": len(train_losses),
@@ -402,6 +429,9 @@ def main():
                                if res["val_losses"] else None),
             "rollout_mse": res["mean_mse"],
             "rollout_mae": res["mean_mae"],
+            "rollout_nll": res.get("rollout_nll"),
+            "coverage_90": res.get("coverage_90"),
+            "interval_width_90": res.get("interval_width_90"),
         })
     results_df = pd.DataFrame(rows)
     csv_path = figs_dir / "comparison_results.csv"

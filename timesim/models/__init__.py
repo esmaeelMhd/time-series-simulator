@@ -37,6 +37,7 @@ from .transformer import SimpleTransformer, TransformerWorldModel
 from .dlinear import DLinear, DLinearWorldModel
 from .nlinear import NLinear, NLinearWorldModel
 from .tft import TemporalFusionTransformer, TFTWorldModel
+from .latent_ssm import LatentSSMWorldModel
 
 # Optional XGBoost (may not be installed)
 try:
@@ -60,6 +61,9 @@ MODEL_REGISTRY = {
     # Linear
     "dlinear": DLinearWorldModel,
     "nlinear": NLinearWorldModel,
+
+    # Probabilistic
+    "latent_ssm": LatentSSMWorldModel,
 }
 
 # Standalone models (different interface)
@@ -152,6 +156,9 @@ __all__ = [
     # TFT
     "TemporalFusionTransformer",
     "TFTWorldModel",
+
+    # Probabilistic
+    "LatentSSMWorldModel",
     
     # XGBoost (optional)
     "XGBoostForecaster",

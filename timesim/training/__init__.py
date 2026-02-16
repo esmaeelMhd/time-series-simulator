@@ -4,6 +4,7 @@ from .losses import (
     OneStepLoss,
     MultiStepLoss,
     CombinedLoss,
+    ProbabilisticRolloutLoss,
     dilate_loss,
 )
 from .rollout import (
@@ -20,6 +21,7 @@ __all__ = [
     "OneStepLoss",
     "MultiStepLoss",
     "CombinedLoss",
+    "ProbabilisticRolloutLoss",
     "dilate_loss",
     "batch_rollout",
     "batch_rollout_padded",
@@ -27,4 +29,3 @@ __all__ = [
     "WorldModelTrainer",
     "Trainer",
 ]
-

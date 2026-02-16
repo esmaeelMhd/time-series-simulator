@@ -69,12 +69,14 @@ MODEL_PARAM_KEYS_BY_TYPE = {
     "nlinear": {"individual"},
     "tft": {"hidden_dim", "n_heads", "num_lstm_layers", "dropout"},
     "transformer": {"d_model", "nhead", "num_layers", "dim_feedforward", "dropout"},
+    "latent_ssm": {"hidden_dim", "latent_dim", "num_layers", "dropout", "min_scale", "min_df"},
     "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
 }
 
 TRAINING_PARAM_KEYS = {
     "learning_rate",
     "optimizer",
+    "weight_decay",
     "loss_type",
     "loss_weighting",
     "loss_weight_scale",
@@ -82,6 +84,14 @@ TRAINING_PARAM_KEYS = {
     "feedback",
     "teacher_forcing_ratio",
     "one_step_weight",
+    "elbo_weight",
+    "kl_weight",
+    "rollout_mse_weight",
+    "objective",
+    "kl_warmup_enabled",
+    "kl_beta_start",
+    "kl_beta_end",
+    "kl_warmup_epochs",
 }
 
 
@@ -181,17 +191,37 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     )
     one_step_weight = training_overrides.get("one_step_weight", tcfg.get("one_step_weight", 0.5))
     use_amp = bool(tcfg.get("use_amp", False))
+    prob_cfg = dict(tcfg.get("probabilistic", {}) or {})
+    if "elbo_weight" in training_overrides:
+        prob_cfg["elbo_weight"] = training_overrides["elbo_weight"]
+    if "kl_weight" in training_overrides:
+        prob_cfg["kl_weight"] = training_overrides["kl_weight"]
+    if "rollout_mse_weight" in training_overrides:
+        prob_cfg["rollout_mse_weight"] = training_overrides["rollout_mse_weight"]
+    if "objective" in training_overrides:
+        prob_cfg["objective"] = training_overrides["objective"]
+    if "kl_warmup_enabled" in training_overrides:
+        prob_cfg["kl_warmup_enabled"] = training_overrides["kl_warmup_enabled"]
+    if "kl_beta_start" in training_overrides:
+        prob_cfg["kl_beta_start"] = training_overrides["kl_beta_start"]
+    if "kl_beta_end" in training_overrides:
+        prob_cfg["kl_beta_end"] = training_overrides["kl_beta_end"]
+    if "kl_warmup_epochs" in training_overrides:
+        prob_cfg["kl_warmup_epochs"] = training_overrides["kl_warmup_epochs"]
 
     # Optimizer
     opt_name = str(
         optimizer_override or training_overrides.get("optimizer", tcfg.get("optimizer", "adam"))
     ).lower()
+    weight_decay = float(
+        training_overrides.get("weight_decay", tcfg.get("weight_decay", 0.0))
+    )
     if opt_name == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif opt_name == "sgd":
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     print(f"  Sampling strategy: {sampling_desc}")
 
@@ -217,6 +247,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         patience=tcfg.get("patience", 5),
         min_delta=tcfg.get("min_delta", 0.0),
         run_dir=model_dir,
+        probabilistic_cfg=prob_cfg,
     )
 
     train_losses, val_losses = trainer.fit(
@@ -537,8 +568,14 @@ def main():
     exo_dim = len([c for c in input_cols if c in exo_cols_list])
 
     warmup_len = config["training"].get("warmup_len", seq_len)
-    eval_horizon = config.get("evaluation", {}).get("horizon", max(pred_len, 12))
-    n_windows = config.get("evaluation", {}).get("n_windows", 4)
+    eval_cfg = config.get("evaluation", {}) or {}
+    eval_horizon = eval_cfg.get("horizon", max(pred_len, 12))
+    n_windows = eval_cfg.get("n_windows", 4)
+    prob_eval_cfg = eval_cfg.get("probabilistic", {}) or {}
+    prob_train_cfg = dict(prob_eval_cfg)
+    prob_training_cfg = config.get("training", {}).get("probabilistic", {}) or {}
+    if "mc_train_samples" in prob_training_cfg:
+        prob_train_cfg["mc_samples"] = int(prob_training_cfg["mc_train_samples"])
 
     sim_cfg = config.get("simulation", {})
     sim_start = sim_cfg.get("start_idx", 0)
@@ -765,6 +802,7 @@ def main():
                                     model, val_dataset, seq_len,
                                     checkpoint_sim_horizon, device,
                                     start_idx=sim_start_idx,
+                                    probabilistic_cfg=prob_train_cfg,
                                 )
                                 if sim_result["n_steps"] <= 0:
                                     continue
@@ -882,15 +920,23 @@ def main():
 
                     # Evaluation (forecast rollout)
                     if model_type in NEURAL_MODELS:
-                        gt_list, pred_list = evaluate_neural_model(
+                        gt_list, pred_list, eval_info = evaluate_neural_model(
                             model, val_dataset, warmup_len, eval_horizon,
                             control_dim, exo_dim, device, n_windows,
+                            probabilistic_cfg=prob_train_cfg,
+                            return_info=True,
                         )
                     else:
                         gt_list, pred_list = evaluate_xgboost_model(
                             model, val_dataset, seq_len, eval_horizon,
                             n_windows,
                         )
+                        eval_info = {
+                            "is_probabilistic": False,
+                            "rollout_nll": float("nan"),
+                            "coverage_90": float("nan"),
+                            "interval_width_90": float("nan"),
+                        }
 
                     if gt_list and pred_list:
                         mean_mse = float(np.mean(
@@ -901,6 +947,14 @@ def main():
                              for g, p in zip(gt_list, pred_list)]))
                         print(f"    Eval  MSE={mean_mse:.6f}  "
                               f"MAE={mean_mae:.6f}")
+                        if bool(eval_info.get("is_probabilistic", False)):
+                            nll = eval_info.get("rollout_nll", float("nan"))
+                            cov = eval_info.get("coverage_90", float("nan"))
+                            wid = eval_info.get("interval_width_90", float("nan"))
+                            print(
+                                f"    Eval  NLL={nll:.6f}  "
+                                f"Coverage@90={cov:.6f}  Width@90={wid:.6f}"
+                            )
 
                         save_forecast_plot(
                             gt_list[0], pred_list[0], output_cols,
@@ -922,6 +976,7 @@ def main():
                             model, val_dataset, seq_len,
                             sim_horizon_val, device,
                             start_idx=sim_start,
+                            probabilistic_cfg=prob_train_cfg,
                         )
                     else:
                         sim_result = simulate_recursive_xgboost(

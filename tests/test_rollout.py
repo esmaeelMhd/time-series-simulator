@@ -8,8 +8,10 @@ import pytest
 from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.sampling import RandomStartFixedHorizon
 from timesim.models.lstm import LSTMWorldModel
+from timesim.models.latent_ssm import LatentSSMWorldModel
 from timesim.training.rollout import batch_rollout, batch_rollout_padded
-from timesim.training.losses import OneStepLoss, MultiStepLoss
+from timesim.training.losses import OneStepLoss, MultiStepLoss, ProbabilisticRolloutLoss
+from timesim.training.trainer import WorldModelTrainer
 
 
 def create_synthetic_dataset(n=500):
@@ -212,6 +214,69 @@ def test_simple_training_reduces_loss():
     assert final_loss < initial_loss * 0.8, f"Loss did not decrease enough: {initial_loss:.4f} -> {final_loss:.4f}"
 
 
+def test_probabilistic_rollout_loss_masked_finite():
+    loss_fn = ProbabilisticRolloutLoss(elbo_weight=1.0, kl_weight=1.0, rollout_mse_weight=1.0)
+    bsz, horizon, out_dim = 4, 6, 2
+    targets = torch.randn(bsz, horizon, out_dim)
+    preds = torch.randn(bsz, horizon, out_dim)
+    dist_loc = torch.randn(bsz, horizon, out_dim)
+    dist_scale = torch.rand(bsz, horizon, out_dim) + 0.01
+    dist_df = torch.rand(bsz, horizon, out_dim) * 5.0 + 2.1
+    kl_terms = torch.rand(bsz, horizon)
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+    loss, info = loss_fn(
+        predictions=preds,
+        targets=targets,
+        dist_loc=dist_loc,
+        dist_scale=dist_scale,
+        dist_df=dist_df,
+        kl_terms=kl_terms,
+        mask=mask,
+    )
+    assert torch.isfinite(loss)
+    assert np.isfinite(info["nll"])
+    assert np.isfinite(info["kl"])
+    assert np.isfinite(info["mse"])
+
+
+def test_probabilistic_trainer_runs():
+    dataset = create_synthetic_dataset(n=260)
+    model = LatentSSMWorldModel(
+        input_dim=3,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+        num_layers=1,
+    )
+    trainer = WorldModelTrainer(
+        model=model,
+        dataset=dataset,
+        val_dataset=dataset,
+        sampling_strategy=RandomStartFixedHorizon(horizon=6),
+        warmup_len=12,
+        batch_size=8,
+        training_mode="multi_step",
+        feedback="model",
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        device="cpu",
+        early_stopping=False,
+        run_dir=None,
+        probabilistic_cfg={"elbo_weight": 1.0, "kl_weight": 1.0, "rollout_mse_weight": 1.0},
+    )
+    train_losses, val_losses = trainer.fit(epochs=2, steps_per_epoch=2, verbose=False)
+    assert len(train_losses) == 2
+    assert len(val_losses) == 2
+    assert np.isfinite(train_losses[-1])
+    assert val_losses[-1] is None or np.isfinite(val_losses[-1])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

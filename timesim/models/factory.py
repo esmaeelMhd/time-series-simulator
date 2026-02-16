@@ -30,7 +30,7 @@ def _check_xgboost() -> bool:
     return _HAS_XGBOOST
 
 # Which model types are neural (PyTorch) vs tree-based
-NEURAL_MODELS = {"lstm", "dlinear", "nlinear", "tft", "transformer"}
+NEURAL_MODELS = {"lstm", "dlinear", "nlinear", "tft", "transformer", "latent_ssm"}
 
 # Hard-coded fallbacks used when *neither* config nor caller supplies a value.
 # These mirror the constructor defaults of each model class.
@@ -59,6 +59,14 @@ _BUILTIN_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "num_layers": 2,
         "dim_feedforward": 128,
         "dropout": 0.1,
+    },
+    "latent_ssm": {
+        "hidden_dim": 64,
+        "latent_dim": 16,
+        "num_layers": 1,
+        "dropout": 0.1,
+        "min_scale": 1e-4,
+        "min_df": 2.1,
     },
     "xgboost": {
         "n_estimators": 100,
@@ -104,7 +112,7 @@ def build_model(
     ----------
     model_type : str
         One of ``lstm``, ``dlinear``, ``nlinear``, ``tft``,
-        ``transformer``, ``xgboost``.
+        ``transformer``, ``latent_ssm``, ``xgboost``.
     input_dim, output_dim, seq_len, pred_len : int
         Dimensions derived from the dataset.
     per_model_cfg : dict, optional
@@ -176,6 +184,20 @@ def build_model(
             num_layers=p.get("num_layers", 2),
             dim_feedforward=p.get("dim_feedforward", 128),
             dropout=p.get("dropout", 0.1),
+        )
+
+    elif model_type == "latent_ssm":
+        from .latent_ssm import LatentSSMWorldModel
+        return LatentSSMWorldModel(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_dim=p.get("hidden_dim", 64),
+            latent_dim=p.get("latent_dim", 16),
+            num_layers=p.get("num_layers", 1),
+            dropout=p.get("dropout", 0.1),
+            pred_len=pred_len,
+            min_scale=p.get("min_scale", 1e-4),
+            min_df=p.get("min_df", 2.1),
         )
 
     elif model_type == "xgboost":

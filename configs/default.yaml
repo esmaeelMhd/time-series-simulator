@@ -15,6 +15,7 @@ training:
   steps_per_epoch: null              # null => auto from dataset size; set int to cap epoch cost
   learning_rate: 0.001
   optimizer: adam                     # adam | sgd | adamw
+  weight_decay: 0.0                   # optimizer weight decay (L2 regularization)
   warmup_len: 24                     # context / burn-in length for rollouts
   sampling_strategy: random_fixed    # random_fixed | random_random | geometric | daily_fixed | stride
   sampling_horizon: 12               # backward-compatible alias for fixed-horizon sampling
@@ -53,6 +54,17 @@ training:
     n_rounds: 0                        # number of simulation snapshots per improved epoch
     horizon: null                      # null -> fallback to simulation.horizon
     start_idx: 0                       # first snapshot index; remaining snapshots use random indices
+  probabilistic:
+    enabled: true
+    objective: elbo_plus_rollout_mse
+    elbo_weight: 1.0
+    kl_weight: 1.0
+    rollout_mse_weight: 1.0
+    kl_warmup_enabled: true
+    kl_beta_start: 0.0
+    kl_beta_end: 1.0
+    kl_warmup_epochs: 10
+    mc_train_samples: 1
 
   # Hyperparameters and fast training
   use_optuna_best_params: false        # if true, load per-model best_params from Optuna summary
@@ -104,6 +116,9 @@ data:
 evaluation:
   horizon: 180                        # rollout evaluation horizon
   n_windows: 8                        # number of validation windows
+  probabilistic:
+    mc_samples: 256
+    interval_level: 0.90
 
 # ══════════════════════════════════════════════════════════════════════
 #  SIMULATION  (recursive step-by-step)
@@ -136,6 +151,13 @@ model_defaults:
     num_layers: 2
     dim_feedforward: 128
     dropout: 0.1
+  latent_ssm:
+    hidden_dim: 64
+    latent_dim: 16
+    num_layers: 1
+    dropout: 0.1
+    min_scale: 0.0001
+    min_df: 2.1
   xgboost:
     n_estimators: 100
     max_depth: 6
