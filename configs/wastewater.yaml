@@ -104,10 +104,10 @@ training:
     horizon: null
     start_idx: 0
   probabilistic:
-    objective: elbo_plus_rollout_mse
-    elbo_weight: 1.0
+    objective: rssm
+    recon_weight: 1.0
     kl_weight: 0.5
-    rollout_mse_weight: 2.0
+    aux_weight: 2.0
     kl_warmup_enabled: true
     kl_beta_start: 0.0
     kl_beta_end: 1.0

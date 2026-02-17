@@ -26,8 +26,6 @@ def _prepare_batch_data(
     horizons: np.ndarray,
     warmup_len: int,
     max_horizon: int,
-    control_positions: List[int],
-    known_exo_positions: List[int],
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Prepare batched data for rollout with a single conversion to tensors.
@@ -59,6 +57,8 @@ def _prepare_batch_data(
     input_dim = len(dataset.in_idx)
     output_dim = len(dataset.out_idx)
     
+    control_positions = list(getattr(dataset, "control_positions", []))
+    known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
     control_dim = len(control_positions)
     exo_dim = len(known_exo_positions)
     
@@ -99,6 +99,9 @@ def _prepare_batch_data(
     warmup_full = np.concatenate([warmup_controls, warmup_exogenous, warmup_outputs], axis=-1)
     
     return {
+        "warmup_controls": torch.from_numpy(warmup_controls).to(device),
+        "warmup_exogenous": torch.from_numpy(warmup_exogenous).to(device),
+        "warmup_outputs": torch.from_numpy(warmup_outputs).to(device),
         "warmup_full": torch.from_numpy(warmup_full).to(device),
         "rollout_inputs": torch.from_numpy(rollout_inputs).to(device),
         "rollout_targets": torch.from_numpy(rollout_targets).to(device),
@@ -160,19 +163,9 @@ def batch_rollout(
     batch_size = len(start_indices)
     max_horizon = int(horizons.max())
     
-    # Build feature positions from semantic column names.
-    # Controls are kept separate; all other known input features (excluding
-    # output/target columns) are fed through the exogenous path.
-    control_cols = set(dataset.groups.get("control", []))
-    output_cols = set(dataset.output_cols)
-    control_positions = [
-        i for i, col in enumerate(dataset.input_cols)
-        if col in control_cols
-    ]
-    known_exo_positions = [
-        i for i, col in enumerate(dataset.input_cols)
-        if (col not in control_cols and col not in output_cols)
-    ]
+    # Build feature positions from centralized dataset taxonomy.
+    control_positions = list(getattr(dataset, "control_positions", []))
+    known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
     control_dim = len(control_positions)
     exo_dim = len(known_exo_positions)
     
@@ -183,11 +176,12 @@ def batch_rollout(
         horizons,
         warmup_len,
         max_horizon,
-        control_positions,
-        known_exo_positions,
         device,
     )
-    
+
+    warmup_controls = batch_data["warmup_controls"]
+    warmup_exogenous = batch_data["warmup_exogenous"]
+    warmup_outputs = batch_data["warmup_outputs"]
     warmup_full = batch_data["warmup_full"]  # (B, warmup_len, model_input_dim)
     rollout_inputs_all = batch_data["rollout_inputs"]  # (B, max_horizon, input)
     rollout_targets_all = batch_data["rollout_targets"]  # (B, max_horizon, output)
@@ -214,7 +208,12 @@ def batch_rollout(
         targets_for_rollout = rollout_targets_all[:, :horizon]
 
         rollout_result = model.rollout(
-            warmup_seq={"inputs": warmup_full},
+            warmup_seq={
+                "inputs": warmup_full,
+                "controls": warmup_controls,
+                "exogenous": warmup_exogenous,
+                "outputs": warmup_outputs,
+            },
             rollout_inputs={"controls": controls[:, :horizon], "exogenous": exogenous[:, :horizon]},
             horizon=horizon,
             feedback=feedback,
@@ -224,10 +223,12 @@ def batch_rollout(
 
         predictions = rollout_result["predictions"]  # (B, horizon, output)
         targets = rollout_targets_all[:, :horizon]
+        exogenous_h = exogenous[:, :horizon]
 
         # Convert to list format for compatibility (no copy, just views)
         predictions_list = [predictions[i] for i in range(batch_size)]
         targets_list = [targets[i] for i in range(batch_size)]
+        exogenous_list = [exogenous_h[i] for i in range(batch_size)]
         extra_lists: Dict[str, List[torch.Tensor]] = {}
         for key, val in rollout_result.items():
             if key in {"predictions", "states"}:
@@ -238,6 +239,7 @@ def batch_rollout(
         # Variable horizons: need per-item rollouts (less common case)
         predictions_list = []
         targets_list = []
+        exogenous_list = []
         extra_lists: Dict[str, List[torch.Tensor]] = {}
 
         for i in range(batch_size):
@@ -250,7 +252,12 @@ def batch_rollout(
             targets_i = rollout_targets_all[i:i+1, :horizon]  # (1, horizon, O)
             
             rollout_result = model.rollout(
-                warmup_seq={"inputs": warmup_i},
+                warmup_seq={
+                    "inputs": warmup_i,
+                    "controls": warmup_controls[i:i+1],
+                    "exogenous": warmup_exogenous[i:i+1],
+                    "outputs": warmup_outputs[i:i+1],
+                },
                 rollout_inputs={"controls": controls_i, "exogenous": exogenous_i},
                 horizon=horizon,
                 feedback=feedback,
@@ -260,6 +267,7 @@ def batch_rollout(
 
             predictions_list.append(rollout_result["predictions"].squeeze(0))
             targets_list.append(targets_i.squeeze(0))
+            exogenous_list.append(exogenous_i.squeeze(0))
             for key, val in rollout_result.items():
                 if key in {"predictions", "states"}:
                     continue
@@ -271,6 +279,7 @@ def batch_rollout(
     out = {
         "predictions": predictions_list,
         "targets": targets_list,
+        "exogenous": exogenous_list,
         "horizons": torch.as_tensor(horizons, dtype=torch.long, device=device),
         "start_indices": torch.as_tensor(start_indices, dtype=torch.long, device=device),
     }

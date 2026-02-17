@@ -65,16 +65,8 @@ def _build_controls_exogenous(
     horizon_len: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Split input features into control and exogenous blocks."""
-    control_cols = set(dataset.groups.get("control", []))
-    output_cols = set(dataset.output_cols)
-    control_positions = [
-        i for i, col in enumerate(dataset.input_cols)
-        if col in control_cols
-    ]
-    known_exo_positions = [
-        i for i, col in enumerate(dataset.input_cols)
-        if (col not in control_cols and col not in output_cols)
-    ]
+    control_positions = list(getattr(dataset, "control_positions", []))
+    known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
     controls_np = (
         horizon_inputs[:, control_positions]
         if control_positions
@@ -93,16 +85,8 @@ def _build_warmup_full(dataset, warmup_data: np.ndarray) -> np.ndarray:
 
     Order matches model.step assembly: [controls, known_exogenous(+time), outputs].
     """
-    control_cols = set(dataset.groups.get("control", []))
-    output_cols = set(dataset.output_cols)
-    control_positions = [
-        i for i, col in enumerate(dataset.input_cols)
-        if col in control_cols
-    ]
-    known_exo_positions = [
-        i for i, col in enumerate(dataset.input_cols)
-        if (col not in control_cols and col not in output_cols)
-    ]
+    control_positions = list(getattr(dataset, "control_positions", []))
+    known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
     input_idx = dataset.in_idx
     control_idx = [input_idx[i] for i in control_positions]
     exo_idx = [input_idx[i] for i in known_exo_positions]
@@ -190,11 +174,18 @@ def evaluate_neural_model(
             warmup_data = val_data[start_idx:warmup_end]
             horizon_data = val_data[warmup_end:horizon_end]
 
+            warmup_inputs_arr = warmup_data[:, val_dataset.in_idx]
             horizon_inputs = horizon_data[:, val_dataset.in_idx]
             horizon_outputs = horizon_data[:, val_dataset.out_idx]
 
             warmup_full = _build_warmup_full(val_dataset, warmup_data)
             warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
+            warmup_controls_np, warmup_exo_np = _build_controls_exogenous(
+                val_dataset, warmup_inputs_arr, warmup_len
+            )
+            warmup_controls_t = torch.from_numpy(warmup_controls_np).float().unsqueeze(0).to(device)
+            warmup_exo_t = torch.from_numpy(warmup_exo_np).float().unsqueeze(0).to(device)
+            warmup_outputs_t = torch.from_numpy(warmup_data[:, val_dataset.out_idx]).float().unsqueeze(0).to(device)
 
             controls_np, exo_np = _build_controls_exogenous(
                 val_dataset, horizon_inputs, eval_horizon
@@ -204,24 +195,42 @@ def evaluate_neural_model(
             exo_t = torch.from_numpy(exo_np).float().unsqueeze(0).to(device)
 
             result = model.rollout(
-                warmup_seq={"inputs": warmup_tensor},
+                warmup_seq={
+                    "inputs": warmup_tensor,
+                    "controls": warmup_controls_t,
+                    "exogenous": warmup_exo_t,
+                    "outputs": warmup_outputs_t,
+                },
                 rollout_inputs={"controls": controls_t, "exogenous": exo_t},
                 horizon=eval_horizon,
             )
             predictions = result["predictions"].squeeze(0).cpu().numpy()
 
             if is_prob_model:
+                dist_loc_latent = result.get("dist_loc_latent")
                 dist_loc = result.get("dist_loc")
                 dist_scale = result.get("dist_scale")
                 dist_df = result.get("dist_df")
-                if dist_loc is not None and dist_scale is not None and dist_df is not None:
+                if dist_loc_latent is not None and dist_scale is not None:
+                    y_t = torch.from_numpy(horizon_outputs).float().unsqueeze(0).to(device)
+                    if bool(getattr(model, "use_symlog", False)):
+                        y_t = model.symlog(y_t)
+                    dist = torch.distributions.Normal(loc=dist_loc_latent, scale=dist_scale)
+                    nll = float((-dist.log_prob(y_t)).mean().item())
+                    nll_list.append(nll)
+                elif dist_loc is not None and dist_scale is not None and dist_df is not None:
                     y_t = torch.from_numpy(horizon_outputs).float().unsqueeze(0).to(device)
                     dist = torch.distributions.StudentT(df=dist_df, loc=dist_loc, scale=dist_scale)
                     nll = float((-dist.log_prob(y_t)).mean().item())
                     nll_list.append(nll)
 
                 mc = model.rollout_mc(
-                    warmup_seq={"inputs": warmup_tensor},
+                    warmup_seq={
+                        "inputs": warmup_tensor,
+                        "controls": warmup_controls_t,
+                        "exogenous": warmup_exo_t,
+                        "outputs": warmup_outputs_t,
+                    },
                     rollout_inputs={"controls": controls_t, "exogenous": exo_t},
                     horizon=eval_horizon,
                     n_samples=mc_samples,
@@ -343,19 +352,29 @@ def simulate_recursive_neural(
         interval_level = float(prob_cfg.get("interval_level", 0.90))
         warmup_data = val_data[start_idx : start_idx + seq_len]
         horizon_data = val_data[start_idx + seq_len : start_idx + seq_len + sim_horizon]
+        warmup_inputs_arr = warmup_data[:, in_idx]
         horizon_inputs = horizon_data[:, in_idx]
         ground_truths = horizon_data[:, out_idx]
 
         warmup_full = _build_warmup_full(val_dataset, warmup_data)
+        warmup_controls_np, warmup_exo_np = _build_controls_exogenous(val_dataset, warmup_inputs_arr, seq_len)
 
         controls_np, exo_np = _build_controls_exogenous(val_dataset, horizon_inputs, sim_horizon)
         warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
+        warmup_controls_t = torch.from_numpy(warmup_controls_np).float().unsqueeze(0).to(device)
+        warmup_exo_t = torch.from_numpy(warmup_exo_np).float().unsqueeze(0).to(device)
+        warmup_outputs_t = torch.from_numpy(warmup_data[:, out_idx]).float().unsqueeze(0).to(device)
         controls_t = torch.from_numpy(controls_np).float().unsqueeze(0).to(device)
         exo_t = torch.from_numpy(exo_np).float().unsqueeze(0).to(device)
 
         with torch.no_grad():
             mc = model.rollout_mc(
-                warmup_seq={"inputs": warmup_tensor},
+                warmup_seq={
+                    "inputs": warmup_tensor,
+                    "controls": warmup_controls_t,
+                    "exogenous": warmup_exo_t,
+                    "outputs": warmup_outputs_t,
+                },
                 rollout_inputs={"controls": controls_t, "exogenous": exo_t},
                 horizon=sim_horizon,
                 n_samples=mc_samples,

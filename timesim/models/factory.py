@@ -67,6 +67,9 @@ _BUILTIN_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "dropout": 0.1,
         "min_scale": 1e-4,
         "min_df": 2.1,
+        "encoder_dim": 64,
+        "decoder_layers": 2,
+        "use_symlog": False,
     },
     "xgboost": {
         "n_estimators": 100,
@@ -102,6 +105,8 @@ def build_model(
     output_dim: int,
     seq_len: int,
     pred_len: int,
+    control_dim: Optional[int] = None,
+    exogenous_dim: Optional[int] = None,
     per_model_cfg: Optional[Dict[str, Any]] = None,
     model_defaults_cfg: Optional[Dict[str, Dict[str, Any]]] = None,
     overrides: Optional[Dict[str, Any]] = None,
@@ -198,6 +203,11 @@ def build_model(
             pred_len=pred_len,
             min_scale=p.get("min_scale", 1e-4),
             min_df=p.get("min_df", 2.1),
+            control_dim=p.get("control_dim", control_dim),
+            exogenous_dim=p.get("exogenous_dim", exogenous_dim),
+            encoder_dim=p.get("encoder_dim", 64),
+            decoder_layers=p.get("decoder_layers", 2),
+            use_symlog=p.get("use_symlog", False),
         )
 
     elif model_type == "xgboost":

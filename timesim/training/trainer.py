@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Literal, Callable, Dict, Any
 import time
+import math
 
 import numpy as np
 import torch
@@ -186,15 +187,27 @@ class WorldModelTrainer:
         )
         prob_cfg = probabilistic_cfg or {}
         self.probabilistic_loss_fn = ProbabilisticRolloutLoss(
-            elbo_weight=prob_cfg.get("elbo_weight", 1.0),
+            recon_weight=prob_cfg.get("recon_weight", prob_cfg.get("elbo_weight", 1.0)),
             kl_weight=prob_cfg.get("kl_weight", 1.0),
-            rollout_mse_weight=prob_cfg.get("rollout_mse_weight", 1.0),
+            aux_weight=prob_cfg.get("aux_weight", prob_cfg.get("rollout_mse_weight", 1.0)),
+            kl_free_bits=prob_cfg.get("kl_free_bits", 1.0),
+            kl_balance=prob_cfg.get("kl_balance", 0.8),
+            use_kl_balancing=prob_cfg.get("use_kl_balancing", True),
+            use_free_bits=prob_cfg.get("use_free_bits", True),
+            use_symlog=prob_cfg.get("use_symlog", False),
         )
-        self.prob_objective = str(prob_cfg.get("objective", "elbo_plus_rollout_mse"))
+        self.prob_objective = str(prob_cfg.get("objective", "rssm"))
         self.kl_warmup_enabled = bool(prob_cfg.get("kl_warmup_enabled", False))
         self.kl_beta_start = float(prob_cfg.get("kl_beta_start", 1.0))
         self.kl_beta_end = float(prob_cfg.get("kl_beta_end", 1.0))
         self.kl_warmup_epochs = max(1, int(prob_cfg.get("kl_warmup_epochs", 1)))
+        self.grad_clip_norm = float(prob_cfg.get("grad_clip_norm", 100.0))
+        self.lr_warmup_steps = max(0, int(prob_cfg.get("lr_warmup_steps", 1000)))
+        self.lr_min_ratio = float(prob_cfg.get("lr_min_ratio", 0.1))
+        self.collapse_kl_threshold = float(prob_cfg.get("collapse_kl_threshold", 0.1))
+        self.collapse_patience_epochs = max(1, int(prob_cfg.get("collapse_patience_epochs", 3)))
+        self._collapse_counter = 0
+        self._last_prob_info: Dict[str, float] = {}
         self._current_epoch = 1
         self._fit_epochs = 1
         
@@ -203,6 +216,9 @@ class WorldModelTrainer:
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         else:
             self.optimizer = optimizer
+        self._base_lrs = [float(pg.get("lr", 1e-3)) for pg in self.optimizer.param_groups]
+        self._global_step = 0
+        self._total_train_steps = 1
         
         # Early stopping
         self.early_stopping = (
@@ -246,6 +262,26 @@ class WorldModelTrainer:
             return self.kl_beta_end
         frac = float(ep - 1) / float(self.kl_warmup_epochs - 1)
         return self.kl_beta_start + frac * (self.kl_beta_end - self.kl_beta_start)
+
+    def _update_learning_rate(self):
+        """Linear warmup then cosine decay on optimizer LR."""
+        if not self._base_lrs:
+            return
+        step = int(self._global_step)
+        total = max(1, int(self._total_train_steps))
+        warmup = int(self.lr_warmup_steps)
+
+        if warmup > 0 and step < warmup:
+            mult = float(step + 1) / float(warmup)
+        else:
+            decay_steps = max(1, total - warmup)
+            progress = float(max(0, step - warmup)) / float(decay_steps)
+            progress = max(0.0, min(1.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            mult = self.lr_min_ratio + (1.0 - self.lr_min_ratio) * cosine
+
+        for pg, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
+            pg["lr"] = float(base_lr) * float(mult)
     
     def _train_step(self) -> float:
         """Perform one training step (one batch of rollouts).
@@ -256,6 +292,7 @@ class WorldModelTrainer:
             Training loss for this batch.
         """
         self.model.train()
+        self._update_learning_rate()
         
         # Sample rollout starting points and horizons
         start_indices, horizons = self.sampling_strategy.sample(
@@ -264,6 +301,8 @@ class WorldModelTrainer:
             warmup_len=self.warmup_len,
             rng=self.rng,
         )
+
+        self.optimizer.zero_grad(set_to_none=True)
         
         # Perform batched rollouts
         with torch.autocast(
@@ -277,54 +316,54 @@ class WorldModelTrainer:
                     self.warmup_len, feedback="teacher",
                     device=self.device
                 )
-                result_model = batch_rollout_padded(
-                    self.model, self.dataset, start_indices, horizons,
-                    self.warmup_len, feedback="model",
-                    device=self.device
-                )
-
-                predictions_teacher = result_teacher["predictions"]
-                predictions_model = result_model["predictions"]
                 targets = result_teacher["targets"]
                 mask = result_teacher["mask"]
+                exogenous_targets = result_teacher.get("exogenous")
+                dist_loc_latent = result_teacher.get("dist_loc_latent")
                 dist_loc = result_teacher.get("dist_loc")
                 dist_scale = result_teacher.get("dist_scale")
-                dist_df = result_teacher.get("dist_df")
-                kl_terms = result_teacher.get("kl_terms")
-                if dist_loc is None or dist_scale is None or dist_df is None or kl_terms is None:
-                    raise ValueError("Probabilistic model rollout must return dist_loc/dist_scale/dist_df/kl_terms")
+                prior_mu = result_teacher.get("prior_mu")
+                prior_logvar = result_teacher.get("prior_logvar")
+                posterior_mu = result_teacher.get("posterior_mu")
+                posterior_logvar = result_teacher.get("posterior_logvar")
+                aux_loc = result_teacher.get("aux_loc")
+                aux_scale = result_teacher.get("aux_scale")
+
+                if dist_loc_latent is None:
+                    if dist_loc is None:
+                        raise ValueError("Probabilistic rollout must return dist_loc or dist_loc_latent")
+                    if self.probabilistic_loss_fn.use_symlog:
+                        dist_loc_latent = self.probabilistic_loss_fn._symlog(dist_loc)  # pylint: disable=protected-access
+                    else:
+                        dist_loc_latent = dist_loc
+                if (
+                    dist_scale is None
+                    or prior_mu is None
+                    or prior_logvar is None
+                    or posterior_mu is None
+                    or posterior_logvar is None
+                ):
+                    raise ValueError(
+                        "Probabilistic model rollout must return "
+                        "dist_scale/prior_mu/prior_logvar/posterior_mu/posterior_logvar"
+                    )
 
                 kl_beta = self._current_kl_beta()
-                self.optimizer.zero_grad(set_to_none=True)
-                nll_teacher, kl_teacher, _ = self.probabilistic_loss_fn.compute_terms(
-                    predictions=predictions_teacher,
+                loss, info = self.probabilistic_loss_fn(
                     targets=targets,
-                    dist_loc=dist_loc,
+                    dist_loc_latent=dist_loc_latent,
                     dist_scale=dist_scale,
-                    dist_df=dist_df,
-                    kl_terms=kl_terms,
+                    prior_mu=prior_mu,
+                    prior_logvar=prior_logvar,
+                    posterior_mu=posterior_mu,
+                    posterior_logvar=posterior_logvar,
+                    exogenous_targets=exogenous_targets,
+                    aux_loc=aux_loc,
+                    aux_scale=aux_scale,
                     mask=mask,
+                    kl_beta=kl_beta,
                 )
-                mse_model = self.probabilistic_loss_fn._masked_mean(  # pylint: disable=protected-access
-                    (predictions_model - targets) ** 2, mask
-                )
-                if self.prob_objective == "elbo_plus_rollout_mse":
-                    loss = (
-                        self.probabilistic_loss_fn.elbo_weight
-                        * (nll_teacher + self.probabilistic_loss_fn.kl_weight * kl_beta * kl_teacher)
-                        + self.probabilistic_loss_fn.rollout_mse_weight * mse_model
-                    )
-                else:
-                    loss, _ = self.probabilistic_loss_fn(
-                        predictions=predictions_model,
-                        targets=targets,
-                        dist_loc=dist_loc,
-                        dist_scale=dist_scale,
-                        dist_df=dist_df,
-                        kl_terms=kl_terms,
-                        mask=mask,
-                        kl_beta=kl_beta,
-                    )
+                self._last_prob_info = info
             elif self.training_mode == "combined":
                 # Need both teacher-forced and model-feedback rollouts
                 result_teacher = batch_rollout_padded(
@@ -342,8 +381,8 @@ class WorldModelTrainer:
                 mask = result_teacher["mask"]
                 
                 # Compute loss
-                self.optimizer.zero_grad(set_to_none=True)
                 loss, info = self.loss_fn(predictions_teacher, predictions_model, targets)
+                self._last_prob_info = {}
                 
             else:
                 # Single rollout mode
@@ -365,8 +404,8 @@ class WorldModelTrainer:
                 targets_masked = targets * mask_expanded
                 
                 # Compute loss
-                self.optimizer.zero_grad(set_to_none=True)
                 loss = self.loss_fn(predictions_masked, targets_masked)
+                self._last_prob_info = {}
         
         # Guard against NaN/Inf
         if torch.isnan(loss) or torch.isinf(loss):
@@ -375,11 +414,17 @@ class WorldModelTrainer:
         # Backward pass
         if self.amp_enabled:
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            if self.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
+            if self.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
             self.optimizer.step()
+        self._global_step += 1
         
         return loss.item()
     
@@ -419,51 +464,51 @@ class WorldModelTrainer:
                         self.model, self.val_dataset, start_indices, horizons,
                         self.warmup_len, feedback="teacher", device=self.device
                     )
-                    result_model = batch_rollout_padded(
-                        self.model, self.val_dataset, start_indices, horizons,
-                        self.warmup_len, feedback="model", device=self.device
-                    )
-
-                    predictions_teacher = result_teacher["predictions"]
-                    predictions_model = result_model["predictions"]
                     targets = result_teacher["targets"]
                     mask = result_teacher["mask"]
+                    exogenous_targets = result_teacher.get("exogenous")
+                    dist_loc_latent = result_teacher.get("dist_loc_latent")
                     dist_loc = result_teacher.get("dist_loc")
                     dist_scale = result_teacher.get("dist_scale")
-                    dist_df = result_teacher.get("dist_df")
-                    kl_terms = result_teacher.get("kl_terms")
-                    if dist_loc is None or dist_scale is None or dist_df is None or kl_terms is None:
-                        raise ValueError("Probabilistic model rollout must return dist_loc/dist_scale/dist_df/kl_terms")
+                    prior_mu = result_teacher.get("prior_mu")
+                    prior_logvar = result_teacher.get("prior_logvar")
+                    posterior_mu = result_teacher.get("posterior_mu")
+                    posterior_logvar = result_teacher.get("posterior_logvar")
+                    aux_loc = result_teacher.get("aux_loc")
+                    aux_scale = result_teacher.get("aux_scale")
+                    if dist_loc_latent is None:
+                        if dist_loc is None:
+                            raise ValueError("Probabilistic rollout must return dist_loc or dist_loc_latent")
+                        if self.probabilistic_loss_fn.use_symlog:
+                            dist_loc_latent = self.probabilistic_loss_fn._symlog(dist_loc)  # pylint: disable=protected-access
+                        else:
+                            dist_loc_latent = dist_loc
+                    if (
+                        dist_scale is None
+                        or prior_mu is None
+                        or prior_logvar is None
+                        or posterior_mu is None
+                        or posterior_logvar is None
+                    ):
+                        raise ValueError(
+                            "Probabilistic model rollout must return "
+                            "dist_scale/prior_mu/prior_logvar/posterior_mu/posterior_logvar"
+                        )
                     kl_beta = self._current_kl_beta()
-                    nll_teacher, kl_teacher, _ = self.probabilistic_loss_fn.compute_terms(
-                        predictions=predictions_teacher,
+                    loss, _ = self.probabilistic_loss_fn(
                         targets=targets,
-                        dist_loc=dist_loc,
+                        dist_loc_latent=dist_loc_latent,
                         dist_scale=dist_scale,
-                        dist_df=dist_df,
-                        kl_terms=kl_terms,
+                        prior_mu=prior_mu,
+                        prior_logvar=prior_logvar,
+                        posterior_mu=posterior_mu,
+                        posterior_logvar=posterior_logvar,
+                        exogenous_targets=exogenous_targets,
+                        aux_loc=aux_loc,
+                        aux_scale=aux_scale,
                         mask=mask,
+                        kl_beta=kl_beta,
                     )
-                    mse_model = self.probabilistic_loss_fn._masked_mean(  # pylint: disable=protected-access
-                        (predictions_model - targets) ** 2, mask
-                    )
-                    if self.prob_objective == "elbo_plus_rollout_mse":
-                        loss = (
-                            self.probabilistic_loss_fn.elbo_weight
-                            * (nll_teacher + self.probabilistic_loss_fn.kl_weight * kl_beta * kl_teacher)
-                            + self.probabilistic_loss_fn.rollout_mse_weight * mse_model
-                        )
-                    else:
-                        loss, _ = self.probabilistic_loss_fn(
-                            predictions=predictions_model,
-                            targets=targets,
-                            dist_loc=dist_loc,
-                            dist_scale=dist_scale,
-                            dist_df=dist_df,
-                            kl_terms=kl_terms,
-                            mask=mask,
-                            kl_beta=kl_beta,
-                        )
                 else:
                     result = batch_rollout_padded(
                         self.model, self.val_dataset, start_indices, horizons,
@@ -526,6 +571,8 @@ class WorldModelTrainer:
             # Heuristic: aim to see each starting point ~once per epoch
             dataset_len = len(self.dataset.values) - self.warmup_len
             steps_per_epoch = max(1, dataset_len // self.batch_size)
+        self._total_train_steps = max(1, int(epochs) * int(steps_per_epoch))
+        self._global_step = 0
         
         if verbose:
             print(f"\n{'='*70}")
@@ -557,6 +604,7 @@ class WorldModelTrainer:
             # Training
             self.model.train()
             epoch_losses = []
+            epoch_kl_values = []
             
             if verbose:
                 # Create progress bar for training steps
@@ -573,6 +621,10 @@ class WorldModelTrainer:
             for step in pbar:
                 batch_loss = self._train_step()
                 epoch_losses.append(batch_loss)
+                if self.is_probabilistic_model and self._last_prob_info:
+                    kl_val = self._last_prob_info.get("kl")
+                    if kl_val is not None and np.isfinite(kl_val):
+                        epoch_kl_values.append(float(kl_val))
                 
                 if verbose:
                     # Update progress bar with current loss
@@ -581,6 +633,18 @@ class WorldModelTrainer:
             
             train_loss = np.mean(epoch_losses)
             train_losses.append(train_loss)
+            mean_epoch_kl = float(np.mean(epoch_kl_values)) if epoch_kl_values else float("nan")
+            if self.is_probabilistic_model and np.isfinite(mean_epoch_kl):
+                if mean_epoch_kl < self.collapse_kl_threshold:
+                    self._collapse_counter += 1
+                else:
+                    self._collapse_counter = 0
+                if self._collapse_counter >= self.collapse_patience_epochs and verbose:
+                    print(
+                        "  Warning: possible posterior collapse detected "
+                        f"(mean KL {mean_epoch_kl:.4f} < {self.collapse_kl_threshold:.4f} "
+                        f"for {self._collapse_counter} epoch(s))."
+                    )
             
             # Validation
             if verbose:
@@ -635,6 +699,8 @@ class WorldModelTrainer:
                     msg += f" | val_loss={val_loss:.6f}"
                 if self.is_probabilistic_model:
                     msg += f" | kl_beta={self._current_kl_beta():.4f}"
+                    if np.isfinite(mean_epoch_kl):
+                        msg += f" | kl_mean={mean_epoch_kl:.4f}"
                 msg += f" | time={epoch_time:.2f}s"
                 if epoch > 1:
                     msg += f" | ETA={eta:.1f}s"

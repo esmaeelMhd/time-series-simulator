@@ -69,7 +69,10 @@ MODEL_PARAM_KEYS_BY_TYPE = {
     "nlinear": {"individual"},
     "tft": {"hidden_dim", "n_heads", "num_lstm_layers", "dropout"},
     "transformer": {"d_model", "nhead", "num_layers", "dim_feedforward", "dropout"},
-    "latent_ssm": {"hidden_dim", "latent_dim", "num_layers", "dropout", "min_scale", "min_df"},
+    "latent_ssm": {
+        "hidden_dim", "latent_dim", "num_layers", "dropout",
+        "min_scale", "min_df", "encoder_dim", "decoder_layers", "use_symlog",
+    },
     "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
 }
 
@@ -84,9 +87,19 @@ TRAINING_PARAM_KEYS = {
     "feedback",
     "teacher_forcing_ratio",
     "one_step_weight",
+    "recon_weight",
     "elbo_weight",
     "kl_weight",
+    "aux_weight",
     "rollout_mse_weight",
+    "kl_free_bits",
+    "kl_balance",
+    "use_kl_balancing",
+    "use_free_bits",
+    "use_symlog",
+    "grad_clip_norm",
+    "lr_warmup_steps",
+    "lr_min_ratio",
     "objective",
     "kl_warmup_enabled",
     "kl_beta_end",
@@ -190,12 +203,28 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     one_step_weight = training_overrides.get("one_step_weight", tcfg.get("one_step_weight", 0.5))
     use_amp = bool(tcfg.get("use_amp", False))
     prob_cfg = dict(tcfg.get("probabilistic", {}) or {})
+    if "recon_weight" in training_overrides:
+        prob_cfg["recon_weight"] = training_overrides["recon_weight"]
     if "elbo_weight" in training_overrides:
         prob_cfg["elbo_weight"] = training_overrides["elbo_weight"]
     if "kl_weight" in training_overrides:
         prob_cfg["kl_weight"] = training_overrides["kl_weight"]
+    if "aux_weight" in training_overrides:
+        prob_cfg["aux_weight"] = training_overrides["aux_weight"]
     if "rollout_mse_weight" in training_overrides:
         prob_cfg["rollout_mse_weight"] = training_overrides["rollout_mse_weight"]
+    for key in [
+        "kl_free_bits",
+        "kl_balance",
+        "use_kl_balancing",
+        "use_free_bits",
+        "use_symlog",
+        "grad_clip_norm",
+        "lr_warmup_steps",
+        "lr_min_ratio",
+    ]:
+        if key in training_overrides:
+            prob_cfg[key] = training_overrides[key]
     if "objective" in training_overrides:
         prob_cfg["objective"] = training_overrides["objective"]
     if "kl_warmup_enabled" in training_overrides:
@@ -575,10 +604,8 @@ def main():
     print("=" * 70 + "\n")
 
     # ── Eval / simulation dimensions ──────────────────────────────────
-    control_cols = groups.get("control", [])
-    exo_cols_list = groups.get("exogenous", [])
-    control_dim = len([c for c in input_cols if c in control_cols])
-    exo_dim = len([c for c in input_cols if c in exo_cols_list])
+    control_dim = 0
+    exo_dim = 0
 
     warmup_len = config["training"].get("warmup_len", seq_len)
     eval_cfg = config.get("evaluation", {}) or {}
@@ -652,6 +679,8 @@ def main():
 
     train_dataset = train_loader.dataset
     val_dataset = val_loader.dataset
+    control_dim = len(getattr(train_dataset, "control_positions", []))
+    exo_dim = len(getattr(train_dataset, "known_exo_positions", []))
     print(f"  Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     # ── Save scaler ───────────────────────────────────────────────────
@@ -918,9 +947,19 @@ def main():
                 total_epochs = len(cumul_train_losses[model_type])
                 resolved_prob_cfg = dict(tcfg.get("probabilistic", {}) or {})
                 for k in [
+                    "recon_weight",
                     "elbo_weight",
                     "kl_weight",
+                    "aux_weight",
                     "rollout_mse_weight",
+                    "kl_free_bits",
+                    "kl_balance",
+                    "use_kl_balancing",
+                    "use_free_bits",
+                    "use_symlog",
+                    "grad_clip_norm",
+                    "lr_warmup_steps",
+                    "lr_min_ratio",
                     "objective",
                     "kl_warmup_enabled",
                     "kl_beta_start",

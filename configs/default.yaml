@@ -56,10 +56,18 @@ training:
     start_idx: 0                       # first snapshot index; remaining snapshots use random indices
   probabilistic:
     enabled: true
-    objective: elbo_plus_rollout_mse
-    elbo_weight: 1.0
+    objective: rssm
+    recon_weight: 1.0
     kl_weight: 1.0
-    rollout_mse_weight: 1.0
+    aux_weight: 1.0
+    kl_free_bits: 1.0
+    kl_balance: 0.8
+    use_kl_balancing: true
+    use_free_bits: true
+    use_symlog: false
+    grad_clip_norm: 100.0
+    lr_warmup_steps: 1000
+    lr_min_ratio: 0.1
     kl_warmup_enabled: true
     kl_beta_start: 0.0
     kl_beta_end: 1.0
@@ -159,6 +167,9 @@ model_defaults:
     dropout: 0.1
     min_scale: 0.0001
     min_df: 2.1
+    encoder_dim: 64
+    decoder_layers: 2
+    use_symlog: false
   xgboost:
     n_estimators: 100
     max_depth: 6

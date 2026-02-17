@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from timesim.data.dataset import TimeSeriesDataset, GroupedTimeSeriesDataset
+from timesim.data.schema import VariableSchema
 
 
 def test_time_series_dataset_basic():
@@ -127,6 +128,16 @@ def test_dataset_nan_detection():
         TimeSeriesDataset(data, seq_len=5, pred_len=2, scale=True)
 
 
+def test_variable_schema_rejects_duplicate_column_roles():
+    with pytest.raises(ValueError, match="assigned to both"):
+        VariableSchema.from_groups(
+            {
+                "control": ["u1"],
+                "exogenous": ["u1"],
+                "objective": ["y"],
+            }
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

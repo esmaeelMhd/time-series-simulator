@@ -35,6 +35,7 @@ from timesim.data.sampling import (
 )
 from timesim.models.factory import build_model, NEURAL_MODELS
 from timesim.training import WorldModelTrainer
+from timesim.evaluation import open_loop_evaluate
 
 try:
     import optuna
@@ -221,6 +222,7 @@ def _suggest_overrides(
         latent_choices = [8, 16, 24, 32] if profile == "fast_gpu" else [8, 16, 24, 32, 48, 64]
         max_layers = 2 if profile == "fast_gpu" else 3
         max_dropout = 0.3 if profile == "fast_gpu" else 0.4
+        encoder_choices = [32, 64, 96] if profile == "fast_gpu" else [32, 64, 96, 128]
         return {
             "hidden_dim": trial.suggest_categorical("hidden_dim", hidden_choices),
             "latent_dim": trial.suggest_categorical("latent_dim", latent_choices),
@@ -228,6 +230,9 @@ def _suggest_overrides(
             "dropout": trial.suggest_float("dropout", 0.0, max_dropout, step=0.05),
             "min_scale": trial.suggest_float("min_scale", 1e-5, 1e-3, log=True),
             "min_df": trial.suggest_float("min_df", 2.01, 5.0),
+            "encoder_dim": trial.suggest_categorical("encoder_dim", encoder_choices),
+            "decoder_layers": trial.suggest_int("decoder_layers", 1, 3),
+            "use_symlog": trial.suggest_categorical("use_symlog", [False, True]),
         }
     if model_type == "xgboost":
         if profile == "fast_gpu":
@@ -471,18 +476,25 @@ def main():
                     lr = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
                 prob_cfg_default = tcfg.get("probabilistic", {}) or {}
                 if model_type == "latent_ssm":
-                    # Keep rollout MSE contribution meaningful for trajectory quality.
-                    elbo_weight = trial.suggest_float("elbo_weight", 0.5, 2.0)
+                    recon_weight = trial.suggest_float("recon_weight", 0.5, 2.0)
                     kl_weight = trial.suggest_float("kl_weight", 0.05, 1.5)
-                    rollout_mse_weight = trial.suggest_float("rollout_mse_weight", 0.5, 3.0)
+                    aux_weight = trial.suggest_float("aux_weight", 0.1, 2.0)
+                    kl_free_bits = trial.suggest_float("kl_free_bits", 0.1, 2.0)
+                    kl_balance = trial.suggest_float("kl_balance", 0.5, 0.95)
+                    use_kl_balancing = trial.suggest_categorical("use_kl_balancing", [True, False])
+                    use_free_bits = trial.suggest_categorical("use_free_bits", [True, False])
                     # Keep KL warmup schedule fixed from training config.
                     kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
                     kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
                     kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
                 else:
-                    elbo_weight = float(prob_cfg_default.get("elbo_weight", 1.0))
+                    recon_weight = float(prob_cfg_default.get("recon_weight", prob_cfg_default.get("elbo_weight", 1.0)))
                     kl_weight = float(prob_cfg_default.get("kl_weight", 1.0))
-                    rollout_mse_weight = float(prob_cfg_default.get("rollout_mse_weight", 1.0))
+                    aux_weight = float(prob_cfg_default.get("aux_weight", prob_cfg_default.get("rollout_mse_weight", 1.0)))
+                    kl_free_bits = float(prob_cfg_default.get("kl_free_bits", 1.0))
+                    kl_balance = float(prob_cfg_default.get("kl_balance", 0.8))
+                    use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", True))
+                    use_free_bits = bool(prob_cfg_default.get("use_free_bits", True))
                     kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
                     kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
                     kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
@@ -549,10 +561,18 @@ def main():
                     min_delta=tcfg.get("min_delta", 0.0),
                     run_dir=None,  # avoid trial artifact overhead
                     probabilistic_cfg={
-                        "objective": prob_cfg_default.get("objective", "elbo_plus_rollout_mse"),
-                        "elbo_weight": elbo_weight,
+                        "objective": prob_cfg_default.get("objective", "rssm"),
+                        "recon_weight": recon_weight,
                         "kl_weight": kl_weight,
-                        "rollout_mse_weight": rollout_mse_weight,
+                        "aux_weight": aux_weight,
+                        "kl_free_bits": kl_free_bits,
+                        "kl_balance": kl_balance,
+                        "use_kl_balancing": use_kl_balancing,
+                        "use_free_bits": use_free_bits,
+                        "use_symlog": bool(model_overrides.get("use_symlog", prob_cfg_default.get("use_symlog", False))),
+                        "grad_clip_norm": float(prob_cfg_default.get("grad_clip_norm", 100.0)),
+                        "lr_warmup_steps": int(prob_cfg_default.get("lr_warmup_steps", 1000)),
+                        "lr_min_ratio": float(prob_cfg_default.get("lr_min_ratio", 0.1)),
                         "kl_warmup_enabled": bool(prob_cfg_default.get("kl_warmup_enabled", False)),
                         "kl_beta_start": kl_beta_start,
                         "kl_beta_end": kl_beta_end,
@@ -585,6 +605,23 @@ def main():
                     return float("inf")
 
                 score = float(best_score)
+                if model_type == "latent_ssm":
+                    try:
+                        curves = open_loop_evaluate(
+                            model=model,
+                            dataset=val_dataset,
+                            warmup_len=tcfg.get("warmup_len", seq_len),
+                            horizon=min(pred_len, int(tcfg.get("sampling_horizon", pred_len))),
+                            n_windows=max(2, int(ocfg.get("n_windows_eval", 4))),
+                            n_samples=max(10, int(prob_cfg_default.get("mc_train_samples", 32))),
+                            device=device,
+                        )
+                        crps_curve = curves.get("crps")
+                        if crps_curve is not None and len(crps_curve) > 0 and np.all(np.isfinite(crps_curve)):
+                            score = float(np.mean(crps_curve))
+                            trial.set_user_attr("open_loop_crps", score)
+                    except Exception as exc:
+                        trial.set_user_attr("open_loop_crps_error", str(exc))
                 if final_val is not None:
                     trial.set_user_attr("final_val_loss", final_val)
                 trial.set_user_attr("best_val_loss", score)

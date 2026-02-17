@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Serve a trained RSSM simulator via FastAPI."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import torch
+import yaml
+from joblib import load
+
+from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
+from timesim.models.factory import build_model
+from timesim.serving import create_app
+from timesim.simulator import RSSMSimulator
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Serve RSSM simulator API")
+    p.add_argument("--config", type=str, required=True)
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--host", type=str, default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--session-ttl", type=int, default=3600)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    dcfg = config["dataset"]
+    data_cfg = config.get("data", {})
+    add_time = bool(data_cfg.get("add_time_features", False))
+    tf_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(tf_cfg, dict) and "enabled" in tf_cfg:
+        add_time = bool(tf_cfg.get("enabled")) or add_time
+    groups = dcfg["variables"]
+    input_groups = config["model_io"]["input_groups"]
+    output_groups = config["model_io"]["output_groups"]
+
+    seq_len = int(dcfg["seq_len"])
+    pred_len = int(dcfg["pred_len"])
+    batch_size = int(dcfg["batch_size"])
+
+    input_cols = sum((groups[g] for g in input_groups), [])
+    output_cols = sum((groups[g] for g in output_groups), [])
+    input_dim = len(set(input_cols) | set(output_cols))
+    output_dim = len(output_cols)
+
+    df = load_csv_dataset(
+        dcfg["csv"],
+        index_col=dcfg.get("index_col", data_cfg.get("index_col", "date")),
+        slice_cfg=dcfg.get("slice"),
+    )
+
+    scaler_path = Path(args.checkpoint).resolve().parent.parent / "scaler.pkl"
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"Scaler not found: {scaler_path}")
+    scaler = load(scaler_path)
+
+    _, val_loader, _ = build_grouped_dataloaders(
+        df,
+        groups,
+        input_groups,
+        output_groups,
+        seq_len=seq_len,
+        pred_len=pred_len,
+        batch_size=batch_size,
+        train_split=dcfg.get("train_split", data_cfg.get("train_split", 0.8)),
+        add_time=add_time,
+        time_features_cfg=tf_cfg,
+        existing_scaler=scaler,
+    )
+    dataset = val_loader.dataset
+
+    model_cfg = config.get("models", [{"type": "latent_ssm"}])
+    latent_cfg = next((m for m in model_cfg if m.get("type") == "latent_ssm"), {"type": "latent_ssm"})
+
+    model = build_model(
+        "latent_ssm",
+        input_dim=input_dim,
+        output_dim=output_dim,
+        seq_len=seq_len,
+        pred_len=pred_len,
+        per_model_cfg=latent_cfg,
+        model_defaults_cfg=config.get("model_defaults", {}),
+    )
+    model.load_state_dict(torch.load(args.checkpoint, map_location=args.device, weights_only=True))
+    model.to(args.device)
+    model.eval()
+
+    simulator_template = RSSMSimulator(
+        model=model,
+        feature_columns=dataset.feature_cols,
+        input_columns=dataset.input_cols,
+        output_columns=dataset.output_cols,
+        in_idx=dataset.in_idx,
+        out_idx=dataset.out_idx,
+        control_positions=dataset.control_positions,
+        known_exo_positions=dataset.known_exo_positions,
+        scaler=dataset.scaler,
+        device=args.device,
+    )
+
+    app = create_app(simulator_template, session_ttl_seconds=args.session_ttl)
+
+    import uvicorn
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

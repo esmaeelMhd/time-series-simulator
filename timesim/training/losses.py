@@ -374,18 +374,35 @@ class CombinedLoss(nn.Module):
 
 
 class ProbabilisticRolloutLoss(nn.Module):
-    """ELBO-style probabilistic rollout loss with optional rollout MSE term."""
+    """RSSM probabilistic loss: reconstruction NLL + balanced/free-bits KL + aux NLL."""
 
     def __init__(
         self,
-        elbo_weight: float = 1.0,
+        recon_weight: float = 1.0,
         kl_weight: float = 1.0,
-        rollout_mse_weight: float = 1.0,
+        aux_weight: float = 1.0,
+        kl_free_bits: float = 1.0,
+        kl_balance: float = 0.8,
+        use_kl_balancing: bool = True,
+        use_free_bits: bool = True,
+        use_symlog: bool = False,
+        # Backward-compat aliases:
+        elbo_weight: Optional[float] = None,
+        rollout_mse_weight: Optional[float] = None,
     ):
         super().__init__()
-        self.elbo_weight = float(elbo_weight)
+        if elbo_weight is not None:
+            recon_weight = float(elbo_weight)
+        if rollout_mse_weight is not None:
+            aux_weight = float(rollout_mse_weight)
+        self.recon_weight = float(recon_weight)
         self.kl_weight = float(kl_weight)
-        self.rollout_mse_weight = float(rollout_mse_weight)
+        self.aux_weight = float(aux_weight)
+        self.kl_free_bits = float(kl_free_bits)
+        self.kl_balance = float(kl_balance)
+        self.use_kl_balancing = bool(use_kl_balancing)
+        self.use_free_bits = bool(use_free_bits)
+        self.use_symlog = bool(use_symlog)
 
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -401,56 +418,136 @@ class ProbabilisticRolloutLoss(nn.Module):
         denom = (mask_f.sum() * float(extra)).clamp_min(1.0)
         return (x * mask_f).sum() / denom
 
+    @staticmethod
+    def _symlog(x: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+
+    @staticmethod
+    def _kl_diag_normal(
+        q_mu: torch.Tensor,
+        q_logvar: torch.Tensor,
+        p_mu: torch.Tensor,
+        p_logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        q_var = torch.exp(q_logvar)
+        p_var = torch.exp(p_logvar)
+        kl = 0.5 * (
+            p_logvar - q_logvar
+            + (q_var + (q_mu - p_mu) ** 2) / (p_var + 1e-12)
+            - 1.0
+        )
+        return kl.sum(dim=-1)
+
+    def _balanced_kl(
+        self,
+        posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        raw_kl = self._kl_diag_normal(posterior_mu, posterior_logvar, prior_mu, prior_logvar)
+        if not self.use_kl_balancing:
+            return raw_kl
+        kl_prior_fit = self._kl_diag_normal(
+            posterior_mu.detach(),
+            posterior_logvar.detach(),
+            prior_mu,
+            prior_logvar,
+        )
+        kl_post_fit = self._kl_diag_normal(
+            posterior_mu,
+            posterior_logvar,
+            prior_mu.detach(),
+            prior_logvar.detach(),
+        )
+        return self.kl_balance * kl_prior_fit + (1.0 - self.kl_balance) * kl_post_fit
+
     def forward(
         self,
-        predictions: torch.Tensor,
         targets: torch.Tensor,
-        dist_loc: torch.Tensor,
+        dist_loc_latent: torch.Tensor,
         dist_scale: torch.Tensor,
-        dist_df: torch.Tensor,
-        kl_terms: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+        posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        exogenous_targets: Optional[torch.Tensor] = None,
+        aux_loc: Optional[torch.Tensor] = None,
+        aux_scale: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         kl_beta: float = 1.0,
-        mse_weight: Optional[float] = None,
     ) -> tuple[torch.Tensor, Dict[str, float]]:
-        nll, kl, mse = self.compute_terms(
-            predictions=predictions,
+        recon_nll, kl, aux_nll = self.compute_terms(
             targets=targets,
-            dist_loc=dist_loc,
+            dist_loc_latent=dist_loc_latent,
             dist_scale=dist_scale,
-            dist_df=dist_df,
-            kl_terms=kl_terms,
+            prior_mu=prior_mu,
+            prior_logvar=prior_logvar,
+            posterior_mu=posterior_mu,
+            posterior_logvar=posterior_logvar,
+            exogenous_targets=exogenous_targets,
+            aux_loc=aux_loc,
+            aux_scale=aux_scale,
             mask=mask,
         )
-        mse_coeff = self.rollout_mse_weight if mse_weight is None else float(mse_weight)
-        total = self.elbo_weight * (nll + self.kl_weight * float(kl_beta) * kl) + mse_coeff * mse
+        total = (
+            self.recon_weight * recon_nll
+            + self.kl_weight * float(kl_beta) * kl
+            + self.aux_weight * aux_nll
+        )
         info = {
             "loss_total": float(total.detach().item()),
-            "nll": float(nll.detach().item()),
+            "recon_nll": float(recon_nll.detach().item()),
             "kl": float(kl.detach().item()),
-            "mse": float(mse.detach().item()),
+            "aux_nll": float(aux_nll.detach().item()),
             "kl_beta": float(kl_beta),
-            "mse_weight": float(mse_coeff),
         }
         return total, info
 
     def compute_terms(
         self,
-        predictions: torch.Tensor,
         targets: torch.Tensor,
-        dist_loc: torch.Tensor,
+        dist_loc_latent: torch.Tensor,
         dist_scale: torch.Tensor,
-        dist_df: torch.Tensor,
-        kl_terms: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+        posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        exogenous_targets: Optional[torch.Tensor] = None,
+        aux_loc: Optional[torch.Tensor] = None,
+        aux_scale: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dist = torch.distributions.StudentT(df=dist_df, loc=dist_loc, scale=dist_scale)
-        nll_elem = -dist.log_prob(targets)
-        nll = self._masked_mean(nll_elem, mask)
-        kl = self._masked_mean(kl_terms, mask)
-        mse_elem = (predictions - targets) ** 2
-        mse = self._masked_mean(mse_elem, mask)
-        return nll, kl, mse
+        targets_latent = self._symlog(targets) if self.use_symlog else targets
+        recon_dist = torch.distributions.Normal(loc=dist_loc_latent, scale=dist_scale)
+        recon_nll_elem = -recon_dist.log_prob(targets_latent)
+        recon_nll = self._masked_mean(recon_nll_elem, mask)
+
+        kl_elem = self._balanced_kl(
+            posterior_mu=posterior_mu,
+            posterior_logvar=posterior_logvar,
+            prior_mu=prior_mu,
+            prior_logvar=prior_logvar,
+        )
+        if self.use_free_bits:
+            kl_elem = torch.maximum(
+                kl_elem,
+                torch.full_like(kl_elem, fill_value=self.kl_free_bits),
+            )
+        kl = self._masked_mean(kl_elem, mask)
+
+        aux_nll = torch.zeros((), dtype=recon_nll.dtype, device=recon_nll.device)
+        if (
+            exogenous_targets is not None
+            and aux_loc is not None
+            and aux_scale is not None
+            and exogenous_targets.shape[-1] > 0
+        ):
+            aux_dist = torch.distributions.Normal(loc=aux_loc, scale=aux_scale)
+            aux_nll_elem = -aux_dist.log_prob(exogenous_targets)
+            aux_nll = self._masked_mean(aux_nll_elem, mask)
+
+        return recon_nll, kl, aux_nll
 
 
 def dilate_loss(

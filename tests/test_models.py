@@ -305,5 +305,92 @@ def test_latent_ssm_no_posterior_leakage_in_model_feedback():
     assert torch.allclose(out["kl_terms"], torch.zeros_like(out["kl_terms"]))
 
 
+def test_latent_ssm_observe_imagine_api_shapes():
+    model = LatentSSMWorldModel(
+        input_dim=5,
+        output_dim=2,
+        hidden_dim=32,
+        latent_dim=8,
+    )
+    model.eval()
+
+    bsz, hist, horizon = 3, 12, 7
+    controls_h = torch.randn(bsz, hist, 2)
+    exo_h = torch.randn(bsz, hist, 1)
+    y_h = torch.randn(bsz, hist, 2)
+    controls_f = torch.randn(bsz, horizon, 2)
+    exo_f = torch.randn(bsz, horizon, 1)
+
+    with torch.no_grad():
+        observed = model.observe(controls_h, exo_h, y_h, sample_posterior=False)
+        imagined = model.imagine(
+            initial_state=observed["state"],
+            future_controls=controls_f,
+            future_exogenous=exo_f,
+            n_steps=horizon,
+            n_samples=5,
+            sample_latent=True,
+        )
+
+    assert observed["dist_loc"].shape == (bsz, hist, 2)
+    assert observed["dist_scale"].shape == (bsz, hist, 2)
+    assert observed["prior_mu"].shape == (bsz, hist, 8)
+    assert observed["posterior_mu"].shape == (bsz, hist, 8)
+    assert imagined["samples"].shape == (5, bsz, horizon, 2)
+    assert imagined["mean"].shape == (bsz, horizon, 2)
+    assert imagined["std"].shape == (bsz, horizon, 2)
+
+
+def test_latent_ssm_controls_and_exogenous_change_imagination():
+    model = LatentSSMWorldModel(
+        input_dim=5,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+    )
+    model.eval()
+    bsz, hist, horizon = 2, 10, 6
+    history_controls = torch.randn(bsz, hist, 2)
+    history_exo = torch.randn(bsz, hist, 1)
+    history_y = torch.randn(bsz, hist, 1)
+    future_controls = torch.randn(bsz, horizon, 2)
+    future_exo = torch.randn(bsz, horizon, 1)
+
+    with torch.no_grad():
+        base = model.condition_then_simulate(
+            history_controls,
+            history_exo,
+            history_y,
+            future_controls,
+            future_exo,
+            n_steps=horizon,
+            n_samples=1,
+        )
+        ctrl_changed = model.condition_then_simulate(
+            history_controls,
+            history_exo,
+            history_y,
+            future_controls + 1.0,
+            future_exo,
+            n_steps=horizon,
+            n_samples=1,
+        )
+        exo_changed = model.condition_then_simulate(
+            history_controls,
+            history_exo,
+            history_y,
+            future_controls,
+            future_exo + 1.0,
+            n_steps=horizon,
+            n_samples=1,
+        )
+
+    base_pred = base["predictions"]
+    ctrl_pred = ctrl_changed["predictions"]
+    exo_pred = exo_changed["predictions"]
+    assert not torch.allclose(base_pred, ctrl_pred)
+    assert not torch.allclose(base_pred, exo_pred)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

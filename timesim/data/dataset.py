@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .stamps import add_time_features
+from .schema import VariableRole, VariableSchema
 from ..utils.scaler import MinMaxScaler
 
 
@@ -95,17 +96,20 @@ class GroupedTimeSeriesDataset(Dataset):
                  time_features_cfg: Optional[Dict[str, Any]] = None,
                  scaler: 'MinMaxScaler | None' = None):
 
-        # Validate columns
-        all_cols = sum(groups.values(), [])
+        # Single source of truth for C/X/Y taxonomy.
+        self.variable_schema = VariableSchema.from_groups(groups)
+        self.groups = self.variable_schema.to_groups()
+
+        # Validate mapped columns exist in data.
+        all_cols = list(self.variable_schema.ordered_columns)
         missing = [c for c in all_cols if c not in df.columns]
         if missing:
             raise ValueError(f"Columns missing in DataFrame: {missing}")
 
-        self.groups = groups
         self.input_groups = input_groups
         self.output_groups = output_groups
-        self.input_cols = sum((groups[g] for g in input_groups), [])
-        self.output_cols = sum((groups[g] for g in output_groups), [])
+        self.input_cols = self.variable_schema.columns_for_group_names(input_groups)
+        self.output_cols = self.variable_schema.columns_for_group_names(output_groups)
         self.time_feature_cols: list[str] = []
 
         # Reorder DF so that input/output order is preserved for later plotting
@@ -139,9 +143,20 @@ class GroupedTimeSeriesDataset(Dataset):
         else:
             self.scaler = None
 
+        self.feature_cols = list(df.columns)
         self.values = df.values.astype(np.float32)
         self.in_idx = [df.columns.get_loc(c) for c in self.input_cols]
         self.out_idx = [df.columns.get_loc(c) for c in self.output_cols]
+        control_cols = set(self.variable_schema.columns_for_role(VariableRole.CONTROL))
+        output_cols_set = set(self.output_cols)
+        self.control_positions = [
+            i for i, col in enumerate(self.input_cols)
+            if col in control_cols
+        ]
+        self.known_exo_positions = [
+            i for i, col in enumerate(self.input_cols)
+            if (col not in control_cols and col not in output_cols_set)
+        ]
 
         # Sanity check – any NaNs at this stage will break MSE and yield NaN
         if np.isnan(self.values).any():

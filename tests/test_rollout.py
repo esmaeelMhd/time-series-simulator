@@ -215,14 +215,26 @@ def test_simple_training_reduces_loss():
 
 
 def test_probabilistic_rollout_loss_masked_finite():
-    loss_fn = ProbabilisticRolloutLoss(elbo_weight=1.0, kl_weight=1.0, rollout_mse_weight=1.0)
+    loss_fn = ProbabilisticRolloutLoss(
+        recon_weight=1.0,
+        kl_weight=1.0,
+        aux_weight=1.0,
+        kl_free_bits=1.0,
+        kl_balance=0.8,
+        use_kl_balancing=True,
+        use_free_bits=True,
+    )
     bsz, horizon, out_dim = 4, 6, 2
     targets = torch.randn(bsz, horizon, out_dim)
-    preds = torch.randn(bsz, horizon, out_dim)
-    dist_loc = torch.randn(bsz, horizon, out_dim)
+    exogenous = torch.randn(bsz, horizon, 3)
+    dist_loc_latent = torch.randn(bsz, horizon, out_dim)
     dist_scale = torch.rand(bsz, horizon, out_dim) + 0.01
-    dist_df = torch.rand(bsz, horizon, out_dim) * 5.0 + 2.1
-    kl_terms = torch.rand(bsz, horizon)
+    prior_mu = torch.randn(bsz, horizon, 5)
+    prior_logvar = torch.randn(bsz, horizon, 5).clamp(min=-4.0, max=4.0)
+    posterior_mu = torch.randn(bsz, horizon, 5)
+    posterior_logvar = torch.randn(bsz, horizon, 5).clamp(min=-4.0, max=4.0)
+    aux_loc = torch.randn_like(exogenous)
+    aux_scale = torch.rand_like(exogenous) + 0.01
     mask = torch.tensor(
         [
             [1, 1, 1, 1, 1, 1],
@@ -233,18 +245,22 @@ def test_probabilistic_rollout_loss_masked_finite():
         dtype=torch.bool,
     )
     loss, info = loss_fn(
-        predictions=preds,
         targets=targets,
-        dist_loc=dist_loc,
+        dist_loc_latent=dist_loc_latent,
         dist_scale=dist_scale,
-        dist_df=dist_df,
-        kl_terms=kl_terms,
+        prior_mu=prior_mu,
+        prior_logvar=prior_logvar,
+        posterior_mu=posterior_mu,
+        posterior_logvar=posterior_logvar,
+        exogenous_targets=exogenous,
+        aux_loc=aux_loc,
+        aux_scale=aux_scale,
         mask=mask,
     )
     assert torch.isfinite(loss)
-    assert np.isfinite(info["nll"])
+    assert np.isfinite(info["recon_nll"])
     assert np.isfinite(info["kl"])
-    assert np.isfinite(info["mse"])
+    assert np.isfinite(info["aux_nll"])
 
 
 def test_probabilistic_trainer_runs():
