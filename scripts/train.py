@@ -89,9 +89,7 @@ TRAINING_PARAM_KEYS = {
     "rollout_mse_weight",
     "objective",
     "kl_warmup_enabled",
-    "kl_beta_start",
     "kl_beta_end",
-    "kl_warmup_epochs",
 }
 
 
@@ -299,6 +297,19 @@ def _split_optuna_params(
     model_keys = MODEL_PARAM_KEYS_BY_TYPE.get(model_type, set())
     model_overrides = {k: v for k, v in best_params.items() if k in model_keys}
     training_overrides = {k: v for k, v in best_params.items() if k in TRAINING_PARAM_KEYS}
+    # Keep KL warmup schedule fixed from training config, even for legacy summaries.
+    training_overrides.pop("kl_beta_start", None)
+    training_overrides.pop("kl_warmup_epochs", None)
+    if "weight_decay" not in training_overrides:
+        optimizer_name = str(training_overrides.get("optimizer", best_params.get("optimizer", ""))).lower()
+        if optimizer_name == "adamw" and "weight_decay_adamw" in best_params:
+            training_overrides["weight_decay"] = best_params["weight_decay_adamw"]
+        elif optimizer_name == "adam" and "weight_decay_adam" in best_params:
+            training_overrides["weight_decay"] = best_params["weight_decay_adam"]
+        elif "weight_decay_adamw" in best_params:
+            training_overrides["weight_decay"] = best_params["weight_decay_adamw"]
+        elif "weight_decay_adam" in best_params:
+            training_overrides["weight_decay"] = best_params["weight_decay_adam"]
     return model_overrides, training_overrides
 
 
@@ -480,6 +491,7 @@ def main():
     device = config["misc"].get("device", "cpu")
 
     # ── Config sub-dicts ──────────────────────────────────────────────
+    tcfg = config.get("training", {})
     data_cfg = config.get("data", {})
     add_time_features = bool(data_cfg.get("add_time_features", False))
     time_features_cfg = data_cfg.get("time_features", {}) or {}
@@ -514,6 +526,7 @@ def main():
 
     seq_len = config["dataset"]["seq_len"]
     pred_len = config["dataset"]["pred_len"]
+    batch_size = config["dataset"]["batch_size"]
     # Use union to avoid double-counting when output_cols are in input_groups
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
@@ -544,7 +557,7 @@ def main():
                 rc["models"] = model_names
 
     # ── Print banner ──────────────────────────────────────────────────
-    round_desc = " → ".join(rc.get("name", "?") for rc in training_rounds)
+    round_desc = " -> ".join(rc.get("name", "?") for rc in training_rounds)
     print("\n" + "=" * 70)
     print("  MULTI-MODEL TRAINING")
     print("=" * 70)
@@ -645,7 +658,7 @@ def main():
     from joblib import dump
     scaler_path = out_dir / "scaler.pkl"
     dump(scaler, scaler_path)
-    print(f"  Saved scaler → {scaler_path}")
+    print(f"  Saved scaler -> {scaler_path}")
 
     # ══════════════════════════════════════════════════════════════════
     #  TRAINING ROUNDS
@@ -721,7 +734,7 @@ def main():
                     is_retrain = True
                     print(f"  Loaded checkpoint: {ckpt}")
                 else:
-                    print(f"  Warning: {ckpt} not found → training from scratch")
+                    print(f"  Warning: {ckpt} not found -> training from scratch")
             elif checkpoint_dir and model_type == "xgboost" and HAS_XGBOOST:
                 pkl = Path(checkpoint_dir) / model_type / "train_model.pkl"
                 if pkl.exists():
@@ -900,11 +913,75 @@ def main():
 
                 # Save / update model config
                 model_params = {k: v for k, v in mc.items() if k != "type"}
+                resolved_model_params = dict(model_params)
+                resolved_model_params.update(model_overrides)
                 total_epochs = len(cumul_train_losses[model_type])
+                resolved_prob_cfg = dict(tcfg.get("probabilistic", {}) or {})
+                for k in [
+                    "elbo_weight",
+                    "kl_weight",
+                    "rollout_mse_weight",
+                    "objective",
+                    "kl_warmup_enabled",
+                    "kl_beta_start",
+                    "kl_beta_end",
+                    "kl_warmup_epochs",
+                ]:
+                    if k in train_overrides:
+                        resolved_prob_cfg[k] = train_overrides[k]
                 model_cfg_data = {
-                    "type": model_type, **model_params,
+                    "type": model_type,
+                    **resolved_model_params,
                     "last_round": round_name,
                     "total_epochs": total_epochs,
+                    "resolved": {
+                        "model_params": resolved_model_params,
+                        "model_overrides": dict(model_overrides),
+                        "training_overrides": dict(train_overrides),
+                        "training": {
+                            "epochs": round_epochs,
+                            "steps_per_epoch": round_steps_per_epoch,
+                            "learning_rate": model_lr,
+                            "optimizer": train_overrides.get(
+                                "optimizer", tcfg.get("optimizer", "adam")
+                            ),
+                            "weight_decay": float(
+                                train_overrides.get(
+                                    "weight_decay", tcfg.get("weight_decay", 0.0)
+                                )
+                            ),
+                            "mode": train_overrides.get("mode", tcfg.get("mode", "multi_step")),
+                            "feedback": train_overrides.get("feedback", tcfg.get("feedback", "model")),
+                            "teacher_forcing_ratio": train_overrides.get(
+                                "teacher_forcing_ratio",
+                                tcfg.get("teacher_forcing_ratio", 0.0),
+                            ),
+                            "one_step_weight": train_overrides.get(
+                                "one_step_weight", tcfg.get("one_step_weight", 0.5)
+                            ),
+                            "probabilistic": resolved_prob_cfg,
+                        },
+                        "data": {
+                            "seq_len": seq_len,
+                            "pred_len": pred_len,
+                            "batch_size": batch_size,
+                            "input_dim": input_dim,
+                            "output_dim": output_dim,
+                            "add_time_features": add_time_features,
+                            "time_features_cfg": time_features_cfg,
+                        },
+                        "optuna": {
+                            "enabled": bool(
+                                use_optuna_best_params and model_type in optuna_best_by_model
+                            ),
+                            "summary_path": str(optuna_summary_path)
+                            if use_optuna_best_params
+                            else None,
+                            "best_params": dict(optuna_best_by_model.get(model_type, {}))
+                            if use_optuna_best_params
+                            else {},
+                        },
+                    },
                 }
                 with open(model_dir / "model_config.yaml", "w") as f:
                     yaml.safe_dump(model_cfg_data, f)

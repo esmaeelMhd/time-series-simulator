@@ -88,6 +88,59 @@ def _build_controls_exogenous(
     return controls_np, exo_np
 
 
+def _build_warmup_full(dataset, warmup_data: np.ndarray) -> np.ndarray:
+    """Build warmup inputs in rollout semantic order.
+
+    Order matches model.step assembly: [controls, known_exogenous(+time), outputs].
+    """
+    control_cols = set(dataset.groups.get("control", []))
+    output_cols = set(dataset.output_cols)
+    control_positions = [
+        i for i, col in enumerate(dataset.input_cols)
+        if col in control_cols
+    ]
+    known_exo_positions = [
+        i for i, col in enumerate(dataset.input_cols)
+        if (col not in control_cols and col not in output_cols)
+    ]
+    input_idx = dataset.in_idx
+    control_idx = [input_idx[i] for i in control_positions]
+    exo_idx = [input_idx[i] for i in known_exo_positions]
+    output_idx = dataset.out_idx
+
+    controls = (
+        warmup_data[:, control_idx]
+        if control_idx
+        else np.zeros((warmup_data.shape[0], 0), dtype=np.float32)
+    )
+    exogenous = (
+        warmup_data[:, exo_idx]
+        if exo_idx
+        else np.zeros((warmup_data.shape[0], 0), dtype=np.float32)
+    )
+    outputs = warmup_data[:, output_idx]
+    return np.concatenate([controls, exogenous, outputs], axis=-1)
+
+
+def _inverse_scale_outputs(dataset, outputs: np.ndarray) -> np.ndarray:
+    """Inverse-transform output columns from scaled space to original space."""
+    scaler = getattr(dataset, "scaler", None)
+    if scaler is None:
+        return outputs
+
+    out = np.asarray(outputs, dtype=np.float32)
+    if out.ndim != 2 or out.shape[1] != len(dataset.out_idx):
+        return outputs
+
+    try:
+        full = np.zeros((out.shape[0], dataset.values.shape[1]), dtype=np.float32)
+        full[:, dataset.out_idx] = out
+        inv_full = scaler.inverse_transform(full)
+        return inv_full[:, dataset.out_idx].astype(np.float32, copy=False)
+    except Exception:
+        return outputs
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Evaluation (rollout)
 # ─────────────────────────────────────────────────────────────────────
@@ -96,6 +149,7 @@ def evaluate_neural_model(
     model, val_dataset, warmup_len, eval_horizon,
     control_dim, exo_dim, device, n_windows=4,
     probabilistic_cfg: Optional[Dict[str, Any]] = None,
+    inverse_transform_outputs: bool = True,
     return_info: bool = False,
 ):
     """Evaluate a neural model on multiple validation windows via rollout."""
@@ -136,18 +190,10 @@ def evaluate_neural_model(
             warmup_data = val_data[start_idx:warmup_end]
             horizon_data = val_data[warmup_end:horizon_end]
 
-            warmup_inputs = warmup_data[:, val_dataset.in_idx]
             horizon_inputs = horizon_data[:, val_dataset.in_idx]
             horizon_outputs = horizon_data[:, val_dataset.out_idx]
 
-            # Only append output columns not already in input columns
-            in_idx_set = set(val_dataset.in_idx)
-            extra_out_idx = [i for i in val_dataset.out_idx if i not in in_idx_set]
-            if extra_out_idx:
-                extra_out = warmup_data[:, extra_out_idx]
-                warmup_full = np.concatenate([warmup_inputs, extra_out], axis=-1)
-            else:
-                warmup_full = warmup_inputs
+            warmup_full = _build_warmup_full(val_dataset, warmup_data)
             warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
 
             controls_np, exo_np = _build_controls_exogenous(
@@ -184,9 +230,17 @@ def evaluate_neural_model(
                 predictions = mc["mean"].squeeze(0).cpu().numpy()
                 lower_np = mc["lower"].squeeze(0).cpu().numpy()
                 upper_np = mc["upper"].squeeze(0).cpu().numpy()
+                if inverse_transform_outputs:
+                    horizon_outputs = _inverse_scale_outputs(val_dataset, horizon_outputs)
+                    predictions = _inverse_scale_outputs(val_dataset, predictions)
+                    lower_np = _inverse_scale_outputs(val_dataset, lower_np)
+                    upper_np = _inverse_scale_outputs(val_dataset, upper_np)
                 inside = (horizon_outputs >= lower_np) & (horizon_outputs <= upper_np)
                 coverage_list.append(float(np.mean(inside)))
                 width_list.append(float(np.mean(upper_np - lower_np)))
+            elif inverse_transform_outputs:
+                horizon_outputs = _inverse_scale_outputs(val_dataset, horizon_outputs)
+                predictions = _inverse_scale_outputs(val_dataset, predictions)
 
             gt_list.append(horizon_outputs)
             pred_list.append(predictions)
@@ -205,6 +259,7 @@ def evaluate_neural_model(
 
 def evaluate_xgboost_model(
     model, val_dataset, seq_len, eval_horizon, n_windows=4,
+    inverse_transform_outputs: bool = True,
 ):
     """Evaluate XGBoost model via recursive rollout on validation data."""
     val_data = val_dataset.values
@@ -246,7 +301,11 @@ def evaluate_xgboost_model(
                     [current_input[:, 1:, :], new_step[np.newaxis, np.newaxis, :]], axis=1
                 )
 
-        pred_list.append(np.array(preds))
+        pred_arr = np.array(preds, dtype=np.float32)
+        if inverse_transform_outputs:
+            pred_arr = _inverse_scale_outputs(val_dataset, pred_arr)
+            gt = _inverse_scale_outputs(val_dataset, gt)
+        pred_list.append(pred_arr)
         gt_list.append(gt)
 
     return gt_list, pred_list
@@ -259,6 +318,7 @@ def evaluate_xgboost_model(
 def simulate_recursive_neural(
     model, val_dataset, seq_len, sim_horizon, device, start_idx=0,
     probabilistic_cfg: Optional[Dict[str, Any]] = None,
+    inverse_transform_outputs: bool = True,
 ):
     """Environment-style recursive simulation for a neural model."""
     model.eval()
@@ -283,17 +343,10 @@ def simulate_recursive_neural(
         interval_level = float(prob_cfg.get("interval_level", 0.90))
         warmup_data = val_data[start_idx : start_idx + seq_len]
         horizon_data = val_data[start_idx + seq_len : start_idx + seq_len + sim_horizon]
-        warmup_inputs = warmup_data[:, in_idx]
         horizon_inputs = horizon_data[:, in_idx]
         ground_truths = horizon_data[:, out_idx]
 
-        in_idx_set = set(in_idx)
-        extra_out_idx = [i for i in out_idx if i not in in_idx_set]
-        if extra_out_idx:
-            extra_out = warmup_data[:, extra_out_idx]
-            warmup_full = np.concatenate([warmup_inputs, extra_out], axis=-1)
-        else:
-            warmup_full = warmup_inputs
+        warmup_full = _build_warmup_full(val_dataset, warmup_data)
 
         controls_np, exo_np = _build_controls_exogenous(val_dataset, horizon_inputs, sim_horizon)
         warmup_tensor = torch.from_numpy(warmup_full).float().unsqueeze(0).to(device)
@@ -308,11 +361,19 @@ def simulate_recursive_neural(
                 n_samples=mc_samples,
                 interval_level=interval_level,
             )
+        pred_np = mc["mean"].squeeze(0).cpu().numpy()
+        lower_np = mc["lower"].squeeze(0).cpu().numpy()
+        upper_np = mc["upper"].squeeze(0).cpu().numpy()
+        if inverse_transform_outputs:
+            ground_truths = _inverse_scale_outputs(val_dataset, ground_truths)
+            pred_np = _inverse_scale_outputs(val_dataset, pred_np)
+            lower_np = _inverse_scale_outputs(val_dataset, lower_np)
+            upper_np = _inverse_scale_outputs(val_dataset, upper_np)
         return {
-            "predictions": mc["mean"].squeeze(0).cpu().numpy(),
+            "predictions": pred_np,
             "ground_truths": ground_truths,
-            "lower": mc["lower"].squeeze(0).cpu().numpy(),
-            "upper": mc["upper"].squeeze(0).cpu().numpy(),
+            "lower": lower_np,
+            "upper": upper_np,
             "interval_level": interval_level,
             "n_steps": sim_horizon,
         }
@@ -343,12 +404,17 @@ def simulate_recursive_neural(
                 new_row[idx] = pred_step[oi]
             window = np.vstack([window[1:], new_row[np.newaxis, :]])
 
+    if inverse_transform_outputs:
+        predictions = _inverse_scale_outputs(val_dataset, predictions)
+        ground_truths = _inverse_scale_outputs(val_dataset, ground_truths)
+
     return {"predictions": predictions, "ground_truths": ground_truths,
             "n_steps": sim_horizon}
 
 
 def simulate_recursive_xgboost(
     model, val_dataset, seq_len, sim_horizon, start_idx=0,
+    inverse_transform_outputs: bool = True,
 ):
     """Environment-style recursive simulation for XGBoost."""
     val_data = val_dataset.values
@@ -379,6 +445,10 @@ def simulate_recursive_xgboost(
         for oi, idx in enumerate(out_idx):
             new_row[idx] = pred_step[oi]
         window = np.vstack([window[1:], new_row[np.newaxis, :]])
+
+    if inverse_transform_outputs:
+        predictions = _inverse_scale_outputs(val_dataset, predictions)
+        ground_truths = _inverse_scale_outputs(val_dataset, ground_truths)
 
     return {"predictions": predictions, "ground_truths": ground_truths,
             "n_steps": sim_horizon}

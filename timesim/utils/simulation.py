@@ -72,14 +72,16 @@ def simulate_autoregressive(model: Module,
         # otherwise keep real value for that input feature
 
     preds = np.stack(preds)  # (horizon, F_out)
-    # inverse scale outputs for plotting
-    out_idx = [input_cols.index(c) if c in input_cols else df.columns.get_loc(c) for c in output_cols]
-    # Build array of real outputs
+    # Build array of real outputs in original units
     real_full = window_df[needed_cols].values[seq_len:seq_len + horizon]
-    real_scaled_full = scaler.transform(real_full)
-    real_scaled = real_scaled_full[:, [needed_cols.index(c) for c in output_cols]]
-    real = real_scaled
-    pred = preds
+    output_positions = [needed_cols.index(c) for c in output_cols]
+    real = real_full[:, output_positions]
+
+    # Inverse-transform predictions to original output units
+    pred_full_scaled = np.zeros((horizon, len(needed_cols)), dtype=np.float32)
+    pred_full_scaled[:, output_positions] = preds
+    pred_full = scaler.inverse_transform(pred_full_scaled)
+    pred = pred_full[:, output_positions]
 
     if out_fig is not None:
         save_simulation_plot(real, pred, output_cols, out_fig)

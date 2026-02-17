@@ -93,6 +93,7 @@ optimization:
   enable_pruning: true               # prune weak trials early
   pruner_startup_trials: 5           # full trials before pruning starts
   pruner_warmup_steps: 1             # epochs reported before pruning eligibility
+  pruner_min_epochs: 1               # do not prune before this many epochs within a trial
 
 # ══════════════════════════════════════════════════════════════════════
 #  DATA

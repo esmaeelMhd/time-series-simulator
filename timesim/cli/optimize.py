@@ -261,6 +261,29 @@ def _sanitize_for_yaml(obj: Any):
     return obj
 
 
+def _normalize_best_params(best_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize best params for downstream config compatibility."""
+    normalized = dict(best_params)
+    optimizer_name = str(normalized.get("optimizer", "")).lower()
+
+    if "weight_decay" not in normalized:
+        if optimizer_name == "adamw" and "weight_decay_adamw" in normalized:
+            normalized["weight_decay"] = normalized["weight_decay_adamw"]
+        elif optimizer_name == "adam" and "weight_decay_adam" in normalized:
+            normalized["weight_decay"] = normalized["weight_decay_adam"]
+        elif "weight_decay_adamw" in normalized:
+            normalized["weight_decay"] = normalized["weight_decay_adamw"]
+        elif "weight_decay_adam" in normalized:
+            normalized["weight_decay"] = normalized["weight_decay_adam"]
+
+    normalized.pop("weight_decay_adamw", None)
+    normalized.pop("weight_decay_adam", None)
+    # KL warmup schedule is intentionally kept under training config control.
+    normalized.pop("kl_beta_start", None)
+    normalized.pop("kl_warmup_epochs", None)
+    return normalized
+
+
 def _maybe_compile_model(model, config: Dict[str, Any]):
     """Optionally compile a model with torch.compile."""
     if getattr(model, "_timesim_compiled", False):
@@ -382,6 +405,9 @@ def main():
     enable_pruning = bool(ocfg.get("enable_pruning", True))
     pruner_startup_trials = int(ocfg.get("pruner_startup_trials", 5))
     pruner_warmup_steps = int(ocfg.get("pruner_warmup_steps", 1))
+    pruner_min_epochs_default = 2 if fast_mode else 1
+    pruner_min_epochs = int(ocfg.get("pruner_min_epochs", pruner_min_epochs_default))
+    pruner_min_epochs = max(1, min(pruner_min_epochs, trial_epochs))
 
     print("\n" + "=" * 70)
     print("  OPTUNA HYPERPARAMETER OPTIMIZATION")
@@ -398,6 +424,13 @@ def main():
     print(f"  Search profile  : {search_space_profile}")
     print(f"  Fast mode       : {fast_mode}")
     print(f"  Pruning         : {enable_pruning}")
+    if enable_pruning:
+        print(
+            "  Pruner          : "
+            f"startup={pruner_startup_trials}, "
+            f"warmup_steps={pruner_warmup_steps}, "
+            f"min_epochs={pruner_min_epochs}"
+        )
     print("=" * 70 + "\n")
 
     # Build data once and reuse across all trials/models.
@@ -442,13 +475,10 @@ def main():
                     elbo_weight = trial.suggest_float("elbo_weight", 0.5, 2.0)
                     kl_weight = trial.suggest_float("kl_weight", 0.05, 1.5)
                     rollout_mse_weight = trial.suggest_float("rollout_mse_weight", 0.5, 3.0)
-                    kl_beta_start = trial.suggest_float("kl_beta_start", 0.0, 0.3)
-                    kl_beta_end = 1.0
-                    kl_warmup_epochs = trial.suggest_int(
-                        "kl_warmup_epochs",
-                        1,
-                        max(1, trial_epochs),
-                    )
+                    # Keep KL warmup schedule fixed from training config.
+                    kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
+                    kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
+                    kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
                 else:
                     elbo_weight = float(prob_cfg_default.get("elbo_weight", 1.0))
                     kl_weight = float(prob_cfg_default.get("kl_weight", 1.0))
@@ -467,10 +497,14 @@ def main():
 
                 optimizer_name = trial.suggest_categorical("optimizer", ["adam", "adamw"])
                 if optimizer_name == "adamw":
-                    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+                    # Keep per-optimizer parameter names so Optuna distributions
+                    # remain compatible when resuming an existing study.
+                    weight_decay = trial.suggest_float(
+                        "weight_decay_adamw", 1e-6, 1e-2, log=True
+                    )
                 else:
                     # Keep Adam regularization mild to avoid over-penalizing dynamics.
-                    weight_decay = trial.suggest_float("weight_decay", 0.0, 1e-4)
+                    weight_decay = trial.suggest_float("weight_decay_adam", 0.0, 1e-4)
                 model = build_model(
                     model_type,
                     input_dim,
@@ -538,8 +572,14 @@ def main():
                     if val_finite:
                         final_val = float(val_finite[-1])
                         best_score = min(best_score, final_val)
-                        trial.report(final_val, step=ep)
-                        if enable_pruning and trial.should_prune():
+                        # Report best-so-far to reduce noisy prune decisions.
+                        trial.report(best_score, step=ep)
+                        if (
+                            enable_pruning
+                            and (ep + 1) >= pruner_min_epochs
+                            and (ep + 1) < trial_epochs
+                            and trial.should_prune()
+                        ):
                             raise optuna.TrialPruned()
                 if not np.isfinite(best_score):
                     return float("inf")
@@ -631,7 +671,7 @@ def main():
             "n_trials_total": len(study.trials),
             "best_trial": study.best_trial.number,
             "best_value": float(study.best_value),
-            "best_params": _sanitize_for_yaml(study.best_params),
+            "best_params": _sanitize_for_yaml(_normalize_best_params(study.best_params)),
         }
 
         with open(model_opt_dir / "best_params.yaml", "w", encoding="utf-8") as f:

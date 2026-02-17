@@ -26,6 +26,8 @@ def _prepare_batch_data(
     horizons: np.ndarray,
     warmup_len: int,
     max_horizon: int,
+    control_positions: List[int],
+    known_exo_positions: List[int],
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Prepare batched data for rollout with a single conversion to tensors.
@@ -57,19 +59,13 @@ def _prepare_batch_data(
     input_dim = len(dataset.in_idx)
     output_dim = len(dataset.out_idx)
     
-    # Determine which output indices are NOT already covered by input indices.
-    # When output_groups overlap with input_groups (e.g. "objective" in both),
-    # out_idx entries already appear in in_idx.  We must NOT duplicate them in
-    # warmup_full, otherwise the tensor dimension won't match the model's
-    # input_dim (= len(union(in_idx, out_idx))).
-    in_idx_set = set(dataset.in_idx)
-    extra_out_idx = [idx for idx in dataset.out_idx if idx not in in_idx_set]
-    extra_out_dim = len(extra_out_idx)
+    control_dim = len(control_positions)
+    exo_dim = len(known_exo_positions)
     
     # Preallocate numpy arrays for batch data (avoid list appends)
-    warmup_inputs = np.zeros((batch_size, warmup_len, input_dim), dtype=np.float32)
-    if extra_out_dim > 0:
-        warmup_extra_out = np.zeros((batch_size, warmup_len, extra_out_dim), dtype=np.float32)
+    warmup_controls = np.zeros((batch_size, warmup_len, control_dim), dtype=np.float32)
+    warmup_exogenous = np.zeros((batch_size, warmup_len, exo_dim), dtype=np.float32)
+    warmup_outputs = np.zeros((batch_size, warmup_len, output_dim), dtype=np.float32)
     rollout_inputs = np.zeros((batch_size, max_horizon, input_dim), dtype=np.float32)
     rollout_targets = np.zeros((batch_size, max_horizon, output_dim), dtype=np.float32)
     
@@ -78,6 +74,8 @@ def _prepare_batch_data(
     values = dataset.values
     in_idx = dataset.in_idx
     out_idx = dataset.out_idx
+    control_idx = [in_idx[pos] for pos in control_positions]
+    exo_idx = [in_idx[pos] for pos in known_exo_positions]
     
     for i in range(batch_size):
         start_idx = int(start_indices[i])
@@ -85,22 +83,20 @@ def _prepare_batch_data(
         
         # Warmup window: [start_idx - warmup_len : start_idx]
         warmup_slice = values[start_idx - warmup_len : start_idx]
-        warmup_inputs[i] = warmup_slice[:, in_idx]
-        if extra_out_dim > 0:
-            warmup_extra_out[i] = warmup_slice[:, extra_out_idx]
+        if control_dim > 0:
+            warmup_controls[i] = warmup_slice[:, control_idx]
+        if exo_dim > 0:
+            warmup_exogenous[i] = warmup_slice[:, exo_idx]
+        warmup_outputs[i] = warmup_slice[:, out_idx]
         
         # Rollout window: [start_idx : start_idx + horizon]
         rollout_slice = values[start_idx : start_idx + horizon]
         rollout_inputs[i, :horizon] = rollout_slice[:, in_idx]
         rollout_targets[i, :horizon] = rollout_slice[:, out_idx]
     
-    # Single batch conversion to tensors (Rule 7: avoid repeated conversions)
-    # Build warmup_full: input columns + any output columns not already in inputs.
-    # This ensures warmup_full dim == model's input_dim == len(union(in_idx, out_idx))
-    if extra_out_dim > 0:
-        warmup_full = np.concatenate([warmup_inputs, warmup_extra_out], axis=-1)
-    else:
-        warmup_full = warmup_inputs
+    # Build warmup_full in the same semantic order used during rollout steps:
+    # [controls, known_exogenous(+time), previous_outputs].
+    warmup_full = np.concatenate([warmup_controls, warmup_exogenous, warmup_outputs], axis=-1)
     
     return {
         "warmup_full": torch.from_numpy(warmup_full).to(device),
@@ -182,7 +178,14 @@ def batch_rollout(
     
     # Prepare batch data with single conversion (HOT PATH optimization)
     batch_data = _prepare_batch_data(
-        dataset, start_indices, horizons, warmup_len, max_horizon, device
+        dataset,
+        start_indices,
+        horizons,
+        warmup_len,
+        max_horizon,
+        control_positions,
+        known_exo_positions,
+        device,
     )
     
     warmup_full = batch_data["warmup_full"]  # (B, warmup_len, model_input_dim)

@@ -16,6 +16,8 @@ optimization:
   search_space_profile: fast_gpu
   fast_sampling_horizon: 32
   enable_pruning: true
+  pruner_warmup_steps: 2
+  pruner_min_epochs: 3
 
 training:
   # Keep optimization representative, but much cheaper than horizon=360.

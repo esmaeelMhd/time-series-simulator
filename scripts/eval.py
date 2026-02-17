@@ -44,9 +44,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.data.stamps import get_time_feature_columns
 from timesim.utils.plotting import save_forecast_plot
 from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
 
@@ -89,6 +91,74 @@ def discover_checkpoints(model_dir: Path, model_type: str):
     return found
 
 
+MODEL_PARAM_KEYS_BY_TYPE = {
+    "lstm": {"hidden_dim", "num_layers", "dropout"},
+    "dlinear": {"kernel_size", "individual"},
+    "nlinear": {"individual"},
+    "tft": {"hidden_dim", "n_heads", "num_lstm_layers", "dropout"},
+    "transformer": {"d_model", "nhead", "num_layers", "dim_feedforward", "dropout"},
+    "latent_ssm": {"hidden_dim", "latent_dim", "num_layers", "dropout", "min_scale", "min_df"},
+    "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
+}
+
+
+def _resolve_optuna_summary_path(config, run_dir: Path, cli_path: str | None = None) -> Path:
+    if cli_path:
+        return Path(cli_path)
+    cfg_path = config.get("training", {}).get("optuna_summary_path", None)
+    if cfg_path:
+        return Path(cfg_path)
+    return run_dir / "optuna" / "summary.yaml"
+
+
+def _load_optuna_best_params(summary_path: Path):
+    if not summary_path.exists():
+        print(f"  Optuna summary not found: {summary_path}")
+        return {}
+    with open(summary_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        print(f"  Warning: Optuna summary is not a mapping: {summary_path}")
+        return {}
+    best_by_model = {}
+    for model_type, entry in raw.items():
+        if isinstance(entry, dict):
+            best_params = entry.get("best_params", {})
+            if isinstance(best_params, dict):
+                best_by_model[str(model_type)] = dict(best_params)
+    return best_by_model
+
+
+def _split_optuna_params(model_type: str, best_params):
+    model_keys = MODEL_PARAM_KEYS_BY_TYPE.get(model_type, set())
+    model_overrides = {k: v for k, v in best_params.items() if k in model_keys}
+    training_overrides = {
+        k: v
+        for k, v in best_params.items()
+        if k in {
+            "learning_rate",
+            "optimizer",
+            "weight_decay",
+            "loss_type",
+            "loss_weighting",
+            "loss_weight_scale",
+            "mode",
+            "feedback",
+            "teacher_forcing_ratio",
+            "one_step_weight",
+            "elbo_weight",
+            "kl_weight",
+            "rollout_mse_weight",
+            "objective",
+            "kl_warmup_enabled",
+            "kl_beta_start",
+            "kl_beta_end",
+            "kl_warmup_epochs",
+        }
+    }
+    return model_overrides, training_overrides
+
+
 # ─────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────
@@ -108,6 +178,25 @@ def parse_args():
                              "Default: latest available checkpoint.")
     parser.add_argument("--device", type=str, default=None,
                         help="Override device (cpu / cuda)")
+    parser.add_argument(
+        "--use-optuna-best-params",
+        dest="use_optuna_best_params",
+        action="store_true",
+        help="Use per-model best params from Optuna summary if available",
+    )
+    parser.add_argument(
+        "--no-use-optuna-best-params",
+        dest="use_optuna_best_params",
+        action="store_false",
+        help="Disable Optuna best params even if enabled in config",
+    )
+    parser.set_defaults(use_optuna_best_params=None)
+    parser.add_argument(
+        "--optuna-summary",
+        type=str,
+        default=None,
+        help="Path to Optuna summary.yaml (default: <run_dir>/optuna/summary.yaml)",
+    )
 
     # ── Evaluation overrides ──────────────────────────────────────────
     eval_grp = parser.add_argument_group("evaluation overrides")
@@ -146,6 +235,12 @@ def main():
     config = load_config(args.config)
     if args.device:
         config["misc"]["device"] = args.device
+    if args.use_optuna_best_params is not None:
+        config.setdefault("training", {})
+        config["training"]["use_optuna_best_params"] = args.use_optuna_best_params
+    if args.optuna_summary:
+        config.setdefault("training", {})
+        config["training"]["optuna_summary_path"] = args.optuna_summary
 
     seed = config["misc"].get("seed", 42)
     torch.manual_seed(seed)
@@ -177,6 +272,17 @@ def main():
     # Use union to avoid double-counting when output_cols are in input_groups
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
+    add_time_features = bool(data_cfg.get("add_time_features", False))
+    time_features_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
+    if add_time_features:
+        input_dim += len(
+            get_time_feature_columns(
+                features=time_features_cfg.get("features"),
+                encoding=time_features_cfg.get("encoding", "cyclical"),
+            )
+        )
     output_dim = len(output_cols)
 
     control_cols = groups.get("control", [])
@@ -204,6 +310,16 @@ def main():
     run_dir = runs_dir / dataset_name
     if run_name is not None:
         run_dir = run_dir / run_name
+    use_optuna_best_params = bool(
+        config.get("training", {}).get("use_optuna_best_params", False)
+    )
+    optuna_summary_path = _resolve_optuna_summary_path(config, run_dir, args.optuna_summary)
+    optuna_best_by_model = {}
+    if use_optuna_best_params:
+        print("Loading Optuna best params...")
+        print(f"  Summary path: {optuna_summary_path}")
+        optuna_best_by_model = _load_optuna_best_params(optuna_summary_path)
+        print(f"  Models with best params: {sorted(optuna_best_by_model.keys())}")
     model_dir = run_dir / model_type
 
     if not model_dir.exists():
@@ -233,11 +349,18 @@ def main():
     models_cfg_list = config.get("models", [])
     models_cfg_map = {m["type"]: m for m in models_cfg_list}
     mc = models_cfg_map.get(model_type, {"type": model_type})
+    model_overrides = {}
+    if use_optuna_best_params and model_type in optuna_best_by_model:
+        model_overrides, _ = _split_optuna_params(
+            model_type, optuna_best_by_model[model_type]
+        )
+        print(f"  Optuna model overrides for {model_type}: {model_overrides}")
 
     if model_type in NEURAL_MODELS:
         model = build_model(
             model_type, input_dim, output_dim, seq_len, pred_len,
-            per_model_cfg=mc, model_defaults_cfg=model_defaults_cfg)
+            per_model_cfg=mc, model_defaults_cfg=model_defaults_cfg,
+            overrides=model_overrides)
         model.load_state_dict(
             torch.load(ckpt_path, map_location=device, weights_only=True))
         model.to(device)
@@ -276,6 +399,8 @@ def main():
         seq_len=seq_len, pred_len=pred_len,
         batch_size=config["dataset"]["batch_size"],
         train_split=train_split,
+        add_time=add_time_features,
+        time_features_cfg=time_features_cfg,
         existing_scaler=scaler,
     )
     val_dataset = val_loader.dataset
@@ -341,7 +466,7 @@ def main():
                           f"Forecast (horizon={eval_horizon})",
                     show_metrics=True,
                 )
-                print(f"  Saved → {forecast_path}")
+                print(f"  Saved -> {forecast_path}")
 
                 # Save per-window metrics CSV
                 metrics_rows = []
@@ -361,7 +486,7 @@ def main():
                 metrics_csv = model_dir / f"{prefix}_eval_metrics.csv"
                 pd.DataFrame(metrics_rows).to_csv(
                     metrics_csv, index=False, float_format="%.6f")
-                print(f"  Saved → {metrics_csv}")
+                print(f"  Saved -> {metrics_csv}")
             else:
                 print("  Warning: no evaluation windows produced (data too short?)")
 
@@ -402,7 +527,7 @@ def main():
                     sim_result, output_cols, model_type,
                     sim_plot_path, plot_cfg=plot_cfg,
                 )
-                print(f"  Saved → {sim_plot_path}")
+                print(f"  Saved -> {sim_plot_path}")
 
                 # Simulation CSV
                 save_per_model_simulation_csv(
@@ -410,7 +535,7 @@ def main():
                     model_dir, prefix,
                 )
                 sim_csv_path = model_dir / f"{prefix}_simulation.csv"
-                print(f"  Saved → {sim_csv_path}")
+                print(f"  Saved -> {sim_csv_path}")
             else:
                 print("  Warning: 0 simulation steps (data too short?)")
 
