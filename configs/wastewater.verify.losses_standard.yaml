@@ -1,0 +1,10 @@
+_base: wastewater.verify.losses_rollout.yaml
+
+output:
+  runs_dir: runs
+  run_name: checklist_loss_eval_standard
+
+training:
+  probabilistic:
+    rollout_weight: 0.0
+    rollout_dtw_weight: 0.0

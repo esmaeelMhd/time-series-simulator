@@ -16,6 +16,25 @@ from timesim.serving import create_app
 from timesim.simulator import RSSMSimulator
 
 
+def _load_model_state(model: torch.nn.Module, checkpoint: str | Path, device: str):
+    try:
+        state = torch.load(checkpoint, map_location=device, weights_only=True)
+    except Exception:
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    try:
+        model.load_state_dict(state)
+    except RuntimeError:
+        # Latent SSM may contain lazily-created aux decoder heads in checkpoints.
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(
+                "Warning: non-strict checkpoint load "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})."
+            )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Serve RSSM simulator API")
     p.add_argument("--config", type=str, required=True)
@@ -74,6 +93,7 @@ def main():
         add_time=add_time,
         time_features_cfg=tf_cfg,
         existing_scaler=scaler,
+        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
     dataset = val_loader.dataset
 
@@ -89,7 +109,7 @@ def main():
         per_model_cfg=latent_cfg,
         model_defaults_cfg=config.get("model_defaults", {}),
     )
-    model.load_state_dict(torch.load(args.checkpoint, map_location=args.device, weights_only=True))
+    _load_model_state(model, args.checkpoint, args.device)
     model.to(args.device)
     model.eval()
 

@@ -43,6 +43,10 @@ obj_cols = st.multiselect("Objective columns", options=[c for c in all_cols if c
 if not control_cols or not obj_cols:
     st.warning("Select at least one control and one objective column.")
     st.stop()
+unassigned = [c for c in all_cols if c not in control_cols and c not in exo_cols and c not in obj_cols]
+if unassigned:
+    st.warning(f"Assign all columns to a role. Unassigned: {unassigned}")
+    st.stop()
 
 groups = {
     "control": control_cols,
@@ -69,6 +73,7 @@ if st.button("Initialize Simulator", type="primary"):
             batch_size=64,
             train_split=0.8,
             add_time=False,
+            require_full_role_mapping=True,
         )
         dataset = train_loader.dataset
 
@@ -86,7 +91,13 @@ if st.button("Initialize Simulator", type="primary"):
 
         ckpt = Path(checkpoint_path) if checkpoint_path else None
         if ckpt is not None and ckpt.exists():
-            model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
+            try:
+                state = torch.load(ckpt, map_location="cpu", weights_only=True)
+            except Exception:
+                state = torch.load(ckpt, map_location="cpu", weights_only=False)
+            if isinstance(state, dict) and "model_state_dict" in state:
+                state = state["model_state_dict"]
+            model.load_state_dict(state)
         else:
             trainer = WorldModelTrainer(
                 model=model,

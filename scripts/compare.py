@@ -222,6 +222,7 @@ def main():
         batch_size=config["dataset"]["batch_size"],
         train_split=train_split,
         existing_scaler=scaler,
+        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
 
     val_dataset = val_loader.dataset
@@ -271,8 +272,13 @@ def main():
                 model = build_model(
                     model_type, input_dim, output_dim, seq_len, pred_len,
                     per_model_cfg=mc, model_defaults_cfg=model_defaults_cfg)
-                model.load_state_dict(
-                    torch.load(ckpt_path, map_location=device, weights_only=True))
+                try:
+                    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+                except Exception:
+                    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+                if isinstance(state, dict) and "model_state_dict" in state:
+                    state = state["model_state_dict"]
+                model.load_state_dict(state)
                 model.to(device)
                 model.eval()
                 n_params = count_parameters(model)

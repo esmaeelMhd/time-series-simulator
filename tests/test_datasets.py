@@ -139,5 +139,58 @@ def test_variable_schema_rejects_duplicate_column_roles():
         )
 
 
+def test_grouped_dataset_rejects_unmapped_columns_by_default():
+    df = pd.DataFrame(
+        {
+            "u": np.random.randn(64),
+            "x": np.random.randn(64),
+            "y": np.random.randn(64),
+            "unused": np.random.randn(64),
+        }
+    )
+    groups = {
+        "control": ["u"],
+        "exogenous": ["x"],
+        "objective": ["y"],
+    }
+    with pytest.raises(ValueError, match="without variable role assignment"):
+        GroupedTimeSeriesDataset(
+            df,
+            groups,
+            ["control", "exogenous"],
+            ["objective"],
+            seq_len=8,
+            pred_len=2,
+            scale=False,
+        )
+
+
+def test_grouped_dataset_can_allow_partial_mapping():
+    df = pd.DataFrame(
+        {
+            "u": np.random.randn(64),
+            "x": np.random.randn(64),
+            "y": np.random.randn(64),
+            "unused": np.random.randn(64),
+        }
+    )
+    groups = {
+        "control": ["u"],
+        "exogenous": ["x"],
+        "objective": ["y"],
+    }
+    ds = GroupedTimeSeriesDataset(
+        df,
+        groups,
+        ["control", "exogenous"],
+        ["objective"],
+        seq_len=8,
+        pred_len=2,
+        scale=False,
+        require_full_role_mapping=False,
+    )
+    assert len(ds) > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

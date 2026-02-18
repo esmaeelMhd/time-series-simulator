@@ -82,6 +82,8 @@ class GroupedTimeSeriesDataset(Dataset):
         Whether to append date/time features (hour, day-of-week, …).
     scaler : MinMaxScaler | None, default None
         Optional MinMaxScaler to use for scaling.
+    require_full_role_mapping : bool, default True
+        If True, every DataFrame column must be assigned to exactly one role.
     """
 
     def __init__(self,
@@ -94,17 +96,16 @@ class GroupedTimeSeriesDataset(Dataset):
                  scale: bool = True,
                  add_time: bool = False,
                  time_features_cfg: Optional[Dict[str, Any]] = None,
-                 scaler: 'MinMaxScaler | None' = None):
+                 scaler: 'MinMaxScaler | None' = None,
+                 require_full_role_mapping: bool = True):
 
         # Single source of truth for C/X/Y taxonomy.
         self.variable_schema = VariableSchema.from_groups(groups)
+        self.variable_schema.validate_columns(
+            list(df.columns),
+            require_exact_match=bool(require_full_role_mapping),
+        )
         self.groups = self.variable_schema.to_groups()
-
-        # Validate mapped columns exist in data.
-        all_cols = list(self.variable_schema.ordered_columns)
-        missing = [c for c in all_cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"Columns missing in DataFrame: {missing}")
 
         self.input_groups = input_groups
         self.output_groups = output_groups

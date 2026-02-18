@@ -70,6 +70,9 @@ _BUILTIN_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "encoder_dim": 64,
         "decoder_layers": 2,
         "use_symlog": False,
+        "use_aux_decoder": True,
+        "use_dual_path": True,
+        "leak_objective_to_transition": False,
     },
     "xgboost": {
         "n_estimators": 100,
@@ -208,6 +211,9 @@ def build_model(
             encoder_dim=p.get("encoder_dim", 64),
             decoder_layers=p.get("decoder_layers", 2),
             use_symlog=p.get("use_symlog", False),
+            use_aux_decoder=p.get("use_aux_decoder", True),
+            use_dual_path=p.get("use_dual_path", True),
+            leak_objective_to_transition=p.get("leak_objective_to_transition", False),
         )
 
     elif model_type == "xgboost":
@@ -235,5 +241,16 @@ def build_model(
 def count_parameters(model) -> int:
     """Count trainable parameters (returns 0 for non-PyTorch models)."""
     if hasattr(model, "parameters"):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+        try:
+            from torch.nn.parameter import UninitializedParameter  # type: ignore
+        except Exception:  # pragma: no cover - older torch fallback
+            UninitializedParameter = tuple()  # type: ignore
+        total = 0
+        for p in model.parameters():
+            if not getattr(p, "requires_grad", False):
+                continue
+            if isinstance(p, UninitializedParameter):
+                continue
+            total += int(p.numel())
+        return total
     return 0

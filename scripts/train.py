@@ -16,7 +16,9 @@ Usage:
 """
 
 import argparse
+import datetime as dt
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -72,6 +74,7 @@ MODEL_PARAM_KEYS_BY_TYPE = {
     "latent_ssm": {
         "hidden_dim", "latent_dim", "num_layers", "dropout",
         "min_scale", "min_df", "encoder_dim", "decoder_layers", "use_symlog",
+        "use_aux_decoder", "use_dual_path", "leak_objective_to_transition",
     },
     "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
 }
@@ -92,6 +95,12 @@ TRAINING_PARAM_KEYS = {
     "kl_weight",
     "aux_weight",
     "rollout_mse_weight",
+    "rollout_weight",
+    "rollout_dtw_weight",
+    "rollout_dtw_gamma",
+    "rollout_warmup_fraction",
+    "rollout_max_horizon",
+    "min_context",
     "kl_free_bits",
     "kl_balance",
     "use_kl_balancing",
@@ -100,9 +109,15 @@ TRAINING_PARAM_KEYS = {
     "grad_clip_norm",
     "lr_warmup_steps",
     "lr_min_ratio",
+    "checkpoint_top_k",
+    "early_stopping_monitor",
     "objective",
     "kl_warmup_enabled",
     "kl_beta_end",
+    "checkpoint_metric",
+    "checkpoint_open_loop_horizon",
+    "checkpoint_open_loop_windows",
+    "checkpoint_open_loop_samples",
 }
 
 
@@ -214,14 +229,29 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
     if "rollout_mse_weight" in training_overrides:
         prob_cfg["rollout_mse_weight"] = training_overrides["rollout_mse_weight"]
     for key in [
+        "rollout_weight",
+        "rollout_dtw_weight",
+        "rollout_dtw_gamma",
+        "rollout_warmup_fraction",
+        "rollout_max_horizon",
+        "min_context",
         "kl_free_bits",
         "kl_balance",
         "use_kl_balancing",
         "use_free_bits",
         "use_symlog",
+        "use_aux_decoder",
+        "use_dual_path",
+        "leak_objective_to_transition",
         "grad_clip_norm",
         "lr_warmup_steps",
         "lr_min_ratio",
+        "checkpoint_top_k",
+        "early_stopping_monitor",
+        "checkpoint_metric",
+        "checkpoint_open_loop_horizon",
+        "checkpoint_open_loop_windows",
+        "checkpoint_open_loop_samples",
     ]:
         if key in training_overrides:
             prob_cfg[key] = training_overrides[key]
@@ -275,6 +305,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         min_delta=tcfg.get("min_delta", 0.0),
         run_dir=model_dir,
         probabilistic_cfg=prob_cfg,
+        sequence_curriculum_cfg=tcfg.get("sequence_curriculum", None),
     )
 
     train_losses, val_losses = trainer.fit(
@@ -409,6 +440,18 @@ def train_xgboost_model(model, train_dataset, val_dataset, config, model_dir):
     return [train_mse], [val_mse]
 
 
+def _save_model_artifacts(model_dir: Path, dataset, scaler) -> None:
+    """Save schema and scaler next to model checkpoints."""
+    model_dir.mkdir(parents=True, exist_ok=True)
+    schema = getattr(dataset, "variable_schema", None)
+    if schema is not None:
+        with open(model_dir / "variable_schema.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(schema.to_groups(), f, sort_keys=False)
+
+    from joblib import dump
+    dump(scaler, model_dir / "scaler.pkl")
+
+
 def _build_simulation_start_idx_schedule(
     total_len: int,
     seq_len: int,
@@ -451,6 +494,19 @@ def _build_simulation_start_idx_schedule(
         sampled = [fixed] * remaining
     schedule.extend(int(s) for s in sampled)
     return schedule
+
+
+def _git_hash() -> str:
+    """Return current git hash, or 'unknown' when unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return out or "unknown"
+    except Exception:
+        return "unknown"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -646,8 +702,15 @@ def main():
         print(f"  Models with best params: {sorted(optuna_best_by_model.keys())}")
 
     # Save resolved config
-    with open(out_dir / "config.yaml", "w") as f:
+    with open(out_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f)
+    run_meta = {
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "git_hash": _git_hash(),
+        "config_path": str(Path(args.config).resolve()),
+    }
+    with open(out_dir / "run_metadata.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(run_meta, f, sort_keys=False)
 
     # Pre-create per-model directories
     for rc in training_rounds:
@@ -675,6 +738,7 @@ def main():
         train_split=train_split,
         add_time=add_time_features,
         time_features_cfg=time_features_cfg,
+        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
 
     train_dataset = train_loader.dataset
@@ -758,7 +822,13 @@ def main():
                     overrides=model_overrides)
                 ckpt = Path(checkpoint_dir) / model_type / "train_checkpoint.pth"
                 if ckpt.exists():
-                    model.load_state_dict(torch.load(ckpt, map_location=device))
+                    try:
+                        state = torch.load(ckpt, map_location=device, weights_only=True)
+                    except Exception:
+                        state = torch.load(ckpt, map_location=device, weights_only=False)
+                    if isinstance(state, dict) and "model_state_dict" in state:
+                        state = state["model_state_dict"]
+                    model.load_state_dict(state)
                     model.to(device)
                     is_retrain = True
                     print(f"  Loaded checkpoint: {ckpt}")
@@ -833,7 +903,7 @@ def main():
                             f"{start_idx_schedule[:checkpoint_sim_rounds]}"
                         )
 
-                        def checkpoint_callback(epoch_idx: int, improved_val_loss: float):
+                        def checkpoint_callback(epoch_idx: int, improved_score: float):
                             if checkpoint_sim_horizon <= 0:
                                 return
                             saved_this_epoch = 0
@@ -860,7 +930,7 @@ def main():
                             if saved_this_epoch > 0:
                                 print(
                                     f"  Saved {saved_this_epoch} checkpoint simulation plots "
-                                    f"(epoch={epoch_idx}, val_loss={improved_val_loss:.6f})"
+                                    f"(epoch={epoch_idx}, score={improved_score:.6f})"
                                 )
 
                     train_losses, val_losses = train_neural_model(
@@ -924,6 +994,7 @@ def main():
                                     "(post-fit xgboost)"
                                 )
 
+                _save_model_artifacts(model_dir, train_dataset, scaler)
                 elapsed = time.time() - t0
 
                 # Round-specific loss plot
@@ -952,19 +1023,34 @@ def main():
                     "kl_weight",
                     "aux_weight",
                     "rollout_mse_weight",
+                    "rollout_weight",
+                    "rollout_dtw_weight",
+                    "rollout_dtw_gamma",
+                    "rollout_warmup_fraction",
+                    "rollout_max_horizon",
+                    "min_context",
                     "kl_free_bits",
                     "kl_balance",
                     "use_kl_balancing",
                     "use_free_bits",
                     "use_symlog",
+                    "use_aux_decoder",
+                    "use_dual_path",
+                    "leak_objective_to_transition",
                     "grad_clip_norm",
                     "lr_warmup_steps",
                     "lr_min_ratio",
+                    "checkpoint_top_k",
+                    "early_stopping_monitor",
                     "objective",
                     "kl_warmup_enabled",
                     "kl_beta_start",
                     "kl_beta_end",
                     "kl_warmup_epochs",
+                    "checkpoint_metric",
+                    "checkpoint_open_loop_horizon",
+                    "checkpoint_open_loop_windows",
+                    "checkpoint_open_loop_samples",
                 ]:
                     if k in train_overrides:
                         resolved_prob_cfg[k] = train_overrides[k]
@@ -998,6 +1084,9 @@ def main():
                             "one_step_weight": train_overrides.get(
                                 "one_step_weight", tcfg.get("one_step_weight", 0.5)
                             ),
+                            "sequence_curriculum": dict(
+                                tcfg.get("sequence_curriculum", {}) or {}
+                            ),
                             "probabilistic": resolved_prob_cfg,
                         },
                         "data": {
@@ -1008,6 +1097,10 @@ def main():
                             "output_dim": output_dim,
                             "add_time_features": add_time_features,
                             "time_features_cfg": time_features_cfg,
+                            "require_full_role_mapping": bool(
+                                data_cfg.get("require_full_role_mapping", True)
+                            ),
+                            "variable_schema": train_dataset.variable_schema.to_groups(),
                         },
                         "optuna": {
                             "enabled": bool(

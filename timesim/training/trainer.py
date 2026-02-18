@@ -28,7 +28,13 @@ from ..data.dataset import GroupedTimeSeriesDataset
 from ..data.sampling import SamplingStrategy, RandomStartFixedHorizon
 from ..models.base import WorldModelBase
 from ..utils.early_stop import EarlyStopping
-from .losses import OneStepLoss, MultiStepLoss, CombinedLoss, ProbabilisticRolloutLoss
+from .losses import (
+    OneStepLoss,
+    MultiStepLoss,
+    CombinedLoss,
+    ProbabilisticRolloutLoss,
+    soft_dtw_distance,
+)
 from .rollout import batch_rollout_padded
 
 
@@ -116,6 +122,7 @@ class WorldModelTrainer:
         run_dir: Optional[str | Path] = None,
         writer: Optional["SummaryWriter"] = None, # type: ignore
         probabilistic_cfg: Optional[Dict[str, Any]] = None,
+        sequence_curriculum_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.model = model
         self.dataset = dataset
@@ -127,6 +134,7 @@ class WorldModelTrainer:
         self.teacher_forcing_ratio = teacher_forcing_ratio
         self.use_amp = use_amp
         self.is_probabilistic_model = bool(getattr(self.model, "is_probabilistic", False))
+        self.disable_aux_loss = not bool(getattr(self.model, "use_aux_decoder", True))
         
         # Device setup
         if use_gpu:
@@ -197,23 +205,71 @@ class WorldModelTrainer:
             use_symlog=prob_cfg.get("use_symlog", False),
         )
         self.prob_objective = str(prob_cfg.get("objective", "rssm"))
+        self.rollout_weight = float(prob_cfg.get("rollout_weight", 0.0))
+        self.rollout_dtw_weight = float(prob_cfg.get("rollout_dtw_weight", 0.0))
+        self.rollout_dtw_gamma = float(prob_cfg.get("rollout_dtw_gamma", 0.1))
+        self.rollout_warmup_fraction = float(prob_cfg.get("rollout_warmup_fraction", 0.30))
+        self.rollout_max_horizon = max(
+            0,
+            int(prob_cfg.get("rollout_max_horizon", max(1, getattr(self.dataset, "pred_len", 1)))),
+        )
+        self.min_context = max(1, int(prob_cfg.get("min_context", 16)))
         self.kl_warmup_enabled = bool(prob_cfg.get("kl_warmup_enabled", False))
         self.kl_beta_start = float(prob_cfg.get("kl_beta_start", 1.0))
         self.kl_beta_end = float(prob_cfg.get("kl_beta_end", 1.0))
         self.kl_warmup_epochs = max(1, int(prob_cfg.get("kl_warmup_epochs", 1)))
         self.grad_clip_norm = float(prob_cfg.get("grad_clip_norm", 100.0))
         self.lr_warmup_steps = max(0, int(prob_cfg.get("lr_warmup_steps", 1000)))
-        self.lr_min_ratio = float(prob_cfg.get("lr_min_ratio", 0.1))
+        self.lr_min_ratio = float(prob_cfg.get("lr_min_ratio", 0.01))
         self.collapse_kl_threshold = float(prob_cfg.get("collapse_kl_threshold", 0.1))
         self.collapse_patience_epochs = max(1, int(prob_cfg.get("collapse_patience_epochs", 3)))
+        self.checkpoint_top_k = max(1, int(prob_cfg.get("checkpoint_top_k", 3)))
+        self.early_stopping_monitor = str(
+            prob_cfg.get(
+                "early_stopping_monitor",
+                "open_loop_crps" if self.is_probabilistic_model else "val_loss",
+            )
+        ).lower()
         self._collapse_counter = 0
         self._last_prob_info: Dict[str, float] = {}
         self._current_epoch = 1
         self._fit_epochs = 1
+        default_checkpoint_metric = "open_loop_crps" if self.is_probabilistic_model else "val_loss"
+        self.checkpoint_metric = str(prob_cfg.get("checkpoint_metric", default_checkpoint_metric)).lower()
+        self.checkpoint_open_loop_horizon = max(
+            1,
+            int(prob_cfg.get("checkpoint_open_loop_horizon", getattr(self.dataset, "pred_len", 1))),
+        )
+        self.checkpoint_open_loop_windows = max(
+            1,
+            int(prob_cfg.get("checkpoint_open_loop_windows", 4)),
+        )
+        self.checkpoint_open_loop_samples = max(
+            1,
+            int(prob_cfg.get("checkpoint_open_loop_samples", 32)),
+        )
+        if self.disable_aux_loss:
+            self.probabilistic_loss_fn.aux_weight = 0.0
+
+        curriculum_cfg = dict(sequence_curriculum_cfg or {})
+        self.sequence_curriculum_enabled = bool(curriculum_cfg.get("enabled", False))
+        self.curriculum_start_horizon = max(
+            1,
+            int(curriculum_cfg.get("start_horizon", curriculum_cfg.get("start_seq_len", 16))),
+        )
+        self.curriculum_target_horizon = max(
+            self.curriculum_start_horizon,
+            int(
+                curriculum_cfg.get(
+                    "target_horizon",
+                    curriculum_cfg.get("target_seq_len", getattr(self.dataset, "pred_len", 1)),
+                )
+            ),
+        )
         
         # Optimizer
         if optimizer is None:
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=3e-4, weight_decay=1e-6)
         else:
             self.optimizer = optimizer
         self._base_lrs = [float(pg.get("lr", 1e-3)) for pg in self.optimizer.param_groups]
@@ -243,13 +299,45 @@ class WorldModelTrainer:
             self.metrics_path = self.run_dir / "metrics.csv"
             if not self.metrics_path.exists():
                 with open(self.metrics_path, "w", encoding="utf-8") as f:
-                    f.write("epoch,train_loss,val_loss\n")
+                    f.write(
+                        "epoch,train_loss,val_loss,recon_nll,kl,kl_raw,aux_nll,"
+                        "rollout_nll,rollout_dtw,rollout_total,rollout_weight_eff,"
+                        "rollout_ramp,horizon_schedule,context_len,grad_norm,lr\n"
+                    )
         else:
             self.writer = writer
             self.metrics_path = None
         
         # Random number generator for reproducibility
         self.rng = np.random.default_rng()
+
+    def _rollout_schedule(self) -> tuple[int, int, float]:
+        """Return (horizon, context_len, ramp_factor) for rollout losses."""
+        seq_len = max(1, int(self.warmup_len))
+        max_h_ctx = max(0, seq_len - self.min_context)
+        max_h = min(int(self.rollout_max_horizon), max_h_ctx)
+        if max_h <= 0:
+            return 0, seq_len, 0.0
+
+        frac = max(0.0, min(1.0, float(self.rollout_warmup_fraction)))
+        total_epochs = max(1, int(self._fit_epochs))
+        warmup_epochs = int(math.ceil(total_epochs * frac))
+        warmup_epochs = min(total_epochs, max(0, warmup_epochs))
+        ep = int(self._current_epoch)
+
+        if ep <= warmup_epochs:
+            return 0, seq_len, 0.0
+
+        denom = max(1, total_epochs - warmup_epochs)
+        progress = float(ep - warmup_epochs) / float(denom)
+        ramp = max(0.0, min(1.0, progress))
+        horizon = int(round(max_h * ramp))
+        if horizon == 0 and ramp > 0.0:
+            horizon = 1
+        horizon = min(max_h, max(0, horizon))
+        context_len = max(self.min_context, seq_len - horizon)
+        horizon = max(0, seq_len - context_len)
+        return horizon, context_len, ramp
 
     def _current_kl_beta(self) -> float:
         """Current KL beta with optional linear warmup."""
@@ -282,6 +370,56 @@ class WorldModelTrainer:
 
         for pg, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
             pg["lr"] = float(base_lr) * float(mult)
+
+    def _current_curriculum_horizon(self) -> int:
+        """Current horizon cap for sequence-length curriculum."""
+        if not self.sequence_curriculum_enabled:
+            return self.curriculum_target_horizon
+        if self._fit_epochs <= 1:
+            return self.curriculum_target_horizon
+        frac = float(self._current_epoch - 1) / float(max(1, self._fit_epochs - 1))
+        frac = max(0.0, min(1.0, frac))
+        curr = self.curriculum_start_horizon + frac * (
+            self.curriculum_target_horizon - self.curriculum_start_horizon
+        )
+        return max(1, int(round(curr)))
+
+    def _apply_horizon_curriculum(self, horizons: np.ndarray) -> np.ndarray:
+        if not self.sequence_curriculum_enabled:
+            return horizons
+        cap = self._current_curriculum_horizon()
+        return np.clip(horizons.astype(np.int64, copy=False), 1, cap)
+
+    def _checkpoint_score(self, val_loss: Optional[float]) -> tuple[float, str]:
+        """Compute score used to select best checkpoint (lower is better)."""
+        if (
+            self.checkpoint_metric == "open_loop_crps"
+            and self.is_probabilistic_model
+            and self.val_dataset is not None
+        ):
+            max_h = max(1, len(self.val_dataset.values) - self.warmup_len)
+            horizon = max(1, min(self.checkpoint_open_loop_horizon, max_h))
+            try:
+                from ..evaluation import open_loop_evaluate
+
+                curves = open_loop_evaluate(
+                    model=self.model,
+                    dataset=self.val_dataset,
+                    warmup_len=self.warmup_len,
+                    horizon=horizon,
+                    n_windows=self.checkpoint_open_loop_windows,
+                    n_samples=self.checkpoint_open_loop_samples,
+                    device=self.device,
+                )
+                crps = curves.get("crps")
+                if crps is not None and len(crps) > 0 and np.all(np.isfinite(crps)):
+                    return float(np.mean(crps)), "open_loop_crps"
+            except Exception:
+                pass
+
+        if val_loss is None or not np.isfinite(val_loss):
+            return float("inf"), "val_loss"
+        return float(val_loss), "val_loss"
     
     def _train_step(self) -> float:
         """Perform one training step (one batch of rollouts).
@@ -301,6 +439,9 @@ class WorldModelTrainer:
             warmup_len=self.warmup_len,
             rng=self.rng,
         )
+        horizons = self._apply_horizon_curriculum(horizons)
+        sched_horizon, context_len, rollout_ramp = self._rollout_schedule()
+        effective_rollout_weight = max(0.0, self.rollout_weight * rollout_ramp)
 
         self.optimizer.zero_grad(set_to_none=True)
         
@@ -328,6 +469,10 @@ class WorldModelTrainer:
                 posterior_logvar = result_teacher.get("posterior_logvar")
                 aux_loc = result_teacher.get("aux_loc")
                 aux_scale = result_teacher.get("aux_scale")
+                if self.disable_aux_loss:
+                    exogenous_targets = None
+                    aux_loc = None
+                    aux_scale = None
 
                 if dist_loc_latent is None:
                     if dist_loc is None:
@@ -363,7 +508,84 @@ class WorldModelTrainer:
                     mask=mask,
                     kl_beta=kl_beta,
                 )
-                self._last_prob_info = info
+                raw_kl_elem = self.probabilistic_loss_fn._balanced_kl(  # pylint: disable=protected-access
+                    posterior_mu=posterior_mu,
+                    posterior_logvar=posterior_logvar,
+                    prior_mu=prior_mu,
+                    prior_logvar=prior_logvar,
+                )
+                raw_kl = self.probabilistic_loss_fn._masked_mean(  # pylint: disable=protected-access
+                    raw_kl_elem.sum(dim=-1), mask
+                )
+
+                rollout_nll = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                rollout_dtw = torch.zeros_like(rollout_nll)
+                rollout_total = torch.zeros_like(rollout_nll)
+                rollout_horizon = int(max(0, sched_horizon))
+                if rollout_horizon > 0 and effective_rollout_weight > 0.0:
+                    rollout_horizons = np.minimum(
+                        horizons.astype(np.int64, copy=False),
+                        np.full_like(horizons, fill_value=rollout_horizon),
+                    )
+                    rollout_horizons = np.clip(rollout_horizons, 1, None)
+                    result_model = batch_rollout_padded(
+                        self.model, self.dataset, start_indices, rollout_horizons,
+                        self.warmup_len, feedback="model",
+                        device=self.device
+                    )
+                    rollout_targets = result_model["targets"]
+                    rollout_mask = result_model["mask"]
+                    rollout_dist_loc_latent = result_model.get("dist_loc_latent")
+                    rollout_dist_loc = result_model.get("dist_loc")
+                    rollout_dist_scale = result_model.get("dist_scale")
+                    if rollout_dist_loc_latent is None:
+                        if rollout_dist_loc is None:
+                            raise ValueError("Model-feedback rollout must return dist_loc or dist_loc_latent")
+                        if self.probabilistic_loss_fn.use_symlog:
+                            rollout_dist_loc_latent = self.probabilistic_loss_fn._symlog(rollout_dist_loc)  # pylint: disable=protected-access
+                        else:
+                            rollout_dist_loc_latent = rollout_dist_loc
+                    if rollout_dist_scale is None:
+                        raise ValueError("Model-feedback rollout must return dist_scale")
+
+                    rollout_nll = self.probabilistic_loss_fn.compute_recon_nll(
+                        targets=rollout_targets,
+                        dist_loc_latent=rollout_dist_loc_latent,
+                        dist_scale=rollout_dist_scale,
+                        mask=rollout_mask,
+                    )
+
+                    if self.rollout_dtw_weight > 0.0:
+                        preds_roll = result_model["predictions"]
+                        dtw_vals = []
+                        for i in range(preds_roll.shape[0]):
+                            h_i = int(rollout_horizons[i])
+                            if h_i <= 1:
+                                continue
+                            dtw_vals.append(
+                                soft_dtw_distance(
+                                    preds_roll[i:i + 1, :h_i, :],
+                                    rollout_targets[i:i + 1, :h_i, :],
+                                    gamma=self.rollout_dtw_gamma,
+                                )
+                            )
+                        if dtw_vals:
+                            rollout_dtw = torch.stack(dtw_vals).mean()
+                    rollout_total = rollout_nll + self.rollout_dtw_weight * rollout_dtw
+                    loss = loss + effective_rollout_weight * rollout_total
+
+                self._last_prob_info = {
+                    **info,
+                    "kl_raw": float(raw_kl.detach().item()),
+                    "rollout_horizon": float(rollout_horizon),
+                    "context_len": float(context_len),
+                    "rollout_ramp": float(rollout_ramp),
+                    "rollout_weight_eff": float(effective_rollout_weight),
+                }
+                if rollout_horizon > 0 and effective_rollout_weight > 0.0:
+                    self._last_prob_info["rollout_nll"] = float(rollout_nll.detach().item())
+                    self._last_prob_info["rollout_dtw"] = float(rollout_dtw.detach().item())
+                    self._last_prob_info["rollout_total"] = float(rollout_total.detach().item())
             elif self.training_mode == "combined":
                 # Need both teacher-forced and model-feedback rollouts
                 result_teacher = batch_rollout_padded(
@@ -412,18 +634,59 @@ class WorldModelTrainer:
             raise ValueError("NaN/Inf in training loss. Check data and model stability.")
         
         # Backward pass
+        grad_norm_value = float("nan")
         if self.amp_enabled:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             if self.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                grad_norm_value = float(gn.detach().item() if torch.is_tensor(gn) else gn)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
             if self.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                grad_norm_value = float(gn.detach().item() if torch.is_tensor(gn) else gn)
             self.optimizer.step()
+        if self.grad_clip_norm <= 0:
+            sq = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    sq += float(torch.sum(g * g).item())
+            grad_norm_value = float(math.sqrt(max(0.0, sq)))
+
+        if self.is_probabilistic_model and self._last_prob_info is not None:
+            self._last_prob_info["grad_norm"] = float(grad_norm_value)
+            self._last_prob_info["lr"] = float(self.optimizer.param_groups[0].get("lr", float("nan")))
+            self._last_prob_info["horizon_schedule"] = float(sched_horizon)
+            self._last_prob_info["context_len"] = float(context_len)
+            self._last_prob_info["rollout_ramp"] = float(rollout_ramp)
+
+            if self.writer is not None:
+                gs = int(self._global_step)
+                for key in [
+                    "loss_total",
+                    "recon_nll",
+                    "kl",
+                    "kl_raw",
+                    "aux_nll",
+                    "rollout_weight_eff",
+                    "rollout_ramp",
+                    "horizon_schedule",
+                    "context_len",
+                    "grad_norm",
+                    "lr",
+                ]:
+                    if key in self._last_prob_info:
+                        self.writer.add_scalar(f"Train/{key}", self._last_prob_info[key], gs)
+                if "rollout_nll" in self._last_prob_info:
+                    self.writer.add_scalar("Train/rollout_nll", self._last_prob_info["rollout_nll"], gs)
+                if "rollout_dtw" in self._last_prob_info:
+                    self.writer.add_scalar("Train/rollout_dtw", self._last_prob_info["rollout_dtw"], gs)
+                if "rollout_total" in self._last_prob_info:
+                    self.writer.add_scalar("Train/rollout_total", self._last_prob_info["rollout_total"], gs)
         self._global_step += 1
         
         return loss.item()
@@ -445,6 +708,8 @@ class WorldModelTrainer:
         # Sample validation rollouts
         val_batches = max(1, len(self.val_dataset) // (self.batch_size * self.warmup_len))
         val_losses = []
+        sched_horizon, context_len, rollout_ramp = self._rollout_schedule()
+        effective_rollout_weight = max(0.0, self.rollout_weight * rollout_ramp)
         
         for _ in range(val_batches):
             start_indices, horizons = self.sampling_strategy.sample(
@@ -453,6 +718,7 @@ class WorldModelTrainer:
                 warmup_len=self.warmup_len,
                 rng=self.rng,
             )
+            horizons = self._apply_horizon_curriculum(horizons)
             
             with torch.autocast(
                 device_type=self.device.type,
@@ -476,6 +742,10 @@ class WorldModelTrainer:
                     posterior_logvar = result_teacher.get("posterior_logvar")
                     aux_loc = result_teacher.get("aux_loc")
                     aux_scale = result_teacher.get("aux_scale")
+                    if self.disable_aux_loss:
+                        exogenous_targets = None
+                        aux_loc = None
+                        aux_scale = None
                     if dist_loc_latent is None:
                         if dist_loc is None:
                             raise ValueError("Probabilistic rollout must return dist_loc or dist_loc_latent")
@@ -509,6 +779,56 @@ class WorldModelTrainer:
                         mask=mask,
                         kl_beta=kl_beta,
                     )
+                    if sched_horizon > 0 and effective_rollout_weight > 0.0:
+                        rollout_horizons = np.minimum(
+                            horizons.astype(np.int64, copy=False),
+                            np.full_like(horizons, fill_value=int(sched_horizon)),
+                        )
+                        rollout_horizons = np.clip(rollout_horizons, 1, None)
+                        result_model = batch_rollout_padded(
+                            self.model, self.val_dataset, start_indices, rollout_horizons,
+                            self.warmup_len, feedback="model", device=self.device
+                        )
+                        rollout_targets = result_model["targets"]
+                        rollout_mask = result_model["mask"]
+                        rollout_dist_loc_latent = result_model.get("dist_loc_latent")
+                        rollout_dist_loc = result_model.get("dist_loc")
+                        rollout_dist_scale = result_model.get("dist_scale")
+                        if rollout_dist_loc_latent is None:
+                            if rollout_dist_loc is None:
+                                raise ValueError("Model-feedback rollout must return dist_loc or dist_loc_latent")
+                            if self.probabilistic_loss_fn.use_symlog:
+                                rollout_dist_loc_latent = self.probabilistic_loss_fn._symlog(rollout_dist_loc)  # pylint: disable=protected-access
+                            else:
+                                rollout_dist_loc_latent = rollout_dist_loc
+                        if rollout_dist_scale is None:
+                            raise ValueError("Model-feedback rollout must return dist_scale")
+
+                        rollout_nll = self.probabilistic_loss_fn.compute_recon_nll(
+                            targets=rollout_targets,
+                            dist_loc_latent=rollout_dist_loc_latent,
+                            dist_scale=rollout_dist_scale,
+                            mask=rollout_mask,
+                        )
+                        rollout_dtw = torch.zeros((), dtype=rollout_nll.dtype, device=rollout_nll.device)
+                        if self.rollout_dtw_weight > 0.0:
+                            preds_roll = result_model["predictions"]
+                            dtw_vals = []
+                            for i in range(preds_roll.shape[0]):
+                                h_i = int(rollout_horizons[i])
+                                if h_i <= 1:
+                                    continue
+                                dtw_vals.append(
+                                    soft_dtw_distance(
+                                        preds_roll[i:i + 1, :h_i, :],
+                                        rollout_targets[i:i + 1, :h_i, :],
+                                        gamma=self.rollout_dtw_gamma,
+                                    )
+                                )
+                            if dtw_vals:
+                                rollout_dtw = torch.stack(dtw_vals).mean()
+                        rollout_total = rollout_nll + self.rollout_dtw_weight * rollout_dtw
+                        loss = loss + effective_rollout_weight * rollout_total
                 else:
                     result = batch_rollout_padded(
                         self.model, self.val_dataset, start_indices, horizons,
@@ -555,9 +875,9 @@ class WorldModelTrainer:
         verbose : bool, default True
             Whether to print progress.
         checkpoint_path : str or Path, optional
-            If provided, save checkpoint only when validation loss improves.
+            If provided, save checkpoint only when checkpoint metric improves.
         on_checkpoint_saved : callable, optional
-            Callback invoked as ``on_checkpoint_saved(epoch, val_loss)`` when
+            Callback invoked as ``on_checkpoint_saved(epoch, score)`` when
             an improved validation checkpoint is saved.
         
         Returns
@@ -585,14 +905,20 @@ class WorldModelTrainer:
         start_time = time.time()
         epoch_times = []
         best_val_loss: Optional[float] = None
+        best_checkpoint_score: Optional[float] = None
+        best_checkpoint_label: str = "val_loss"
         best_state_dict: Optional[Dict[str, torch.Tensor]] = None
         checkpoint_target: Optional[Path] = None
+        checkpoint_bundle_dir: Optional[Path] = None
+        topk_checkpoints: list[tuple[float, Path]] = []
         if checkpoint_path is not None:
             checkpoint_target = Path(checkpoint_path)
         elif self.run_dir:
             checkpoint_target = self.run_dir / "best_checkpoint.pth"
         if checkpoint_target is not None:
             checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_bundle_dir = checkpoint_target.parent / "checkpoints"
+            checkpoint_bundle_dir.mkdir(parents=True, exist_ok=True)
         
         for epoch in range(1, epochs + 1):
             self._fit_epochs = epochs
@@ -600,11 +926,32 @@ class WorldModelTrainer:
             epoch_start_time = time.time()
             if verbose:
                 print(f"Epoch {epoch}/{epochs}...")
+                if self.sequence_curriculum_enabled:
+                    print(
+                        "  Curriculum horizon cap: "
+                        f"{self._current_curriculum_horizon()} "
+                        f"(start={self.curriculum_start_horizon}, target={self.curriculum_target_horizon})"
+                    )
             
             # Training
             self.model.train()
             epoch_losses = []
             epoch_kl_values = []
+            epoch_prob_stats: Dict[str, list[float]] = {
+                "recon_nll": [],
+                "kl": [],
+                "kl_raw": [],
+                "aux_nll": [],
+                "rollout_nll": [],
+                "rollout_dtw": [],
+                "rollout_total": [],
+                "rollout_weight_eff": [],
+                "rollout_ramp": [],
+                "horizon_schedule": [],
+                "context_len": [],
+                "grad_norm": [],
+                "lr": [],
+            }
             
             if verbose:
                 # Create progress bar for training steps
@@ -625,6 +972,10 @@ class WorldModelTrainer:
                     kl_val = self._last_prob_info.get("kl")
                     if kl_val is not None and np.isfinite(kl_val):
                         epoch_kl_values.append(float(kl_val))
+                    for k in epoch_prob_stats.keys():
+                        v = self._last_prob_info.get(k)
+                        if v is not None and np.isfinite(v):
+                            epoch_prob_stats[k].append(float(v))
                 
                 if verbose:
                     # Update progress bar with current loss
@@ -656,9 +1007,15 @@ class WorldModelTrainer:
             if verbose:
                 print(f"  Validation done ({val_time:.2f}s)")
             if val_loss is not None and np.isfinite(val_loss):
-                if best_val_loss is None or val_loss < best_val_loss:
-                    prev_best = best_val_loss
+                if best_val_loss is None or float(val_loss) < best_val_loss:
                     best_val_loss = float(val_loss)
+
+            checkpoint_score, checkpoint_label = self._checkpoint_score(val_loss)
+            if np.isfinite(checkpoint_score):
+                if best_checkpoint_score is None or checkpoint_score < best_checkpoint_score:
+                    prev_best = best_checkpoint_score
+                    best_checkpoint_score = float(checkpoint_score)
+                    best_checkpoint_label = checkpoint_label
                     # Keep a CPU copy so we can restore best weights after training.
                     best_state_dict = {
                         k: v.detach().cpu().clone()
@@ -670,19 +1027,56 @@ class WorldModelTrainer:
                             if prev_best is None:
                                 print(
                                     f"  Saved checkpoint: {checkpoint_target} "
-                                    f"(val_loss={val_loss:.6f})"
+                                    f"({checkpoint_label}={checkpoint_score:.6f})"
                                 )
                             else:
                                 print(
                                     f"  Saved checkpoint: {checkpoint_target} "
-                                    f"(val_loss improved {prev_best:.6f} -> {val_loss:.6f})"
+                                    f"({checkpoint_label} improved "
+                                    f"{prev_best:.6f} -> {checkpoint_score:.6f})"
                                 )
                         if on_checkpoint_saved is not None:
                             try:
-                                on_checkpoint_saved(epoch, float(val_loss))
+                                on_checkpoint_saved(epoch, float(checkpoint_score))
                             except Exception as cb_exc:
                                 if verbose:
                                     print(f"  Warning: checkpoint callback failed: {cb_exc}")
+                if checkpoint_bundle_dir is not None:
+                    should_save_topk = (
+                        len(topk_checkpoints) < self.checkpoint_top_k
+                        or checkpoint_score < max(s for s, _ in topk_checkpoints)
+                    )
+                    if should_save_topk:
+                        bundle_name = (
+                            f"epoch{epoch:04d}_{checkpoint_label}_"
+                            f"{checkpoint_score:.6f}.pth"
+                        ).replace(":", "_")
+                        bundle_path = checkpoint_bundle_dir / bundle_name
+                        checkpoint_bundle = {
+                            "epoch": int(epoch),
+                            "checkpoint_label": str(checkpoint_label),
+                            "checkpoint_score": float(checkpoint_score),
+                            "model_state_dict": {
+                                k: v.detach().cpu().clone()
+                                for k, v in self.model.state_dict().items()
+                            },
+                            "optimizer_state_dict": self.optimizer.state_dict(),
+                            "trainer_state": {
+                                "global_step": int(self._global_step),
+                                "fit_epochs": int(self._fit_epochs),
+                                "current_epoch": int(self._current_epoch),
+                                "base_lrs": list(self._base_lrs),
+                            },
+                        }
+                        torch.save(checkpoint_bundle, bundle_path)
+                        topk_checkpoints.append((float(checkpoint_score), bundle_path))
+                        topk_checkpoints.sort(key=lambda x: x[0])
+                        while len(topk_checkpoints) > self.checkpoint_top_k:
+                            _, rm_path = topk_checkpoints.pop(-1)
+                            try:
+                                rm_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
             
             epoch_time = time.time() - epoch_start_time
             epoch_times.append(epoch_time)
@@ -697,10 +1091,35 @@ class WorldModelTrainer:
                 msg += f"train_loss={train_loss:.6f}"
                 if val_loss is not None:
                     msg += f" | val_loss={val_loss:.6f}"
+                if best_checkpoint_score is not None:
+                    msg += (
+                        f" | ckpt_{best_checkpoint_label}={best_checkpoint_score:.6f}"
+                    )
                 if self.is_probabilistic_model:
                     msg += f" | kl_beta={self._current_kl_beta():.4f}"
                     if np.isfinite(mean_epoch_kl):
                         msg += f" | kl_mean={mean_epoch_kl:.4f}"
+                    recon_mean = np.mean(epoch_prob_stats["recon_nll"]) if epoch_prob_stats["recon_nll"] else float("nan")
+                    aux_mean = np.mean(epoch_prob_stats["aux_nll"]) if epoch_prob_stats["aux_nll"] else float("nan")
+                    roll_mean = np.mean(epoch_prob_stats["rollout_nll"]) if epoch_prob_stats["rollout_nll"] else float("nan")
+                    horizon_mean = np.mean(epoch_prob_stats["horizon_schedule"]) if epoch_prob_stats["horizon_schedule"] else float("nan")
+                    ramp_mean = np.mean(epoch_prob_stats["rollout_ramp"]) if epoch_prob_stats["rollout_ramp"] else float("nan")
+                    grad_mean = np.mean(epoch_prob_stats["grad_norm"]) if epoch_prob_stats["grad_norm"] else float("nan")
+                    lr_mean = np.mean(epoch_prob_stats["lr"]) if epoch_prob_stats["lr"] else float("nan")
+                    if np.isfinite(recon_mean):
+                        msg += f" | recon={recon_mean:.4f}"
+                    if np.isfinite(aux_mean):
+                        msg += f" | aux={aux_mean:.4f}"
+                    if np.isfinite(roll_mean):
+                        msg += f" | rollout_nll={roll_mean:.4f}"
+                    if np.isfinite(horizon_mean):
+                        msg += f" | h={horizon_mean:.2f}"
+                    if np.isfinite(ramp_mean):
+                        msg += f" | ramp={ramp_mean:.2f}"
+                    if np.isfinite(grad_mean):
+                        msg += f" | grad={grad_mean:.2f}"
+                    if np.isfinite(lr_mean):
+                        msg += f" | lr={lr_mean:.2e}"
                 msg += f" | time={epoch_time:.2f}s"
                 if epoch > 1:
                     msg += f" | ETA={eta:.1f}s"
@@ -710,15 +1129,45 @@ class WorldModelTrainer:
                 self.writer.add_scalar("Loss/train", train_loss, epoch)
                 if val_loss is not None:
                     self.writer.add_scalar("Loss/val", val_loss, epoch)
+                if best_checkpoint_score is not None:
+                    self.writer.add_scalar(
+                        f"Checkpoint/{best_checkpoint_label}",
+                        best_checkpoint_score,
+                        epoch,
+                    )
+                if self.is_probabilistic_model:
+                    for k, vals in epoch_prob_stats.items():
+                        if vals:
+                            self.writer.add_scalar(f"Epoch/{k}", float(np.mean(vals)), epoch)
                 self.writer.add_scalar("Time/epoch", epoch_time, epoch)
             
             if self.metrics_path is not None:
+                def _m(name: str) -> str:
+                    vals = epoch_prob_stats.get(name, [])
+                    if not vals:
+                        return ""
+                    v = float(np.mean(vals))
+                    return f"{v:.10f}" if np.isfinite(v) else ""
                 with open(self.metrics_path, "a", encoding="utf-8") as f:
-                    f.write(f"{epoch},{train_loss},{val_loss if val_loss is not None else ''}\n")
+                    f.write(
+                        f"{epoch},{train_loss},{val_loss if val_loss is not None else ''},"
+                        f"{_m('recon_nll')},{_m('kl')},{_m('kl_raw')},{_m('aux_nll')},"
+                        f"{_m('rollout_nll')},{_m('rollout_dtw')},{_m('rollout_total')},"
+                        f"{_m('rollout_weight_eff')},{_m('rollout_ramp')},"
+                        f"{_m('horizon_schedule')},{_m('context_len')},{_m('grad_norm')},{_m('lr')}\n"
+                    )
             
             # Early stopping
             if self.early_stopping:
-                self.early_stopping(val_loss)
+                monitor_value: Optional[float] = val_loss
+                monitor_label = "val_loss"
+                if (
+                    self.early_stopping_monitor in {"open_loop_crps", "checkpoint_metric"}
+                    and np.isfinite(checkpoint_score)
+                ):
+                    monitor_value = float(checkpoint_score)
+                    monitor_label = str(checkpoint_label)
+                self.early_stopping(monitor_value)
                 if self.early_stopping.early_stop:
                     if verbose:
                         print(f"\n{'='*70}")
@@ -728,13 +1177,19 @@ class WorldModelTrainer:
                             f"{self.early_stopping.counter} epoch(s) "
                             f"(patience={self.early_stopping.patience})."
                         )
-                        if val_loss is not None:
-                            print(f"Current validation loss: {val_loss:.6f}")
+                        if monitor_value is not None and np.isfinite(monitor_value):
+                            print(
+                                f"Current monitored {monitor_label}: "
+                                f"{float(monitor_value):.6f}"
+                            )
                         if self.early_stopping.best_loss is not None:
-                            print(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
-                            if val_loss is not None:
-                                diff = float(val_loss) - float(self.early_stopping.best_loss)
-                                print(f"Validation gap vs best: {diff:+.6f}")
+                            print(
+                                f"Best monitored {monitor_label}: "
+                                f"{self.early_stopping.best_loss:.6f}"
+                            )
+                            if monitor_value is not None and np.isfinite(monitor_value):
+                                diff = float(monitor_value) - float(self.early_stopping.best_loss)
+                                print(f"Monitored gap vs best: {diff:+.6f}")
                         print(f"Stopped at epoch {epoch}/{epochs}")
                         print(f"{'='*70}\n")
                     break
@@ -756,6 +1211,16 @@ class WorldModelTrainer:
                     print(f"Final val loss: {val_losses[-1]:.6f}")
                 if best_val_loss is not None:
                     print(f"Best val loss: {best_val_loss:.6f}")
+                if best_checkpoint_score is not None:
+                    print(
+                        f"Best checkpoint {best_checkpoint_label}: "
+                        f"{best_checkpoint_score:.6f}"
+                    )
+                if checkpoint_bundle_dir is not None and topk_checkpoints:
+                    print(
+                        f"Saved top-{len(topk_checkpoints)} checkpoints to: "
+                        f"{checkpoint_bundle_dir}"
+                    )
             print(f"{'='*70}\n")
         
         return train_losses, val_losses
@@ -778,7 +1243,10 @@ class WorldModelTrainer:
         path : str or Path
             Path to load checkpoint from.
         """
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        state = torch.load(path, map_location=self.device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        self.model.load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()
 
@@ -933,6 +1401,9 @@ class Trainer(nn.Module):
         torch.save(self.model.state_dict(), path)
     
     def load(self, path: str):
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        state = torch.load(path, map_location=self.device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        self.model.load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()

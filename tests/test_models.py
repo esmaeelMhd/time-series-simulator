@@ -392,5 +392,51 @@ def test_latent_ssm_controls_and_exogenous_change_imagination():
     assert not torch.allclose(base_pred, exo_pred)
 
 
+def test_latent_ssm_aux_decoder_ablation_returns_zero_aux():
+    model = LatentSSMWorldModel(
+        input_dim=5,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+        use_aux_decoder=False,
+    )
+    model.eval()
+    controls = torch.randn(2, 6, 2)
+    exogenous = torch.randn(2, 6, 1)
+    y = torch.randn(2, 6, 1)
+    with torch.no_grad():
+        out = model.observe(controls, exogenous, y, sample_posterior=False)
+    assert torch.allclose(out["aux_loc"], torch.zeros_like(out["aux_loc"]))
+    assert torch.all(out["aux_scale"] > 0.0)
+
+
+def test_latent_ssm_single_path_ablation_runs():
+    model = LatentSSMWorldModel(
+        input_dim=5,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+        use_dual_path=False,
+    )
+    model.eval()
+    bsz, hist, horizon = 2, 10, 4
+    history_controls = torch.randn(bsz, hist, 2)
+    history_exo = torch.randn(bsz, hist, 1)
+    history_y = torch.randn(bsz, hist, 1)
+    future_controls = torch.randn(bsz, horizon, 2)
+    future_exo = torch.randn(bsz, horizon, 1)
+    with torch.no_grad():
+        out = model.condition_then_simulate(
+            history_controls,
+            history_exo,
+            history_y,
+            future_controls,
+            future_exo,
+            n_steps=horizon,
+            n_samples=3,
+        )
+    assert out["samples"].shape == (3, bsz, horizon, 1)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

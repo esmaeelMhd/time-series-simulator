@@ -423,20 +423,11 @@ class ProbabilisticRolloutLoss(nn.Module):
         return torch.sign(x) * torch.log1p(torch.abs(x))
 
     @staticmethod
-    def _kl_diag_normal(
-        q_mu: torch.Tensor,
-        q_logvar: torch.Tensor,
-        p_mu: torch.Tensor,
-        p_logvar: torch.Tensor,
-    ) -> torch.Tensor:
-        q_var = torch.exp(q_logvar)
-        p_var = torch.exp(p_logvar)
-        kl = 0.5 * (
-            p_logvar - q_logvar
-            + (q_var + (q_mu - p_mu) ** 2) / (p_var + 1e-12)
-            - 1.0
+    def _normal_from_mu_logvar(mu: torch.Tensor, logvar: torch.Tensor) -> torch.distributions.Normal:
+        return torch.distributions.Normal(
+            loc=mu,
+            scale=torch.exp(0.5 * logvar).clamp_min(1e-6),
         )
-        return kl.sum(dim=-1)
 
     def _balanced_kl(
         self,
@@ -445,21 +436,21 @@ class ProbabilisticRolloutLoss(nn.Module):
         prior_mu: torch.Tensor,
         prior_logvar: torch.Tensor,
     ) -> torch.Tensor:
-        raw_kl = self._kl_diag_normal(posterior_mu, posterior_logvar, prior_mu, prior_logvar)
+        post = self._normal_from_mu_logvar(posterior_mu, posterior_logvar)
+        prior = self._normal_from_mu_logvar(prior_mu, prior_logvar)
+        raw_kl = torch.distributions.kl_divergence(post, prior)
         if not self.use_kl_balancing:
             return raw_kl
-        kl_prior_fit = self._kl_diag_normal(
+        post_sg = self._normal_from_mu_logvar(
             posterior_mu.detach(),
             posterior_logvar.detach(),
-            prior_mu,
-            prior_logvar,
         )
-        kl_post_fit = self._kl_diag_normal(
-            posterior_mu,
-            posterior_logvar,
+        prior_sg = self._normal_from_mu_logvar(
             prior_mu.detach(),
             prior_logvar.detach(),
         )
+        kl_prior_fit = torch.distributions.kl_divergence(post_sg, prior)
+        kl_post_fit = torch.distributions.kl_divergence(post, prior_sg)
         return self.kl_balance * kl_prior_fit + (1.0 - self.kl_balance) * kl_post_fit
 
     def forward(
@@ -518,10 +509,12 @@ class ProbabilisticRolloutLoss(nn.Module):
         aux_scale: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        targets_latent = self._symlog(targets) if self.use_symlog else targets
-        recon_dist = torch.distributions.Normal(loc=dist_loc_latent, scale=dist_scale)
-        recon_nll_elem = -recon_dist.log_prob(targets_latent)
-        recon_nll = self._masked_mean(recon_nll_elem, mask)
+        recon_nll = self.compute_recon_nll(
+            targets=targets,
+            dist_loc_latent=dist_loc_latent,
+            dist_scale=dist_scale,
+            mask=mask,
+        )
 
         kl_elem = self._balanced_kl(
             posterior_mu=posterior_mu,
@@ -534,7 +527,7 @@ class ProbabilisticRolloutLoss(nn.Module):
                 kl_elem,
                 torch.full_like(kl_elem, fill_value=self.kl_free_bits),
             )
-        kl = self._masked_mean(kl_elem, mask)
+        kl = self._masked_mean(kl_elem.sum(dim=-1), mask)
 
         aux_nll = torch.zeros((), dtype=recon_nll.dtype, device=recon_nll.device)
         if (
@@ -548,6 +541,63 @@ class ProbabilisticRolloutLoss(nn.Module):
             aux_nll = self._masked_mean(aux_nll_elem, mask)
 
         return recon_nll, kl, aux_nll
+
+    def compute_recon_nll(
+        self,
+        targets: torch.Tensor,
+        dist_loc_latent: torch.Tensor,
+        dist_scale: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Reconstruction NLL over objective outputs."""
+        targets_latent = self._symlog(targets) if self.use_symlog else targets
+        recon_dist = torch.distributions.Normal(loc=dist_loc_latent, scale=dist_scale)
+        recon_nll_elem = -recon_dist.log_prob(targets_latent)
+        return self._masked_mean(recon_nll_elem, mask)
+
+
+def soft_dtw_distance(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    gamma: float = 0.1,
+) -> torch.Tensor:
+    """Differentiable Soft-DTW distance averaged across output dimensions.
+
+    Parameters
+    ----------
+    x, y : torch.Tensor
+        Shape (batch, time, dim).
+    gamma : float
+        Smoothing parameter (>0).
+    """
+    if x.shape != y.shape:
+        raise ValueError(f"soft_dtw_distance requires matching shapes, got {x.shape} vs {y.shape}")
+    if x.dim() != 3:
+        raise ValueError(f"soft_dtw_distance expects rank-3 tensors, got rank {x.dim()}")
+    bsz, tlen, _ = x.shape
+    if tlen == 0:
+        return torch.zeros((), dtype=x.dtype, device=x.device)
+
+    g = max(1e-6, float(gamma))
+    # Pairwise squared distances: (B, T, T)
+    dist = torch.cdist(x, y, p=2) ** 2
+    inf = torch.tensor(float("inf"), dtype=x.dtype, device=x.device)
+    r = torch.full((bsz, tlen + 1, tlen + 1), inf, dtype=x.dtype, device=x.device)
+    r[:, 0, 0] = 0.0
+
+    for i in range(1, tlen + 1):
+        for j in range(1, tlen + 1):
+            prev = torch.stack(
+                [
+                    r[:, i - 1, j],
+                    r[:, i, j - 1],
+                    r[:, i - 1, j - 1],
+                ],
+                dim=-1,
+            )
+            softmin = -g * torch.logsumexp(-prev / g, dim=-1)
+            r[:, i, j] = dist[:, i - 1, j - 1] + softmin
+    return r[:, tlen, tlen].mean()
 
 
 def dilate_loss(

@@ -94,7 +94,8 @@ def build_grouped_dataloaders(df: pd.DataFrame,
                               device: str | torch.device = "cpu",
                               add_time: bool = False,
                               time_features_cfg: Optional[Dict[str, Any]] = None,
-                              existing_scaler = None) -> Tuple[DataLoader, DataLoader, object]:
+                              existing_scaler = None,
+                              require_full_role_mapping: bool = True) -> Tuple[DataLoader, DataLoader, object]:
     from .dataset import GroupedTimeSeriesDataset
     n_total = len(df)
     n_train = int(n_total * train_split)
@@ -104,11 +105,13 @@ def build_grouped_dataloaders(df: pd.DataFrame,
 
     train_ds = GroupedTimeSeriesDataset(
         train_df, groups, input_groups, output_groups, seq_len, pred_len,
-        add_time=add_time, time_features_cfg=time_features_cfg, scaler=existing_scaler
+        add_time=add_time, time_features_cfg=time_features_cfg, scaler=existing_scaler,
+        require_full_role_mapping=require_full_role_mapping,
     )
     val_ds = GroupedTimeSeriesDataset(
         val_df, groups, input_groups, output_groups, seq_len, pred_len,
-        add_time=add_time, time_features_cfg=time_features_cfg, scaler=train_ds.scaler
+        add_time=add_time, time_features_cfg=time_features_cfg, scaler=train_ds.scaler,
+        require_full_role_mapping=require_full_role_mapping,
     )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)

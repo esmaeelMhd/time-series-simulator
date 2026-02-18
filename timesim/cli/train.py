@@ -99,7 +99,10 @@ def main():
                                                              batch_size=batch_size,
                                                              add_time=add_time_features,
                                                              time_features_cfg=time_features_cfg,
-                                                             device=device)
+                                                             device=device,
+                                                             require_full_role_mapping=bool(
+                                                                 cfg.get("data", {}).get("require_full_role_mapping", True)
+                                                             ))
 
         # Save fitted scaler for future use
         from joblib import dump

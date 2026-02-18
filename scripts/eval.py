@@ -100,6 +100,7 @@ MODEL_PARAM_KEYS_BY_TYPE = {
     "latent_ssm": {
         "hidden_dim", "latent_dim", "num_layers", "dropout",
         "min_scale", "min_df", "encoder_dim", "decoder_layers", "use_symlog",
+        "use_aux_decoder", "use_dual_path", "leak_objective_to_transition",
     },
     "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
 }
@@ -154,6 +155,12 @@ def _split_optuna_params(model_type: str, best_params):
             "kl_weight",
             "aux_weight",
             "rollout_mse_weight",
+            "rollout_weight",
+            "rollout_dtw_weight",
+            "rollout_dtw_gamma",
+            "rollout_warmup_fraction",
+            "rollout_max_horizon",
+            "min_context",
             "kl_free_bits",
             "kl_balance",
             "use_kl_balancing",
@@ -162,11 +169,17 @@ def _split_optuna_params(model_type: str, best_params):
             "grad_clip_norm",
             "lr_warmup_steps",
             "lr_min_ratio",
+            "checkpoint_top_k",
+            "early_stopping_monitor",
             "objective",
             "kl_warmup_enabled",
             "kl_beta_start",
             "kl_beta_end",
             "kl_warmup_epochs",
+            "checkpoint_metric",
+            "checkpoint_open_loop_horizon",
+            "checkpoint_open_loop_windows",
+            "checkpoint_open_loop_samples",
         }
     }
     return model_overrides, training_overrides
@@ -374,8 +387,21 @@ def main():
             model_type, input_dim, output_dim, seq_len, pred_len,
             per_model_cfg=mc, model_defaults_cfg=model_defaults_cfg,
             overrides=model_overrides)
-        model.load_state_dict(
-            torch.load(ckpt_path, map_location=device, weights_only=True))
+        try:
+            state = torch.load(ckpt_path, map_location=device, weights_only=True)
+        except Exception:
+            state = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        try:
+            model.load_state_dict(state)
+        except RuntimeError:
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                print(
+                    "  Warning: non-strict checkpoint load "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})"
+                )
         model.to(device)
         model.eval()
         n_params = count_parameters(model)
@@ -415,6 +441,7 @@ def main():
         add_time=add_time_features,
         time_features_cfg=time_features_cfg,
         existing_scaler=scaler,
+        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
     val_dataset = val_loader.dataset
 

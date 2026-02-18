@@ -96,7 +96,10 @@ def main():
                                                                     pred_len=pred_len,
                                                                     batch_size=batch_size,
                                                                     device=device,
-                                                                    existing_scaler=existing_scaler)
+                                                                    existing_scaler=existing_scaler,
+                                                                    require_full_role_mapping=bool(
+                                                                        cfg.get("data", {}).get("require_full_role_mapping", True)
+                                                                    ))
 
         # save scaler into new run dir
         dump(scaler, run_dir/"scaler.pkl")
@@ -129,7 +132,10 @@ def main():
         sim_horizon = cfg.get('retrain', {}).get('sim_horizon', 10*pred_len)
         from timesim.utils.simulation import simulate_autoregressive
         model_pre = build_model_func().to(device)
-        model_pre.load_state_dict(torch.load(cfg['ckpt'], map_location=device))
+        state_pre = torch.load(cfg['ckpt'], map_location=device)
+        if isinstance(state_pre, dict) and "model_state_dict" in state_pre:
+            state_pre = state_pre["model_state_dict"]
+        model_pre.load_state_dict(state_pre)
         for _ in range(sim_points):
             real, pred, sidx = simulate_autoregressive(model_pre,
                                                        df_raw,
@@ -149,7 +155,10 @@ def main():
     if retrain_method == "sepp":
         from timesim.engine.sepp_trainer import SEPPTrainer
         model = build_model_func().to(device)
-        model.load_state_dict(torch.load(cfg['ckpt'], map_location=device))
+        state = torch.load(cfg['ckpt'], map_location=device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        model.load_state_dict(state)
         h_max = cli_args.sepp_h_max or 10*pred_len
         stride = cli_args.sepp_stride or pred_len
 

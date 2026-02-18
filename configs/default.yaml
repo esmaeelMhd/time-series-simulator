@@ -13,9 +13,9 @@
 training:
   epochs: 50
   steps_per_epoch: null              # null => auto from dataset size; set int to cap epoch cost
-  learning_rate: 0.001
-  optimizer: adam                     # adam | sgd | adamw
-  weight_decay: 0.0                   # optimizer weight decay (L2 regularization)
+  learning_rate: 0.0003
+  optimizer: adamw                    # adam | sgd | adamw
+  weight_decay: 0.000001              # optimizer weight decay (L2 regularization)
   warmup_len: 24                     # context / burn-in length for rollouts
   sampling_strategy: random_fixed    # random_fixed | random_random | geometric | daily_fixed | stride
   sampling_horizon: 12               # backward-compatible alias for fixed-horizon sampling
@@ -47,19 +47,29 @@ training:
 
   # Early stopping
   early_stopping: true
-  patience: 5
+  patience: 30
   min_delta: 0.0                       # minimum improvement to reset patience
   checkpoint_simulation:
     enabled: false                     # run monitoring simulation when checkpoint improves
     n_rounds: 0                        # number of simulation snapshots per improved epoch
     horizon: null                      # null -> fallback to simulation.horizon
     start_idx: 0                       # first snapshot index; remaining snapshots use random indices
+  sequence_curriculum:
+    enabled: false
+    start_horizon: 16
+    target_horizon: 64
   probabilistic:
     enabled: true
     objective: rssm
     recon_weight: 1.0
     kl_weight: 1.0
     aux_weight: 1.0
+    rollout_weight: 0.0               # weight for prior-only rollout loss
+    rollout_dtw_weight: 0.0           # soft-DTW term in rollout loss (off by default)
+    rollout_dtw_gamma: 0.1            # smoothing for soft-DTW
+    rollout_warmup_fraction: 0.30     # first fraction of epochs with rollout horizon=0
+    rollout_max_horizon: 24           # maximum imagined horizon used for rollout loss
+    min_context: 16                   # enforce context_len >= min_context
     kl_free_bits: 1.0
     kl_balance: 0.8
     use_kl_balancing: true
@@ -67,12 +77,17 @@ training:
     use_symlog: false
     grad_clip_norm: 100.0
     lr_warmup_steps: 1000
-    lr_min_ratio: 0.1
+    lr_min_ratio: 0.01
+    checkpoint_top_k: 3
     kl_warmup_enabled: true
     kl_beta_start: 0.0
     kl_beta_end: 1.0
     kl_warmup_epochs: 10
     mc_train_samples: 1
+    checkpoint_metric: open_loop_crps
+    checkpoint_open_loop_horizon: 24
+    checkpoint_open_loop_windows: 4
+    checkpoint_open_loop_samples: 32
 
   # Hyperparameters and fast training
   use_optuna_best_params: false        # if true, load per-model best_params from Optuna summary
@@ -110,6 +125,7 @@ data:
   train_split: 0.8
   shuffle_train: true
   drop_last: true
+  require_full_role_mapping: true      # require every dataset column be mapped to control/exogenous/objective
   scale: true                        # apply MinMaxScaler
   add_time_features: false           # legacy switch; same as data.time_features.enabled
   time_features:
@@ -125,6 +141,7 @@ data:
 evaluation:
   horizon: 180                        # rollout evaluation horizon
   n_windows: 8                        # number of validation windows
+  test_split: null                    # optional holdout fraction for eval-only test split
   probabilistic:
     mc_samples: 256
     interval_level: 0.90
@@ -170,6 +187,9 @@ model_defaults:
     encoder_dim: 64
     decoder_layers: 2
     use_symlog: false
+    use_aux_decoder: true
+    use_dual_path: true
+    leak_objective_to_transition: false
   xgboost:
     n_estimators: 100
     max_depth: 6

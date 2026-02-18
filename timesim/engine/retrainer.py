@@ -36,7 +36,10 @@ class Retrainer:
         self.device = torch.device(device)
         self.model = model_cls.to(self.device) if isinstance(model_cls, nn.Module) else model_cls()
         self.model.to(self.device)
-        self.model.load_state_dict(torch.load(checkpoint, map_location=self.device))
+        state = torch.load(checkpoint, map_location=self.device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        self.model.load_state_dict(state)
 
     def fine_tune(self,
                   train_loader: DataLoader,

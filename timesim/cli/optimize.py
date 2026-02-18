@@ -233,6 +233,11 @@ def _suggest_overrides(
             "encoder_dim": trial.suggest_categorical("encoder_dim", encoder_choices),
             "decoder_layers": trial.suggest_int("decoder_layers", 1, 3),
             "use_symlog": trial.suggest_categorical("use_symlog", [False, True]),
+            "use_aux_decoder": trial.suggest_categorical("use_aux_decoder", [True, False]),
+            "use_dual_path": trial.suggest_categorical("use_dual_path", [True, False]),
+            "leak_objective_to_transition": trial.suggest_categorical(
+                "leak_objective_to_transition", [False, True]
+            ),
         }
     if model_type == "xgboost":
         if profile == "fast_gpu":
@@ -457,6 +462,7 @@ def main():
         train_split=train_split,
         add_time=add_time_features,
         time_features_cfg=time_features_cfg,
+        require_full_role_mapping=bool(config.get("data", {}).get("require_full_role_mapping", True)),
     )
     train_dataset = train_loader.dataset
     val_dataset = val_loader.dataset
@@ -572,12 +578,15 @@ def main():
                         "use_symlog": bool(model_overrides.get("use_symlog", prob_cfg_default.get("use_symlog", False))),
                         "grad_clip_norm": float(prob_cfg_default.get("grad_clip_norm", 100.0)),
                         "lr_warmup_steps": int(prob_cfg_default.get("lr_warmup_steps", 1000)),
-                        "lr_min_ratio": float(prob_cfg_default.get("lr_min_ratio", 0.1)),
+                        "lr_min_ratio": float(prob_cfg_default.get("lr_min_ratio", 0.01)),
+                        "checkpoint_top_k": int(prob_cfg_default.get("checkpoint_top_k", 3)),
+                        "early_stopping_monitor": str(prob_cfg_default.get("early_stopping_monitor", "open_loop_crps")),
                         "kl_warmup_enabled": bool(prob_cfg_default.get("kl_warmup_enabled", False)),
                         "kl_beta_start": kl_beta_start,
                         "kl_beta_end": kl_beta_end,
                         "kl_warmup_epochs": kl_warmup_epochs,
                     },
+                    sequence_curriculum_cfg=tcfg.get("sequence_curriculum", None),
                 )
 
                 best_score = float("inf")

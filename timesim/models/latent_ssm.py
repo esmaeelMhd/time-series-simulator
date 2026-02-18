@@ -1,6 +1,6 @@
 """Recurrent state-space world model (RSSM) with typed encoders.
 
-Design constraints enforced:
+Design constraints enforced (default configuration):
 - Transition depends on control + exogenous only (never objective/target).
 - Separate, non-shared encoders for control/exogenous/objective variables.
 - Dual latent path: deterministic h_t + stochastic z_t.
@@ -111,6 +111,9 @@ class LatentSSMWorldModel(WorldModelBase):
         encoder_dim: int = 64,
         decoder_layers: int = 2,
         use_symlog: bool = False,
+        use_aux_decoder: bool = True,
+        use_dual_path: bool = True,
+        leak_objective_to_transition: bool = False,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -126,6 +129,9 @@ class LatentSSMWorldModel(WorldModelBase):
         self.encoder_dim = int(encoder_dim)
         self.decoder_layers = max(1, int(decoder_layers))
         self.use_symlog = bool(use_symlog)
+        self.use_aux_decoder = bool(use_aux_decoder)
+        self.use_dual_path = bool(use_dual_path)
+        self.leak_objective_to_transition = bool(leak_objective_to_transition)
 
         # Explicitly independent encoders per variable type (no weight sharing).
         self.control_encoder = TypedEncoder(
@@ -145,7 +151,10 @@ class LatentSSMWorldModel(WorldModelBase):
         )
 
         # Deterministic transition h_t = f(h_{t-1}, z_{t-1}, enc_c(c_t), enc_x(x_t)).
+        # Optional objective leakage is available only as an ablation switch.
         trans_in_dim = self.latent_dim + 2 * self.encoder_dim
+        if self.leak_objective_to_transition:
+            trans_in_dim += self.encoder_dim
         self.transition = nn.GRUCell(input_size=trans_in_dim, hidden_size=self.hidden_dim)
 
         # Prior p(z_t | h_t) and posterior q(z_t | h_t, enc_y(y_t)).
@@ -216,13 +225,29 @@ class LatentSSMWorldModel(WorldModelBase):
         )
         return kl.sum(dim=-1)
 
-    def _get_aux_head(self, exogenous_dim: int) -> Optional[nn.Linear]:
+    def _get_aux_head(
+        self,
+        exogenous_dim: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Optional[nn.Linear]:
         if exogenous_dim <= 0:
             return None
         key = str(int(exogenous_dim))
         if key not in self._aux_decoder_heads:
-            self._aux_decoder_heads[key] = nn.Linear(self.hidden_dim, 2 * int(exogenous_dim))
-        return self._aux_decoder_heads[key]
+            head = nn.Linear(self.hidden_dim, 2 * int(exogenous_dim))
+            if device is not None or dtype is not None:
+                head = head.to(device=device, dtype=dtype)
+            self._aux_decoder_heads[key] = head
+        head = self._aux_decoder_heads[key]
+        if device is not None and head.weight.device != device:
+            head = head.to(device=device)
+            self._aux_decoder_heads[key] = head
+        if dtype is not None and head.weight.dtype != dtype:
+            head = head.to(dtype=dtype)
+            self._aux_decoder_heads[key] = head
+        return head
 
     def _decode_obs(self, h_t: torch.Tensor, z_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         latent = torch.cat([h_t, z_t], dim=-1)
@@ -240,8 +265,17 @@ class LatentSSMWorldModel(WorldModelBase):
             bsz = h_t.shape[0]
             empty = torch.zeros(bsz, 0, device=h_t.device, dtype=h_t.dtype)
             return empty, empty
+        if not self.use_aux_decoder:
+            bsz = h_t.shape[0]
+            loc = torch.zeros(bsz, exogenous_dim, device=h_t.device, dtype=h_t.dtype)
+            scale = torch.full_like(loc, fill_value=self.min_scale)
+            return loc, scale
         hidden = self._aux_decoder_hidden(torch.cat([h_t, z_t], dim=-1))
-        head = self._get_aux_head(exogenous_dim)
+        head = self._get_aux_head(
+            exogenous_dim,
+            device=h_t.device,
+            dtype=h_t.dtype,
+        )
         assert head is not None
         raw = head(hidden)
         loc, raw_scale = torch.chunk(raw, 2, dim=-1)
@@ -253,11 +287,23 @@ class LatentSSMWorldModel(WorldModelBase):
         state: RSSMState,
         control_t: torch.Tensor,
         exo_t: torch.Tensor,
+        objective_encoded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         c_enc = self.control_encoder(control_t)
         x_enc = self.exogenous_encoder(exo_t)
-        trans_in = torch.cat([state.z, c_enc, x_enc], dim=-1)
-        h_t = self.transition(trans_in, state.h)
+        pieces = [state.z, c_enc, x_enc]
+        if self.leak_objective_to_transition:
+            if objective_encoded is None:
+                objective_encoded = torch.zeros(
+                    control_t.shape[0],
+                    self.encoder_dim,
+                    device=control_t.device,
+                    dtype=control_t.dtype,
+                )
+            pieces.append(objective_encoded)
+        trans_in = torch.cat(pieces, dim=-1)
+        prev_h = state.h if self.use_dual_path else torch.zeros_like(state.h)
+        h_t = self.transition(trans_in, prev_h)
         return h_t
 
     def _zero_state(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> RSSMState:
@@ -326,9 +372,12 @@ class LatentSSMWorldModel(WorldModelBase):
         exo_t: torch.Tensor,
         prev_output_t: Optional[torch.Tensor] = None,
     ) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        del prev_output_t  # objective is intentionally excluded from transition
         prev = RSSMState(h=state["h"], z=state["z"])
-        h_t = self._transition_step(prev, control_t, exo_t)
+        y_enc = None
+        if self.leak_objective_to_transition and prev_output_t is not None:
+            y_t = self.symlog(prev_output_t) if self.use_symlog else prev_output_t
+            y_enc = self.observation_encoder(y_t)
+        h_t = self._transition_step(prev, control_t, exo_t, objective_encoded=y_enc)
         prior_mu, prior_logvar = self._split_mu_logvar(self.prior_net(h_t))
         z_t = prior_mu
         pred_t, _, _ = self._decode_obs(h_t, z_t)
@@ -368,11 +417,9 @@ class LatentSSMWorldModel(WorldModelBase):
             x_t = exogenous[:, t, :]
             y_t_raw = observations[:, t, :]
             y_t = self.symlog(y_t_raw) if self.use_symlog else y_t_raw
-
-            h_t = self._transition_step(state, c_t, x_t)
-            prior_mu, prior_logvar = self._split_mu_logvar(self.prior_net(h_t))
-
             y_enc = self.observation_encoder(y_t)
+            h_t = self._transition_step(state, c_t, x_t, objective_encoded=y_enc)
+            prior_mu, prior_logvar = self._split_mu_logvar(self.prior_net(h_t))
             post_mu, post_logvar = self._split_mu_logvar(
                 self.posterior_net(torch.cat([h_t, y_enc], dim=-1))
             )
@@ -463,7 +510,7 @@ class LatentSSMWorldModel(WorldModelBase):
         for t in range(horizon):
             c_t = controls[:, t, :]
             x_t = exogenous[:, t, :]
-            h_t = self._transition_step(state, c_t, x_t)
+            h_t = self._transition_step(state, c_t, x_t, objective_encoded=None)
             prior_mu, prior_logvar = self._split_mu_logvar(self.prior_net(h_t))
             z_t = self._reparameterize(prior_mu, prior_logvar, sample=sample_latent)
 
@@ -639,10 +686,10 @@ class LatentSSMWorldModel(WorldModelBase):
             y_t_raw = targets[:, t, :]
             y_t = self.symlog(y_t_raw) if self.use_symlog else y_t_raw
 
-            h_t = self._transition_step(state, c_t, x_t)
+            y_enc = self.observation_encoder(y_t)
+            h_t = self._transition_step(state, c_t, x_t, objective_encoded=y_enc)
             prior_mu, prior_logvar = self._split_mu_logvar(self.prior_net(h_t))
 
-            y_enc = self.observation_encoder(y_t)
             post_mu, post_logvar = self._split_mu_logvar(
                 self.posterior_net(torch.cat([h_t, y_enc], dim=-1))
             )

@@ -102,3 +102,28 @@ class VariableSchema:
         if column not in self.role_by_column:
             raise KeyError(f"Column '{column}' is not present in the variable schema")
         return self.role_by_column[column]
+
+    def validate_columns(self, columns: Sequence[str], *, require_exact_match: bool = True) -> None:
+        """Validate schema coverage against DataFrame columns.
+
+        When ``require_exact_match=True``, each input column must be assigned to
+        exactly one of {control, exogenous, objective}, and schema columns must
+        all exist in the provided column list.
+        """
+        columns_set = set(columns)
+        mapped_set = set(self.role_by_column.keys())
+
+        missing = [c for c in self.ordered_columns if c not in columns_set]
+        if missing:
+            raise ValueError(
+                f"Variable schema references columns missing from dataset: {missing}"
+            )
+
+        if require_exact_match:
+            unmapped = [c for c in columns if c not in mapped_set]
+            if unmapped:
+                raise ValueError(
+                    "Dataset columns without variable role assignment: "
+                    f"{unmapped}. Map every dataset column to exactly one of "
+                    f"{sorted(_ALLOWED_ROLE_NAMES)}."
+                )

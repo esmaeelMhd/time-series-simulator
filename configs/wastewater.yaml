@@ -1,17 +1,9 @@
-# ─────────────────────────────────────────────────────────────────────
-#  wastewater.yaml  –  full config for wastewater treatment dataset
-#
-#  Extends default.yaml with dataset info, model definitions, and
-#  training rounds.  Override training/eval/sim/misc here as needed.
-# ─────────────────────────────────────────────────────────────────────
 _base: default.yaml
 
-# ---------- output ----------
 output:
   runs_dir: runs
   run_name: full_with_time
 
-# ---------- dataset ----------
 dataset:
   name: wastewater
   csv: datasets/wastewater.csv
@@ -20,23 +12,22 @@ dataset:
   pred_len: 1
   batch_size: 32
   variables:
-    control:   [IN_METAL_Q, T1_O2]
+    control: [IN_METAL_Q, T1_O2]
     exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]
     objective: [T1_PO4]
 
 data:
   add_time_features: true
+  require_full_role_mapping: true
   time_features:
     enabled: true
     features: [hour, day_of_week, month]
     encoding: cyclical
 
-# ---------- model I/O ----------
 model_io:
   input_groups: ["control", "exogenous", "objective"]
   output_groups: ["objective"]
 
-# ---------- models to compare ----------
 models:
   - type: lstm
     hidden_dim: 32
@@ -60,11 +51,13 @@ models:
     dropout: 0.05
     learning_rate: 0.0005
     min_df: 2.2
+    use_aux_decoder: true
+    use_dual_path: true
+    leak_objective_to_transition: false
   - type: xgboost
     n_estimators: 200
     max_depth: 6
 
-# ---------- training rounds ----------
 training_rounds:
   - name: train
     epochs: 50
@@ -72,58 +65,64 @@ training_rounds:
     models: [lstm, dlinear, nlinear, tft, transformer, latent_ssm, xgboost]
 
 simulation:
-  horizon: 360                       # null → use all available val data
+  horizon: 360
   start_idx: 0
 
-# ---------- overrides ----------
 training:
-  steps_per_epoch: 1000              # null → use all available train data
-  # Optional DTW-like fast shape-aware objective:
-  # loss_type: shape
-  # shape_loss:
-  #   w_level: 0.5
-  #   w_slope: 0.3
-  #   w_curvature: 0.1
-  #   w_stats: 0.1
-  #   robust_beta: 1.0
+  steps_per_epoch: 1000
+  optimizer: adamw
+  weight_decay: 0.000001
+  patience: 30
   use_optuna_best_params: true
-  # optuna_summary_path: null  # optional override; defaults to runs/<dataset>/<run_name>/optuna/summary.yaml
   warmup_len: 24
-  sampling_strategy: random_fixed    # random_fixed | random_random | geometric | daily_fixed | stride
+  sampling_strategy: random_fixed
   sampling:
     strategy: random_fixed
-    horizon: 120                      # for random_fixed / daily_fixed
-    h_min: 1                          # for random_random
-    h_max: 120                        # for random_random / geometric / stride
-    stride: 12                        # for stride
-    start_hour: 0                     # for daily_fixed
-    samples_per_hour: 1               # for daily_fixed (e.g., 30 for 2-min data)
+    horizon: 120
+    h_min: 1
+    h_max: 120
+    stride: 12
+    start_hour: 0
+    samples_per_hour: 1
   checkpoint_simulation:
     enabled: true
     n_rounds: 4
     horizon: null
     start_idx: 0
+  sequence_curriculum:
+    enabled: false
+    start_horizon: 16
+    target_horizon: 120
   probabilistic:
     objective: rssm
     recon_weight: 1.0
     kl_weight: 0.5
     aux_weight: 2.0
+    rollout_weight: 0.0
+    rollout_dtw_weight: 0.0
+    rollout_dtw_gamma: 0.1
+    rollout_warmup_fraction: 0.30
+    rollout_max_horizon: 24
+    min_context: 16
     kl_warmup_enabled: true
     kl_beta_start: 0.0
     kl_beta_end: 1.0
     kl_warmup_epochs: 20
     mc_train_samples: 8
-  
-  use_amp: true                        # mixed precision (cuda only); faster on tensor cores
-  use_compile: false                   # torch.compile model for potential speedup
-  compile_mode: default                # default | reduce-overhead | max-autotune
+    checkpoint_metric: open_loop_crps
+    checkpoint_open_loop_horizon: 120
+    checkpoint_open_loop_windows: 4
+    checkpoint_open_loop_samples: 64
+    lr_min_ratio: 0.01
+    checkpoint_top_k: 3
+  use_amp: true
+  use_compile: false
+  compile_mode: default
 
 evaluation:
   probabilistic:
     mc_samples: 128
     interval_level: 0.90
 
-
-# ---------- misc ---------------
 misc:
   device: cuda

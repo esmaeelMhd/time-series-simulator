@@ -12,6 +12,7 @@ from timesim.models.latent_ssm import LatentSSMWorldModel
 from timesim.training.rollout import batch_rollout, batch_rollout_padded
 from timesim.training.losses import OneStepLoss, MultiStepLoss, ProbabilisticRolloutLoss
 from timesim.training.trainer import WorldModelTrainer
+from timesim.evaluation import interventional_evaluate
 
 
 def create_synthetic_dataset(n=500):
@@ -285,13 +286,46 @@ def test_probabilistic_trainer_runs():
         device="cpu",
         early_stopping=False,
         run_dir=None,
-        probabilistic_cfg={"elbo_weight": 1.0, "kl_weight": 1.0, "rollout_mse_weight": 1.0},
+        probabilistic_cfg={
+            "elbo_weight": 1.0,
+            "kl_weight": 1.0,
+            "rollout_mse_weight": 1.0,
+            "checkpoint_metric": "open_loop_crps",
+            "checkpoint_open_loop_horizon": 4,
+            "checkpoint_open_loop_windows": 2,
+            "checkpoint_open_loop_samples": 4,
+        },
+        sequence_curriculum_cfg={"enabled": True, "start_horizon": 2, "target_horizon": 6},
     )
     train_losses, val_losses = trainer.fit(epochs=2, steps_per_epoch=2, verbose=False)
     assert len(train_losses) == 2
     assert len(val_losses) == 2
     assert np.isfinite(train_losses[-1])
     assert val_losses[-1] is None or np.isfinite(val_losses[-1])
+
+
+def test_interventional_evaluate_runs():
+    dataset = create_synthetic_dataset(n=240)
+    model = LatentSSMWorldModel(
+        input_dim=3,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+        num_layers=1,
+    )
+    model.eval()
+    out = interventional_evaluate(
+        model=model,
+        dataset=dataset,
+        warmup_len=12,
+        horizon=6,
+        n_windows=2,
+        n_samples=4,
+        scenario="step",
+        device="cpu",
+    )
+    assert out["delta_abs"].shape == (6,)
+    assert out["direction_score"].shape == (6,)
 
 
 if __name__ == "__main__":
