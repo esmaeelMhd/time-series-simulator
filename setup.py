@@ -52,9 +52,17 @@ setup(
         "dev": [
             "pytest>=7.0",
             "pytest-cov",
+            "hypothesis>=6.0",
             "black",
             "flake8",
             "mypy",
+        ],
+        "tracking": [
+            "wandb>=0.17",
+            "mlflow>=2.14",
+        ],
+        "lightning": [
+            "pytorch-lightning>=2.0",
         ],
         "docs": [
             "sphinx",

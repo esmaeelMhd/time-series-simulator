@@ -38,6 +38,7 @@ def parse_args():
     p.add_argument("--horizon", type=int, default=None)
     p.add_argument("--n-windows", type=int, default=None)
     p.add_argument("--mc-samples", type=int, default=None)
+    p.add_argument("--sigma-scale", type=float, default=None)
     p.add_argument("--output-dir", type=str, default=None)
     return p.parse_args()
 
@@ -94,6 +95,8 @@ def _build_test_dataset(config: Dict[str, Any], scaler) -> GroupedTimeSeriesData
         dcfg["csv"],
         index_col=dcfg.get("index_col", data_cfg.get("index_col", "date")),
         slice_cfg=dcfg.get("slice"),
+        engine=str(data_cfg.get("csv_engine", "pandas")),
+        validation_cfg=data_cfg.get("validation", None),
     )
 
     train_split = float(dcfg.get("train_split", data_cfg.get("train_split", 0.8)))
@@ -314,6 +317,12 @@ def main():
     horizon = int(args.horizon or eval_cfg.get("horizon", max(pred_len, 20)))
     n_windows = int(args.n_windows or eval_cfg.get("n_windows", 8))
     mc_samples = int(args.mc_samples or prob_eval_cfg.get("mc_samples", 128))
+    sigma_scale = float(
+        args.sigma_scale
+        if args.sigma_scale is not None
+        else prob_eval_cfg.get("sigma_scale", 1.0)
+    )
+    sigma_scale = float(max(1e-6, sigma_scale))
     interval_levels = (0.5, 0.8, 0.9, 0.95)
 
     open_curves = open_loop_evaluate(
@@ -326,6 +335,7 @@ def main():
         device=device,
         denormalize=True,
         interval_levels=interval_levels,
+        sigma_scale=sigma_scale,
     )
     closed_curves = closed_loop_evaluate(
         model=model,
@@ -337,6 +347,7 @@ def main():
         device=device,
         denormalize=True,
         interval_levels=interval_levels,
+        sigma_scale=sigma_scale,
     )
     inter_cfg = eval_cfg.get("interventional", {}) or {}
     inter_control_index: Optional[int] = (
@@ -439,6 +450,7 @@ def main():
         "horizon": int(horizon),
         "open_loop_horizon_summary": open_hsum,
         "closed_loop_horizon_summary": closed_hsum,
+        "sigma_scale": float(sigma_scale),
         "coverage_95_mean": coverage95,
         "open_loop_rmse_h20_over_h1": rmse_ratio_h20_h1,
         "intervention_direction_mean_raw": direction_mean_raw,
@@ -468,6 +480,7 @@ def main():
     print("\nEvaluation suite complete")
     print(f"  Checkpoint: {checkpoint}")
     print(f"  Output dir: {out_dir}")
+    print(f"  Sigma scale: {sigma_scale:.4f}")
     print(f"  Open RMSE h1/h20 ratio: {rmse_ratio_h20_h1:.4f}" if np.isfinite(rmse_ratio_h20_h1) else "  Open RMSE h1/h20 ratio: nan")
     print(f"  Coverage@95 mean: {coverage95:.4f}" if np.isfinite(coverage95) else "  Coverage@95 mean: nan")
     print(f"  Latent KL mean: {mean_test_kl:.4f}" if np.isfinite(mean_test_kl) else "  Latent KL mean: nan")

@@ -7,9 +7,9 @@ import argparse
 from pathlib import Path
 
 import torch
-import yaml
 from joblib import load
 
+from timesim.utils.config import load_config
 from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
 from timesim.models.factory import build_model
 from timesim.serving import create_app
@@ -43,13 +43,13 @@ def parse_args():
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--session-ttl", type=int, default=3600)
+    p.add_argument("--sigma-scale", type=float, default=None)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    with open(args.config, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_config(args.config)
 
     dcfg = config["dataset"]
     data_cfg = config.get("data", {})
@@ -74,6 +74,8 @@ def main():
         dcfg["csv"],
         index_col=dcfg.get("index_col", data_cfg.get("index_col", "date")),
         slice_cfg=dcfg.get("slice"),
+        engine=str(data_cfg.get("csv_engine", "pandas")),
+        validation_cfg=data_cfg.get("validation", None),
     )
 
     scaler_path = Path(args.checkpoint).resolve().parent.parent / "scaler.pkl"
@@ -113,6 +115,19 @@ def main():
     model.to(args.device)
     model.eval()
 
+    serving_cfg = config.get("serving", {}) or {}
+    eval_prob_cfg = config.get("evaluation", {}).get("probabilistic", {}) or {}
+    if args.sigma_scale is not None:
+        sigma_scale = float(args.sigma_scale)
+    else:
+        sigma_scale = float(
+            serving_cfg.get(
+                "sigma_scale",
+                eval_prob_cfg.get("sigma_scale", 1.0),
+            )
+        )
+    sigma_scale = float(max(1e-6, sigma_scale))
+
     simulator_template = RSSMSimulator(
         model=model,
         feature_columns=dataset.feature_cols,
@@ -123,6 +138,7 @@ def main():
         control_positions=dataset.control_positions,
         known_exo_positions=dataset.known_exo_positions,
         scaler=dataset.scaler,
+        sigma_scale=sigma_scale,
         device=args.device,
     )
 

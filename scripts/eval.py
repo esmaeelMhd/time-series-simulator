@@ -431,6 +431,8 @@ def main():
         config["dataset"]["csv"],
         index_col=index_col,
         slice_cfg=config["dataset"].get("slice"),
+        engine=str(data_cfg.get("csv_engine", "pandas")),
+        validation_cfg=data_cfg.get("validation", None),
     )
 
     _, val_loader, _ = build_grouped_dataloaders(

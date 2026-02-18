@@ -39,6 +39,7 @@ class RSSMSimulator:
         known_exo_positions: Sequence[int],
         scaler=None,
         input_stats: Optional[Dict[str, InputStats]] = None,
+        sigma_scale: float = 1.0,
         device: str | torch.device = "cpu",
     ):
         self.model = model
@@ -55,6 +56,7 @@ class RSSMSimulator:
         self.known_exo_positions = list(known_exo_positions)
         self.scaler = scaler
         self.input_stats = input_stats or {}
+        self.sigma_scale = float(max(1e-6, sigma_scale))
 
         self.feature_idx = {c: i for i, c in enumerate(self.feature_columns)}
         self.control_columns = [self.input_columns[i] for i in self.control_positions]
@@ -68,6 +70,7 @@ class RSSMSimulator:
         cls,
         model,
         dataset: GroupedTimeSeriesDataset,
+        sigma_scale: float = 1.0,
         device: str | torch.device = "cpu",
     ) -> "RSSMSimulator":
         scaler = getattr(dataset, "scaler", None)
@@ -109,6 +112,7 @@ class RSSMSimulator:
             known_exo_positions=dataset.known_exo_positions,
             scaler=scaler,
             input_stats=input_stats,
+            sigma_scale=sigma_scale,
             device=device,
         )
 
@@ -125,9 +129,17 @@ class RSSMSimulator:
             known_exo_positions=self.known_exo_positions,
             scaler=self.scaler,
             input_stats=self.input_stats,
+            sigma_scale=self.sigma_scale,
             device=self.device,
         )
         return clone
+
+    def _apply_sigma_scale_to_samples(self, samples: np.ndarray) -> np.ndarray:
+        """Scale sample spread around the per-step mean for post-hoc calibration."""
+        if np.isclose(self.sigma_scale, 1.0):
+            return samples.astype(np.float32, copy=False)
+        mean = np.mean(samples, axis=0, keepdims=True)
+        return (mean + self.sigma_scale * (samples - mean)).astype(np.float32, copy=False)
 
     def _check_columns(self, df: pd.DataFrame):
         missing = [c for c in self.feature_columns if c not in df.columns]
@@ -256,6 +268,7 @@ class RSSMSimulator:
             samples_scaled = out["samples"].squeeze(2).squeeze(1).cpu().numpy()  # (N, O)
         else:
             samples_scaled = out["predictions"][0, 0, :].cpu().numpy()[None, :]
+        samples_scaled = self._apply_sigma_scale_to_samples(samples_scaled)
         mean_scaled = np.mean(samples_scaled, axis=0)
         std_scaled = np.std(samples_scaled, axis=0)
 
@@ -327,6 +340,7 @@ class RSSMSimulator:
             samples_scaled = out["samples"].squeeze(1).cpu().numpy()  # (N, H, O)
         else:
             samples_scaled = out["predictions"].squeeze(0).cpu().numpy()[None, ...]
+        samples_scaled = self._apply_sigma_scale_to_samples(samples_scaled)
         mean_scaled = np.mean(samples_scaled, axis=0)
         std_scaled = np.std(samples_scaled, axis=0)
 

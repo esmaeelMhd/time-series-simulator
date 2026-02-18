@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Tuple, Dict, List, Optional, Any
 from .dataset import TimeSeriesDataset
 import pandas as pd
+from .validation import validate_time_series_dataframe
 
 
 def generate_sine_dataset(length: int = 1000,
@@ -46,9 +47,25 @@ def build_dataloaders(series: np.ndarray,
 def load_csv_dataset(path: str | Path,
                      index_col: str = "date",
                      parse_dates: bool = True,
-                     slice_cfg: Dict | None = None) -> pd.DataFrame:
+                     slice_cfg: Dict | None = None,
+                     engine: str = "pandas",
+                     validation_cfg: Dict[str, Any] | None = None) -> pd.DataFrame:
     """Read a CSV file and return a time-indexed DataFrame."""
-    df = pd.read_csv(path)
+    engine_name = str(engine or "pandas").lower()
+    if engine_name == "polars":
+        try:
+            import polars as pl  # type: ignore
+        except Exception as exc:
+            raise ImportError("CSV engine 'polars' requested but polars is not installed.") from exc
+        pl_df = pl.read_csv(path)
+        if parse_dates:
+            pl_df = pl_df.with_columns(pl.col(index_col).str.to_datetime(strict=False))
+        if index_col not in pl_df.columns:
+            raise KeyError(f"Index column '{index_col}' not found in CSV")
+        df = pl_df.to_pandas()
+    else:
+        df = pd.read_csv(path)
+
     if parse_dates:
         df[index_col] = pd.to_datetime(df[index_col])
     df = df.set_index(index_col)
@@ -80,6 +97,15 @@ def load_csv_dataset(path: str | Path,
             start = slice_cfg["start"]
             end = slice_cfg.get("end")
             df = df.loc[start:end]
+
+    vcfg = validation_cfg or {}
+    if bool(vcfg.get("enabled", False)):
+        df = validate_time_series_dataframe(
+            df,
+            required_columns=vcfg.get("required_columns"),
+            strict=bool(vcfg.get("strict", False)),
+            require_datetime_index=bool(vcfg.get("require_datetime_index", True)),
+        )
     return df
 
 

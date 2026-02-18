@@ -78,6 +78,15 @@ def _interval_curves(
     return coverage_by_level, sharpness90
 
 
+def _apply_sigma_scale_to_samples(samples: np.ndarray, sigma_scale: float) -> np.ndarray:
+    """Post-hoc calibration on ensemble samples by scaling spread around the mean."""
+    scale = float(max(1e-6, sigma_scale))
+    if np.isclose(scale, 1.0):
+        return samples
+    mean = np.mean(samples, axis=0, keepdims=True)
+    return (mean + scale * (samples - mean)).astype(np.float32, copy=False)
+
+
 def open_loop_evaluate(
     model,
     dataset: GroupedTimeSeriesDataset,
@@ -88,6 +97,7 @@ def open_loop_evaluate(
     device: str | torch.device = "cpu",
     denormalize: bool = True,
     interval_levels: Sequence[float] = (0.5, 0.8, 0.9, 0.95),
+    sigma_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """Open-loop rollout quality: observe context, then imagine with known C/X."""
     device = torch.device(device)
@@ -126,6 +136,7 @@ def open_loop_evaluate(
 
             if "samples" in out:
                 samples = out["samples"].squeeze(1).cpu().numpy().astype(np.float32, copy=False)  # (N, H, O)
+                samples = _apply_sigma_scale_to_samples(samples, sigma_scale=sigma_scale)
                 if denormalize:
                     samples = _inverse_outputs(dataset, samples)
                     target_eval = _inverse_outputs(dataset, target_y)
@@ -144,7 +155,7 @@ def open_loop_evaluate(
 
                 if "dist_loc_latent" in out and "dist_scale" in out:
                     loc_lat = out["dist_loc_latent"].squeeze(0)
-                    scale = out["dist_scale"].squeeze(0)
+                    scale = out["dist_scale"].squeeze(0) * float(max(1e-6, sigma_scale))
                     y_t = torch.from_numpy(target_y).to(loc_lat.device)
                     if bool(getattr(model, "use_symlog", False)):
                         y_t = model.symlog(y_t)
@@ -199,6 +210,7 @@ def closed_loop_evaluate(
     device: str | torch.device = "cpu",
     denormalize: bool = True,
     interval_levels: Sequence[float] = (0.5, 0.8, 0.9, 0.95),
+    sigma_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """Closed-loop one-step quality with reconditioning on true Y every step."""
     device = torch.device(device)
@@ -245,6 +257,10 @@ def closed_loop_evaluate(
                 y_t = target_y[t:t + 1]
                 if "samples" in step_out:
                     samples_t = step_out["samples"].squeeze(2).squeeze(1).cpu().numpy().astype(np.float32, copy=False)  # (N, O)
+                    samples_t = _apply_sigma_scale_to_samples(
+                        samples_t[:, None, :],
+                        sigma_scale=sigma_scale,
+                    )[:, 0, :]
                     if denormalize:
                         samples_eval = _inverse_outputs(dataset, samples_t)
                         y_eval = _inverse_outputs(dataset, y_t)
@@ -270,7 +286,7 @@ def closed_loop_evaluate(
 
                     if "dist_loc_latent" in step_out and "dist_scale" in step_out:
                         loc_lat = step_out["dist_loc_latent"].squeeze(1).squeeze(0)
-                        scale = step_out["dist_scale"].squeeze(1).squeeze(0)
+                        scale = step_out["dist_scale"].squeeze(1).squeeze(0) * float(max(1e-6, sigma_scale))
                         yt_t = torch.from_numpy(target_y[t]).to(loc_lat.device)
                         if bool(getattr(model, "use_symlog", False)):
                             yt_t = model.symlog(yt_t)

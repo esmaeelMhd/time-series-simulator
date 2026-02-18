@@ -45,6 +45,7 @@ from timesim.data.sampling import (
 from timesim.training import WorldModelTrainer
 from timesim.utils.plotting import save_loss_plot, save_forecast_plot
 from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
+from timesim.utils.tracking import ExperimentTracker
 
 # Shared eval / simulation utilities  (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -585,6 +586,7 @@ def main():
     model_defaults_cfg = config.get("model_defaults", {})
     plot_cfg = config.get("plotting", {})
     output_cfg = config.get("output", {})
+    tracking_cfg = config.get("tracking", {}) or {}
     runs_dir = Path(output_cfg.get("runs_dir", "runs"))
     run_name = output_cfg.get("run_name", None)
     if isinstance(run_name, str):
@@ -712,6 +714,26 @@ def main():
     with open(out_dir / "run_metadata.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(run_meta, f, sort_keys=False)
 
+    tracker_run_name = tracking_cfg.get("run_name", None) or run_name or "run"
+    tracker = ExperimentTracker(
+        backend=str(tracking_cfg.get("backend", "none")),
+        project=str(
+            tracking_cfg.get("project", f"timesim-{config['dataset']['name']}")
+        ),
+        run_name=str(tracker_run_name),
+        run_dir=out_dir,
+        config=config if bool(tracking_cfg.get("log_config", True)) else None,
+        tags=list(tracking_cfg.get("tags", [])),
+    )
+    tracker.log_params(
+        {
+            "git_hash": run_meta.get("git_hash", "unknown"),
+            "config_path": run_meta.get("config_path", ""),
+            "dataset.name": config["dataset"]["name"],
+            "output.run_name": run_name or "",
+        }
+    )
+
     # Pre-create per-model directories
     for rc in training_rounds:
         for mt in rc.get("models", model_names):
@@ -728,6 +750,8 @@ def main():
         config["dataset"]["csv"],
         index_col=index_col,
         slice_cfg=config["dataset"].get("slice"),
+        engine=str(data_cfg.get("csv_engine", "pandas")),
+        validation_cfg=data_cfg.get("validation", None),
     )
     print(f"  Rows: {len(df)}, Columns: {list(df.columns)}")
 
@@ -1122,6 +1146,15 @@ def main():
                 vl = val_losses[-1] if val_losses else float("nan")
                 print(f"  => train_loss={tl:.6f}  val_loss={vl:.6f}  "
                       f"time={elapsed:.1f}s")
+                tracker.log_metrics(
+                    {
+                        f"{model_type}/{round_name}/train_loss": float(tl),
+                        f"{model_type}/{round_name}/val_loss": float(vl),
+                        f"{model_type}/{round_name}/train_time_sec": float(elapsed),
+                    },
+                    step=int(total_epochs),
+                )
+                tracker.log_artifact(model_dir / "model_config.yaml", artifact_path=model_type)
 
                 # ── Post-round evaluation & simulation ────────────
                 try:
@@ -1156,6 +1189,13 @@ def main():
                              for g, p in zip(gt_list, pred_list)]))
                         print(f"    Eval  MSE={mean_mse:.6f}  "
                               f"MAE={mean_mae:.6f}")
+                        tracker.log_metrics(
+                            {
+                                f"{model_type}/{round_name}/eval_mse": float(mean_mse),
+                                f"{model_type}/{round_name}/eval_mae": float(mean_mae),
+                            },
+                            step=int(total_epochs),
+                        )
                         if bool(eval_info.get("is_probabilistic", False)):
                             nll = eval_info.get("rollout_nll", float("nan"))
                             cov = eval_info.get("coverage_90", float("nan"))
@@ -1163,6 +1203,14 @@ def main():
                             print(
                                 f"    Eval  NLL={nll:.6f}  "
                                 f"Coverage@90={cov:.6f}  Width@90={wid:.6f}"
+                            )
+                            tracker.log_metrics(
+                                {
+                                    f"{model_type}/{round_name}/eval_nll": float(nll),
+                                    f"{model_type}/{round_name}/eval_coverage90": float(cov),
+                                    f"{model_type}/{round_name}/eval_width90": float(wid),
+                                },
+                                step=int(total_epochs),
                             )
 
                         save_forecast_plot(
@@ -1202,6 +1250,13 @@ def main():
                         print(f"    Sim   MSE={sim_mse:.6f}  "
                               f"MAE={sim_mae:.6f}  "
                               f"({sim_result['n_steps']} steps)")
+                        tracker.log_metrics(
+                            {
+                                f"{model_type}/{round_name}/sim_mse": float(sim_mse),
+                                f"{model_type}/{round_name}/sim_mae": float(sim_mae),
+                            },
+                            step=int(total_epochs),
+                        )
 
                         save_per_model_simulation_plot(
                             sim_result, output_cols, model_type,
@@ -1251,6 +1306,9 @@ def main():
     print(f"  Scaler           : {scaler_path}")
     print(f"  Config           : {out_dir / 'config.yaml'}")
     print(f"{'=' * 70}\n")
+    tracker.log_artifact(out_dir / "run_metadata.yaml")
+    tracker.log_artifact(out_dir / "config.yaml")
+    tracker.finish()
 
 
 if __name__ == "__main__":

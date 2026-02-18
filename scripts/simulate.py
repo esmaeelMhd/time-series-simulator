@@ -197,6 +197,8 @@ def main():
         config["dataset"]["csv"],
         index_col=index_col,
         slice_cfg=slice_cfg,
+        engine=str(data_cfg.get("csv_engine", "pandas")),
+        validation_cfg=data_cfg.get("validation", None),
     )
 
     dataset_full = GroupedTimeSeriesDataset(

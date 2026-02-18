@@ -450,6 +450,8 @@ def main():
         dataset_cfg["csv"],
         index_col=index_col,
         slice_cfg=dataset_cfg.get("slice"),
+        engine=str(config.get("data", {}).get("csv_engine", "pandas")),
+        validation_cfg=config.get("data", {}).get("validation", None),
     )
     train_loader, val_loader, scaler = build_grouped_dataloaders(
         df,

@@ -11,7 +11,7 @@ models:
     num_layers: 1
     dropout: 0.10
     learning_rate: 0.0005
-    min_scale: 0.01
+    min_scale: 0.02
     use_symlog: true
     min_df: 2.2
     use_aux_decoder: true
@@ -29,6 +29,9 @@ training:
   early_stopping: false
   optimizer: adamw
   weight_decay: 0.000001
+  checkpoint_simulation:
+    enabled: false
+    n_rounds: 0
   probabilistic:
     objective: rssm
     recon_weight: 1.0

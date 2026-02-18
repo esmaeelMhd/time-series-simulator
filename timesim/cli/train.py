@@ -83,7 +83,9 @@ def main():
         from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
         df_raw = load_csv_dataset(dataset_cfg["csv"],
                                   index_col=dataset_cfg.get("index_col", "date"),
-                                  slice_cfg=dataset_cfg.get("slice"))
+                                  slice_cfg=dataset_cfg.get("slice"),
+                                  engine=str(cfg.get("data", {}).get("csv_engine", "pandas")),
+                                  validation_cfg=cfg.get("data", {}).get("validation", None))
         groups = dataset_cfg["variables"]
 
         io_cfg = cfg.get("model_io", {})

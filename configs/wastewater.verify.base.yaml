@@ -24,6 +24,11 @@ training_rounds:
 training:
   use_optuna_best_params: false
   steps_per_epoch: 300
+  checkpoint_simulation:
+    enabled: false
+    n_rounds: 4
+    horizon: null
+    start_idx: 0
 
 evaluation:
   test_split: 0.1

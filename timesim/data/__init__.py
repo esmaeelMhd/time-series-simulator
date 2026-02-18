@@ -16,6 +16,7 @@ from .sampling import (
     GeometricHorizonSampling,
     StrideBasedSampling,
 )
+from .validation import validate_time_series_dataframe
 
 __all__ = [
     "TimeSeriesDataset",
@@ -32,4 +33,5 @@ __all__ = [
     "DailyFixedHorizon",
     "GeometricHorizonSampling",
     "StrideBasedSampling",
+    "validate_time_series_dataframe",
 ]

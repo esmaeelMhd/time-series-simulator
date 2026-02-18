@@ -125,6 +125,12 @@ data:
   train_split: 0.8
   shuffle_train: true
   drop_last: true
+  csv_engine: pandas                 # pandas | polars
+  validation:
+    enabled: false                   # optional Pandera validation
+    strict: false                    # if true, require pandera installed
+    require_datetime_index: true
+    required_columns: null
   require_full_role_mapping: true      # require every dataset column be mapped to control/exogenous/objective
   scale: true                        # apply MinMaxScaler
   add_time_features: false           # legacy switch; same as data.time_features.enabled
@@ -222,6 +228,14 @@ plotting:
 output:
   runs_dir: runs                     # base directory for all run artifacts
   run_name: null                     # optional subfolder under runs/<dataset>/
+
+# Optional experiment tracking backend
+tracking:
+  backend: none                      # none | wandb | mlflow
+  project: timesim
+  run_name: null
+  tags: []
+  log_config: true
 
 # ══════════════════════════════════════════════════════════════════════
 #  MISC

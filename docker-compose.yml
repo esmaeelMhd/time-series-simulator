@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - python
+      - scripts/serve.py
+      - --config
+      - ${TIMESIM_CONFIG:-configs/wastewater.yaml}
+      - --checkpoint
+      - ${TIMESIM_CHECKPOINT:-runs/wastewater/full_with_time/latent_ssm/train_checkpoint.pth}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - streamlit
+      - run
+      - scripts/dashboard.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    depends_on:
+      - api

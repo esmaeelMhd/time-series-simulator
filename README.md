@@ -32,6 +32,39 @@ cd time-series-simulator
 pip install -e .
 ```
 
+### Optional Full-Stack Extras
+
+```bash
+# Tracking + Lightning + validation + property tests
+pip install -e ".[all]"
+```
+
+## Technology Stack
+
+The repository now supports this stack end-to-end (optionally enabled):
+
+- Deep learning: PyTorch 2.x
+- Training orchestration: native trainer + optional PyTorch Lightning (`scripts/train_lightning.py`)
+- Configuration: YAML `_base` chain + optional Hydra wrapper (`scripts/train_hydra.py`)
+- Experiment tracking: TensorBoard + optional W&B / MLflow (`tracking.backend`)
+- Hyperparameter optimization: Optuna (`timesim.cli.optimize`, `scripts/optimize.py`)
+- Serving: FastAPI + Uvicorn (`scripts/serve.py`)
+- Dashboard: Streamlit (`scripts/dashboard.py`)
+- Containerization: `Dockerfile`, `docker-compose.yml`
+- Testing: `pytest` + property-based tests (`tests/test_property_invariants.py`)
+- Data validation: optional Pandera (`data.validation.enabled`)
+- Dataframe/array stack: NumPy, pandas, optional polars (`data.csv_engine: polars`)
+
+Examples:
+
+```bash
+# Hydra wrapper (composes base config + overrides)
+python scripts/train_hydra.py base_config=configs/wastewater.yaml overrides.training.epochs=5
+
+# Lightning entrypoint (experimental)
+python scripts/train_lightning.py --config configs/wastewater.yaml --model latent_ssm
+```
+
 ### Requirements
 
 - Python >= 3.10

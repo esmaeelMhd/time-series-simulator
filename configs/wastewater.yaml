@@ -122,6 +122,7 @@ training:
 evaluation:
   probabilistic:
     mc_samples: 128
+    sigma_scale: 1.0
     interval_level: 0.90
 
 misc:
