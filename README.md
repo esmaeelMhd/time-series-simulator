@@ -12,6 +12,53 @@ This library provides a clean, domain-agnostic framework for:
 4. **Gymnasium-compatible environments** for RL integration
 5. **Easy deployment** for MPC and control applications
 
+## Model Card
+
+Model behavior, schema expectations, training recipe, simulator usage, limitations, and benchmark references are documented in:
+
+- `MODEL_CARD.md`
+
+## Production Hardening Quickstart
+
+### Docker API (CPU)
+
+```bash
+docker build -t timesim-api .
+docker run --rm -p 8000:8000 \
+  -e TIMESIM_CONFIG=configs/wastewater.yaml \
+  -e TIMESIM_CHECKPOINT=runs/wastewater/full_with_time/latent_ssm/train_checkpoint.pth \
+  -v "$PWD:/app" \
+  timesim-api
+```
+
+If config/checkpoint are missing, the container still starts a minimal health API (`/health`, `/ready`).
+
+### Docker API (GPU / nvidia-docker)
+
+```bash
+docker build -t timesim-api-gpu \
+  --build-arg PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124 .
+
+docker run --rm --gpus all -p 8000:8000 \
+  -e TIMESIM_DEVICE=cuda \
+  -e TIMESIM_CONFIG=configs/wastewater.yaml \
+  -e TIMESIM_CHECKPOINT=runs/wastewater/full_with_time/latent_ssm/train_checkpoint.pth \
+  -v "$PWD:/app" \
+  timesim-api-gpu
+```
+
+### CI Pipeline
+
+The repository includes GitHub Actions CI at:
+
+- `.github/workflows/ci.yml`
+
+On every push/PR it runs:
+
+1. Lint (`ruff` fatal checks)
+2. Unit tests for RSSM/encoders/decoders/losses/normalization/simulator
+3. A fast synthetic training smoke run (`scripts/ci_fast_train.py`, 5 epochs)
+
 ### Key Features
 
 - ✅ **Domain-agnostic**: Works across industries (wastewater, energy, manufacturing, etc.)
