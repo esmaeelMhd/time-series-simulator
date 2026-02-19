@@ -30,6 +30,7 @@ from timesim.evaluation import (
     open_loop_evaluate,
     closed_loop_evaluate,
     interventional_evaluate,
+    interventional_suite_evaluate,
     summarize_horizons,
     latent_diagnostics,
 )
@@ -186,6 +187,85 @@ def _save_horizon_csv(
     pd.DataFrame(rows).to_csv(out_path, index=False)
 
 
+def _save_selected_horizons_csv(
+    out_path: Path,
+    curves: Dict[str, Any],
+    horizons: Sequence[int] = (1, 5, 10, 20),
+):
+    rows = []
+    for h in horizons:
+        idx = int(h) - 1
+        row = {
+            "horizon": int(h),
+            "rmse": np.nan,
+            "mae": np.nan,
+            "crps": np.nan,
+            "nll": np.nan,
+            "sharpness_90": np.nan,
+        }
+        for key in ("rmse", "mae", "crps", "nll", "sharpness_90"):
+            arr = np.asarray(curves.get(key, []), dtype=np.float32)
+            if 0 <= idx < arr.size:
+                row[key] = float(arr[idx])
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
+def _save_per_objective_horizon_csv(
+    out_path: Path,
+    curves: Dict[str, Any],
+    objective_names: Sequence[str],
+):
+    rmse = np.asarray(curves.get("rmse_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    mae = np.asarray(curves.get("mae_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    crps = np.asarray(curves.get("crps_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    nll = np.asarray(curves.get("nll_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    horizon = int(rmse.shape[0]) if rmse.ndim == 2 else 0
+    out_dim = int(rmse.shape[1]) if rmse.ndim == 2 else 0
+
+    rows = []
+    for t in range(horizon):
+        for j in range(out_dim):
+            rows.append(
+                {
+                    "horizon": t + 1,
+                    "objective_index": j,
+                    "objective": objective_names[j] if j < len(objective_names) else f"y{j}",
+                    "rmse": float(rmse[t, j]) if rmse.size else np.nan,
+                    "mae": float(mae[t, j]) if mae.shape == rmse.shape else np.nan,
+                    "crps": float(crps[t, j]) if crps.shape == rmse.shape else np.nan,
+                    "nll": float(nll[t, j]) if nll.shape == rmse.shape else np.nan,
+                }
+            )
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
+def _save_per_objective_summary_csv(
+    out_path: Path,
+    curves: Dict[str, Any],
+    objective_names: Sequence[str],
+):
+    rmse = np.asarray(curves.get("rmse_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    mae = np.asarray(curves.get("mae_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    crps = np.asarray(curves.get("crps_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    nll = np.asarray(curves.get("nll_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    out_dim = int(rmse.shape[1]) if rmse.ndim == 2 else 0
+
+    rows = []
+    for j in range(out_dim):
+        rows.append(
+            {
+                "objective_index": j,
+                "objective": objective_names[j] if j < len(objective_names) else f"y{j}",
+                "rmse_mean_over_horizon": _finite_mean(rmse[:, j]) if rmse.size else np.nan,
+                "mae_mean_over_horizon": _finite_mean(mae[:, j]) if mae.shape == rmse.shape else np.nan,
+                "crps_mean_over_horizon": _finite_mean(crps[:, j]) if crps.shape == rmse.shape else np.nan,
+                "nll_mean_over_horizon": _finite_mean(nll[:, j]) if nll.shape == rmse.shape else np.nan,
+            }
+        )
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
 def _calibration_summary(curves: Dict[str, Any], levels: Sequence[float]) -> pd.DataFrame:
     cov = curves.get("coverage", {})
     rows = []
@@ -198,6 +278,70 @@ def _calibration_summary(curves: Dict[str, Any], levels: Sequence[float]) -> pd.
     return pd.DataFrame(rows)
 
 
+def _coverage_table(
+    curves: Dict[str, Any],
+    levels: Sequence[float],
+    split: str,
+) -> pd.DataFrame:
+    cov = curves.get("coverage", {})
+    rows = []
+    for lvl in levels:
+        arr = cov.get(float(lvl), np.empty((0,), dtype=np.float32))
+        rows.append(
+            {
+                "split": split,
+                "nominal": float(lvl),
+                "actual": float(np.mean(arr)) if arr.size > 0 else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _sharpness_summary(
+    curves: Dict[str, Any],
+    split: str,
+) -> pd.DataFrame:
+    sharp = np.asarray(curves.get("sharpness_90", []), dtype=np.float32)
+    rows = [
+        {
+            "split": split,
+            "metric": "sharpness_90_mean",
+            "value": _finite_mean(sharp),
+        }
+    ]
+    for h in (1, 5, 10, 20):
+        idx = h - 1
+        rows.append(
+            {
+                "split": split,
+                "metric": f"sharpness_90_h{h}",
+                "value": float(sharp[idx]) if 0 <= idx < sharp.size else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _per_objective_summary_dict(
+    curves: Dict[str, Any],
+    objective_names: Sequence[str],
+) -> Dict[str, Dict[str, float]]:
+    rmse = np.asarray(curves.get("rmse_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    mae = np.asarray(curves.get("mae_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    crps = np.asarray(curves.get("crps_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    nll = np.asarray(curves.get("nll_per_dim", np.empty((0, 0), dtype=np.float32)), dtype=np.float32)
+    out_dim = int(rmse.shape[1]) if rmse.ndim == 2 else 0
+    out: Dict[str, Dict[str, float]] = {}
+    for j in range(out_dim):
+        key = objective_names[j] if j < len(objective_names) else f"y{j}"
+        out[key] = {
+            "rmse_mean_over_horizon": _finite_mean(rmse[:, j]) if rmse.size else np.nan,
+            "mae_mean_over_horizon": _finite_mean(mae[:, j]) if mae.shape == rmse.shape else np.nan,
+            "crps_mean_over_horizon": _finite_mean(crps[:, j]) if crps.shape == rmse.shape else np.nan,
+            "nll_mean_over_horizon": _finite_mean(nll[:, j]) if nll.shape == rmse.shape else np.nan,
+        }
+    return out
+
+
 def _finite_mean(x: np.ndarray) -> float:
     arr = np.asarray(x, dtype=np.float32)
     if arr.size == 0:
@@ -206,6 +350,273 @@ def _finite_mean(x: np.ndarray) -> float:
     if not np.any(mask):
         return float("nan")
     return float(arr[mask].mean())
+
+
+def _save_records_csv(out_path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    pd.DataFrame(list(rows)).to_csv(out_path, index=False)
+
+
+def _save_trajectory_means_csv(
+    out_path: Path,
+    trajectory_means: Dict[str, np.ndarray],
+    objective_names: Sequence[str],
+) -> None:
+    rows = []
+    for scenario, traj in trajectory_means.items():
+        arr = np.asarray(traj, dtype=np.float32)
+        if arr.ndim != 2:
+            continue
+        horizon, out_dim = arr.shape
+        for t in range(horizon):
+            for j in range(out_dim):
+                rows.append(
+                    {
+                        "scenario": str(scenario),
+                        "horizon": int(t + 1),
+                        "objective_index": int(j),
+                        "objective": objective_names[j] if j < len(objective_names) else f"y{j}",
+                        "value": float(arr[t, j]),
+                    }
+                )
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+
+
+def _inverse_outputs(dataset: GroupedTimeSeriesDataset, arr: np.ndarray) -> np.ndarray:
+    scaler = getattr(dataset, "scaler", None)
+    out = np.asarray(arr, dtype=np.float32)
+    if scaler is None:
+        return out
+    if out.ndim < 2 or out.shape[-1] != len(dataset.out_idx):
+        return out
+    flat = out.reshape(-1, out.shape[-1])
+    full = np.zeros((flat.shape[0], dataset.values.shape[1]), dtype=np.float32)
+    full[:, dataset.out_idx] = flat
+    inv = scaler.inverse_transform(full)[:, dataset.out_idx]
+    return inv.reshape(out.shape).astype(np.float32, copy=False)
+
+
+def _decode_from_state(model, h: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    if hasattr(model, "_decode_obs"):
+        _, _, loc, _, _ = model._decode_obs(h, z)  # type: ignore[attr-defined]
+        return loc
+    if hasattr(model, "obs_decoder"):
+        latent = torch.cat([h, z], dim=-1)
+        min_scale = max(0.01, float(getattr(model, "min_scale", 1e-4)))
+        _, loc_latent, _ = model.obs_decoder(latent, min_scale=min_scale)
+        if bool(getattr(model, "use_symlog", False)) and hasattr(model, "symexp"):
+            return model.symexp(loc_latent)
+        return loc_latent
+    raise RuntimeError("Model does not expose a supported decode path for latent traversal.")
+
+
+def _latent_traversal(
+    model,
+    dataset: GroupedTimeSeriesDataset,
+    warmup_len: int,
+    start_idx: int,
+    device: str | torch.device,
+) -> Dict[str, Any]:
+    values = dataset.values
+    if start_idx + warmup_len > len(values):
+        return {
+            "deltas_sigma": np.empty((0,), dtype=np.float32),
+            "trajectory": np.empty((0, len(dataset.out_idx)), dtype=np.float32),
+            "latent_dim": -1,
+            "latent_sigma": np.nan,
+            "smoothness_ratio": np.nan,
+            "effect_range_mean": np.nan,
+        }
+    w = values[start_idx:start_idx + warmup_len]
+    w_inputs = w[:, dataset.in_idx]
+    w_out = w[:, dataset.out_idx]
+    c = (
+        w_inputs[:, dataset.control_positions]
+        if dataset.control_positions
+        else np.zeros((warmup_len, 0), dtype=np.float32)
+    )
+    x = (
+        w_inputs[:, dataset.known_exo_positions]
+        if dataset.known_exo_positions
+        else np.zeros((warmup_len, 0), dtype=np.float32)
+    )
+    latent = latent_diagnostics(
+        model=model,
+        controls=torch.from_numpy(c).unsqueeze(0).to(device),
+        exogenous=torch.from_numpy(x).unsqueeze(0).to(device),
+        observations=torch.from_numpy(w_out.astype(np.float32)).unsqueeze(0).to(device),
+    )
+    h_last = latent["deter"][0, -1, :]
+    z_last = latent["stoch"][0, -1, :]
+    post_logvar_last = latent["posterior_logvar"][0, -1, :]
+    post_std_last = torch.exp(0.5 * post_logvar_last).clamp_min(1e-6)
+    dim = int(torch.argmax(post_std_last).item())
+    sigma = float(post_std_last[dim].item())
+
+    deltas = np.linspace(-2.0, 2.0, num=9, dtype=np.float32)
+    traj = []
+    with torch.no_grad():
+        for d in deltas:
+            z_t = z_last.clone()
+            z_t[dim] = z_t[dim] + float(d) * sigma
+            loc = _decode_from_state(model, h_last.unsqueeze(0), z_t.unsqueeze(0))
+            traj.append(loc.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False))
+    traj_arr = np.stack(traj, axis=0).astype(np.float32, copy=False)
+    traj_eval = _inverse_outputs(dataset, traj_arr)
+
+    if traj_eval.shape[0] >= 3:
+        d1 = np.diff(traj_eval, axis=0)
+        d2 = np.diff(d1, axis=0)
+        smoothness = float(np.mean(np.abs(d2)) / (np.mean(np.abs(d1)) + 1e-8))
+    else:
+        smoothness = np.nan
+    effect_range_mean = float(np.mean(np.ptp(traj_eval, axis=0)))
+
+    return {
+        "deltas_sigma": deltas,
+        "trajectory": traj_eval,
+        "latent_dim": dim,
+        "latent_sigma": sigma,
+        "smoothness_ratio": smoothness,
+        "effect_range_mean": effect_range_mean,
+    }
+
+
+def _plot_latent_traversal(
+    deltas_sigma: np.ndarray,
+    trajectory: np.ndarray,
+    objective_names: Sequence[str],
+    out_path: Path,
+) -> None:
+    if deltas_sigma.size == 0 or trajectory.size == 0:
+        return
+    plt.figure(figsize=(8, 4))
+    for j in range(trajectory.shape[-1]):
+        label = objective_names[j] if j < len(objective_names) else f"y{j}"
+        plt.plot(deltas_sigma, trajectory[:, j], marker="o", linewidth=1.8, label=label)
+    plt.xlabel("Latent Perturbation (sigma)")
+    plt.ylabel("Decoded Objective")
+    plt.title("Latent Traversal")
+    plt.grid(True, alpha=0.3)
+    if trajectory.shape[-1] <= 8:
+        plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140)
+    plt.close()
+
+
+def _reconstruction_sanity(
+    model,
+    dataset: GroupedTimeSeriesDataset,
+    warmup_len: int,
+    horizon: int,
+    n_windows: int,
+    device: str | torch.device,
+) -> Dict[str, Any]:
+    starts = np.linspace(
+        0,
+        max(0, len(dataset.values) - (warmup_len + horizon)),
+        num=max(1, int(n_windows)),
+        dtype=int,
+    ).tolist()
+    true_list = []
+    recon_list = []
+    overlay_true = np.empty((0, len(dataset.out_idx)), dtype=np.float32)
+    overlay_recon = np.empty((0, len(dataset.out_idx)), dtype=np.float32)
+
+    with torch.no_grad():
+        for idx, s in enumerate(starts):
+            seq = dataset.values[s:s + warmup_len + horizon]
+            if seq.shape[0] < 2:
+                continue
+            seq_inputs = seq[:, dataset.in_idx]
+            seq_out = seq[:, dataset.out_idx]
+            c = (
+                seq_inputs[:, dataset.control_positions]
+                if dataset.control_positions
+                else np.zeros((seq.shape[0], 0), dtype=np.float32)
+            )
+            x = (
+                seq_inputs[:, dataset.known_exo_positions]
+                if dataset.known_exo_positions
+                else np.zeros((seq.shape[0], 0), dtype=np.float32)
+            )
+            observed = model.observe(
+                controls=torch.from_numpy(c).unsqueeze(0).to(device),
+                exogenous=torch.from_numpy(x).unsqueeze(0).to(device),
+                observations=torch.from_numpy(seq_out.astype(np.float32)).unsqueeze(0).to(device),
+                initial_state=None,
+                sample_posterior=False,
+            )
+            recon = observed["predictions"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+            true_eval = _inverse_outputs(dataset, seq_out.astype(np.float32, copy=False))
+            recon_eval = _inverse_outputs(dataset, recon)
+            true_list.append(true_eval)
+            recon_list.append(recon_eval)
+            if idx == 0:
+                overlay_true = true_eval
+                overlay_recon = recon_eval
+
+    if not true_list:
+        return {
+            "overlay_true": overlay_true,
+            "overlay_recon": overlay_recon,
+            "rmse_per_dim": np.empty((0,), dtype=np.float32),
+            "mae_per_dim": np.empty((0,), dtype=np.float32),
+            "corr_per_dim": np.empty((0,), dtype=np.float32),
+            "rmse_mean": np.nan,
+            "corr_mean": np.nan,
+        }
+
+    true_arr = np.stack(true_list, axis=0).astype(np.float32, copy=False)
+    recon_arr = np.stack(recon_list, axis=0).astype(np.float32, copy=False)
+    err = recon_arr - true_arr
+    rmse_per_dim = np.sqrt(np.mean(err ** 2, axis=(0, 1))).astype(np.float32, copy=False)
+    mae_per_dim = np.mean(np.abs(err), axis=(0, 1)).astype(np.float32, copy=False)
+    corr = []
+    for j in range(true_arr.shape[-1]):
+        y_true = true_arr[:, :, j].reshape(-1)
+        y_pred = recon_arr[:, :, j].reshape(-1)
+        if y_true.size < 2 or np.std(y_true) < 1e-8 or np.std(y_pred) < 1e-8:
+            corr.append(np.nan)
+        else:
+            corr.append(float(np.corrcoef(y_true, y_pred)[0, 1]))
+    corr_per_dim = np.asarray(corr, dtype=np.float32)
+    return {
+        "overlay_true": overlay_true,
+        "overlay_recon": overlay_recon,
+        "rmse_per_dim": rmse_per_dim,
+        "mae_per_dim": mae_per_dim,
+        "corr_per_dim": corr_per_dim,
+        "rmse_mean": _finite_mean(rmse_per_dim),
+        "corr_mean": _finite_mean(corr_per_dim),
+    }
+
+
+def _plot_reconstruction_overlay(
+    true_arr: np.ndarray,
+    recon_arr: np.ndarray,
+    objective_names: Sequence[str],
+    out_path: Path,
+) -> None:
+    if true_arr.size == 0 or recon_arr.size == 0:
+        return
+    n_obj = true_arr.shape[-1]
+    obj = 0
+    y_true = true_arr[:, obj]
+    y_recon = recon_arr[:, obj]
+    x = np.arange(1, y_true.shape[0] + 1)
+    label = objective_names[obj] if obj < len(objective_names) else f"y{obj}"
+    plt.figure(figsize=(9, 4))
+    plt.plot(x, y_true, linewidth=2.0, label=f"{label} true")
+    plt.plot(x, y_recon, linewidth=1.8, linestyle="--", label=f"{label} recon")
+    plt.xlabel("Timestep")
+    plt.ylabel("Objective Value")
+    plt.title("Reconstruction Sanity (Observe Mode)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140)
+    plt.close()
 
 
 def _compute_latent_kl_windows(
@@ -341,7 +752,30 @@ def main():
         else prob_eval_cfg.get("sigma_scale", 1.0)
     )
     sigma_scale = float(max(1e-6, sigma_scale))
-    interval_levels = (0.5, 0.8, 0.9, 0.95)
+
+    coverage_table_levels_cfg = prob_eval_cfg.get(
+        "coverage_table_levels",
+        [0.5, 0.8, 0.9, 0.95],
+    )
+    coverage_table_levels = tuple(
+        sorted({float(x) for x in coverage_table_levels_cfg if 0.0 < float(x) < 1.0})
+    )
+    if not coverage_table_levels:
+        coverage_table_levels = (0.5, 0.8, 0.9, 0.95)
+
+    calibration_levels_cfg = prob_eval_cfg.get(
+        "calibration_levels",
+        [round(v, 2) for v in np.arange(0.50, 1.00, 0.01)],
+    )
+    calibration_levels = tuple(
+        sorted({float(x) for x in calibration_levels_cfg if 0.0 < float(x) < 1.0})
+    )
+    if not calibration_levels:
+        calibration_levels = tuple(round(v, 2) for v in np.arange(0.50, 1.00, 0.01))
+
+    interval_levels = tuple(
+        sorted(set(coverage_table_levels) | set(calibration_levels))
+    )
 
     open_curves = open_loop_evaluate(
         model=model,
@@ -374,6 +808,9 @@ def main():
     inter_objective_index: Optional[int] = (
         int(inter_cfg["objective_index"]) if inter_cfg.get("objective_index", None) is not None else None
     )
+    inter_exogenous_index: Optional[int] = (
+        int(inter_cfg["exogenous_index"]) if inter_cfg.get("exogenous_index", None) is not None else None
+    )
     expected_sign_raw = inter_cfg.get("expected_direction_sign", None)
     expected_sign: Optional[float]
     if expected_sign_raw is None:
@@ -381,6 +818,16 @@ def main():
     else:
         exp = float(expected_sign_raw)
         expected_sign = 1.0 if exp >= 0.0 else -1.0
+    inter_direction_n_windows = int(inter_cfg.get("direction_n_windows", 100))
+    inter_exogenous_step_size = float(inter_cfg.get("exogenous_step_size", inter_cfg.get("control_step_size", 1.0)))
+    inter_sensitivity_threshold_ratio = float(inter_cfg.get("sensitivity_threshold_ratio", 0.01))
+    inter_irrelevance_pairs = inter_cfg.get("control_irrelevance_pairs", [])
+    inter_irrelevance_tol_ratio = float(inter_cfg.get("irrelevance_tolerance_ratio", 0.05))
+    inter_irrelevance_tol_abs = float(inter_cfg.get("irrelevance_tolerance_abs", 1e-4))
+    inter_extreme_sigma = float(inter_cfg.get("extreme_sigma", 3.0))
+    inter_extreme_widen_ratio = float(inter_cfg.get("extreme_widen_ratio", 1.2))
+    inter_extreme_min_std_ratio = float(inter_cfg.get("extreme_min_std_ratio", 0.05))
+    inter_extreme_min_std_abs = float(inter_cfg.get("extreme_min_std_abs", 1e-4))
 
     intervention = interventional_evaluate(
         model=model,
@@ -393,6 +840,33 @@ def main():
         control_step_size=float(inter_cfg.get("control_step_size", 1.0)),
         control_index=inter_control_index,
         objective_index=inter_objective_index,
+        device=device,
+        denormalize=True,
+    )
+    intervention_suite = interventional_suite_evaluate(
+        model=model,
+        dataset=dataset,
+        warmup_len=warmup_len,
+        horizon=horizon,
+        n_windows=n_windows,
+        n_samples=mc_samples,
+        control_index=inter_control_index,
+        objective_index=inter_objective_index,
+        exogenous_index=inter_exogenous_index,
+        expected_direction_sign=expected_sign,
+        direction_n_windows=inter_direction_n_windows,
+        control_step_size=float(inter_cfg.get("control_step_size", 1.0)),
+        exogenous_step_size=inter_exogenous_step_size,
+        sensitivity_threshold_ratio=inter_sensitivity_threshold_ratio,
+        irrelevance_pairs=inter_irrelevance_pairs,
+        irrelevance_tolerance_ratio=inter_irrelevance_tol_ratio,
+        irrelevance_tolerance_abs=inter_irrelevance_tol_abs,
+        extreme_sigma=inter_extreme_sigma,
+        extreme_widen_ratio=inter_extreme_widen_ratio,
+        extreme_min_std_ratio=inter_extreme_min_std_ratio,
+        extreme_min_std_abs=inter_extreme_min_std_abs,
+        sigma_scale=sigma_scale,
+        random_seed=seed,
         device=device,
         denormalize=True,
     )
@@ -415,10 +889,63 @@ def main():
         device=device,
     )
     mean_test_kl = _finite_mean(kl_window_means)
+    training_prob_cfg = config.get("training", {}).get("probabilistic", {}) or {}
+    free_nats = float(training_prob_cfg.get("kl_free_bits", 1.0))
+    kl_above_free_ratio = float(
+        np.mean((kl_per_timestep > free_nats).astype(np.float32))
+    ) if kl_per_timestep.size > 0 else np.nan
+    kl_timestep_mean = _finite_mean(kl_per_timestep)
+    kl_timestep_std = float(np.nanstd(kl_per_timestep)) if kl_per_timestep.size > 0 else np.nan
+    free_tol = 0.10 * max(abs(free_nats), 1e-6)
+    kl_flat_at_free = bool(
+        np.isfinite(kl_timestep_mean)
+        and np.isfinite(kl_timestep_std)
+        and abs(kl_timestep_mean - free_nats) <= free_tol
+        and kl_timestep_std <= free_tol
+    )
+
+    traversal_start = int(open_curves.get("starts", np.asarray([0], dtype=np.int64))[0]) if len(open_curves.get("starts", [])) > 0 else 0
+    latent_traversal = _latent_traversal(
+        model=model,
+        dataset=dataset,
+        warmup_len=warmup_len,
+        start_idx=traversal_start,
+        device=device,
+    )
+    reconstruction = _reconstruction_sanity(
+        model=model,
+        dataset=dataset,
+        warmup_len=warmup_len,
+        horizon=horizon,
+        n_windows=max(1, n_windows),
+        device=device,
+    )
 
     # Persist metrics.
-    _save_horizon_csv(out_dir / "open_loop_horizon_metrics.csv", open_curves, interval_levels)
-    _save_horizon_csv(out_dir / "closed_loop_horizon_metrics.csv", closed_curves, interval_levels)
+    _save_horizon_csv(out_dir / "open_loop_horizon_metrics.csv", open_curves, coverage_table_levels)
+    _save_horizon_csv(out_dir / "closed_loop_horizon_metrics.csv", closed_curves, coverage_table_levels)
+    _save_selected_horizons_csv(out_dir / "open_loop_horizons_1_5_10_20.csv", open_curves)
+    _save_selected_horizons_csv(out_dir / "closed_loop_horizons_1_5_10_20.csv", closed_curves)
+    _save_per_objective_horizon_csv(
+        out_dir / "open_loop_per_objective_horizon_metrics.csv",
+        open_curves,
+        output_cols,
+    )
+    _save_per_objective_horizon_csv(
+        out_dir / "closed_loop_per_objective_horizon_metrics.csv",
+        closed_curves,
+        output_cols,
+    )
+    _save_per_objective_summary_csv(
+        out_dir / "open_loop_per_objective_summary.csv",
+        open_curves,
+        output_cols,
+    )
+    _save_per_objective_summary_csv(
+        out_dir / "closed_loop_per_objective_summary.csv",
+        closed_curves,
+        output_cols,
+    )
 
     inter_df = pd.DataFrame({
         "horizon": np.arange(1, len(intervention["delta_abs"]) + 1),
@@ -428,14 +955,140 @@ def main():
         "direction_score_aligned": direction_curve_aligned,
     })
     inter_df.to_csv(out_dir / "interventional_metrics.csv", index=False)
+    _save_records_csv(
+        out_dir / "interventional_control_sensitivity_windows.csv",
+        intervention_suite["control_sensitivity"]["window_rows"],
+    )
+    _save_trajectory_means_csv(
+        out_dir / "interventional_control_sensitivity_trajectories.csv",
+        intervention_suite["control_sensitivity"]["trajectory_means"],
+        output_cols,
+    )
+    _save_records_csv(
+        out_dir / "interventional_direction_check_windows.csv",
+        intervention_suite["direction_check"]["window_rows"],
+    )
+    _save_records_csv(
+        out_dir / "interventional_exogenous_sensitivity_windows.csv",
+        intervention_suite["exogenous_sensitivity"]["window_rows"],
+    )
+    _save_trajectory_means_csv(
+        out_dir / "interventional_exogenous_sensitivity_trajectories.csv",
+        intervention_suite["exogenous_sensitivity"]["trajectory_means"],
+        output_cols,
+    )
+    _save_records_csv(
+        out_dir / "interventional_control_irrelevance_windows.csv",
+        intervention_suite["control_irrelevance"]["rows"],
+    )
+    _save_records_csv(
+        out_dir / "interventional_control_irrelevance_summary.csv",
+        intervention_suite["control_irrelevance"]["summary"],
+    )
+    _save_records_csv(
+        out_dir / "interventional_extreme_control_windows.csv",
+        intervention_suite["extreme_control"]["window_rows"],
+    )
 
-    cal_df = _calibration_summary(open_curves, interval_levels)
+    coverage_open_df = _coverage_table(open_curves, coverage_table_levels, split="open_loop")
+    coverage_closed_df = _coverage_table(closed_curves, coverage_table_levels, split="closed_loop")
+    coverage_df = pd.concat([coverage_open_df, coverage_closed_df], ignore_index=True)
+    coverage_df.to_csv(out_dir / "coverage_table.csv", index=False)
+
+    sharpness_df = pd.concat(
+        [
+            _sharpness_summary(open_curves, split="open_loop"),
+            _sharpness_summary(closed_curves, split="closed_loop"),
+        ],
+        ignore_index=True,
+    )
+    sharpness_df.to_csv(out_dir / "sharpness_summary.csv", index=False)
+
+    cal_df = _calibration_summary(open_curves, calibration_levels)
     cal_df.to_csv(out_dir / "calibration_curve.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "timestep": np.arange(1, len(kl_per_timestep) + 1),
+            "kl": kl_per_timestep,
+        }
+    ).to_csv(out_dir / "latent_kl_per_timestep.csv", index=False)
+    pd.DataFrame(
+        {
+            "window_index": np.arange(1, len(kl_window_means) + 1),
+            "kl_mean": kl_window_means,
+        }
+    ).to_csv(out_dir / "latent_kl_per_window.csv", index=False)
+
+    traversal_rows = []
+    traversal_vals = np.asarray(latent_traversal.get("trajectory", np.empty((0, 0))), dtype=np.float32)
+    traversal_deltas = np.asarray(latent_traversal.get("deltas_sigma", np.empty((0,))), dtype=np.float32)
+    if traversal_vals.ndim == 2 and traversal_deltas.ndim == 1 and traversal_vals.shape[0] == traversal_deltas.shape[0]:
+        for i in range(traversal_vals.shape[0]):
+            for j in range(traversal_vals.shape[1]):
+                traversal_rows.append(
+                    {
+                        "delta_sigma": float(traversal_deltas[i]),
+                        "objective_index": int(j),
+                        "objective": output_cols[j] if j < len(output_cols) else f"y{j}",
+                        "value": float(traversal_vals[i, j]),
+                        "latent_dim": int(latent_traversal.get("latent_dim", -1)),
+                        "latent_sigma": float(latent_traversal.get("latent_sigma", np.nan)),
+                    }
+                )
+    pd.DataFrame(traversal_rows).to_csv(out_dir / "latent_traversal.csv", index=False)
+
+    recon_rmse = np.asarray(reconstruction.get("rmse_per_dim", np.empty((0,))), dtype=np.float32)
+    recon_mae = np.asarray(reconstruction.get("mae_per_dim", np.empty((0,))), dtype=np.float32)
+    recon_corr = np.asarray(reconstruction.get("corr_per_dim", np.empty((0,))), dtype=np.float32)
+    recon_rows = []
+    for j in range(recon_rmse.shape[0]):
+        recon_rows.append(
+            {
+                "objective_index": int(j),
+                "objective": output_cols[j] if j < len(output_cols) else f"y{j}",
+                "rmse": float(recon_rmse[j]),
+                "mae": float(recon_mae[j]) if j < recon_mae.shape[0] else np.nan,
+                "corr": float(recon_corr[j]) if j < recon_corr.shape[0] else np.nan,
+            }
+        )
+    pd.DataFrame(recon_rows).to_csv(out_dir / "reconstruction_summary.csv", index=False)
+
+    overlay_true = np.asarray(reconstruction.get("overlay_true", np.empty((0, 0))), dtype=np.float32)
+    overlay_recon = np.asarray(reconstruction.get("overlay_recon", np.empty((0, 0))), dtype=np.float32)
+    overlay_rows = []
+    if overlay_true.ndim == 2 and overlay_recon.shape == overlay_true.shape:
+        for t in range(overlay_true.shape[0]):
+            for j in range(overlay_true.shape[1]):
+                overlay_rows.append(
+                    {
+                        "timestep": int(t + 1),
+                        "objective_index": int(j),
+                        "objective": output_cols[j] if j < len(output_cols) else f"y{j}",
+                        "true": float(overlay_true[t, j]),
+                        "recon": float(overlay_recon[t, j]),
+                    }
+                )
+    pd.DataFrame(overlay_rows).to_csv(out_dir / "reconstruction_overlay_series.csv", index=False)
 
     _plot_curve(open_curves.get("rmse", np.empty((0,))), "Open-loop RMSE vs Horizon", "RMSE", out_dir / "open_loop_rmse.png")
     _plot_curve(open_curves.get("crps", np.empty((0,))), "Open-loop CRPS vs Horizon", "CRPS", out_dir / "open_loop_crps.png")
+    _plot_curve(closed_curves.get("rmse", np.empty((0,))), "Closed-loop RMSE vs Horizon", "RMSE", out_dir / "closed_loop_rmse.png")
+    _plot_curve(closed_curves.get("crps", np.empty((0,))), "Closed-loop CRPS vs Horizon", "CRPS", out_dir / "closed_loop_crps.png")
     _plot_curve(open_curves.get("sharpness_90", np.empty((0,))), "Open-loop 90% Interval Width", "Width", out_dir / "open_loop_sharpness90.png")
     _plot_curve(kl_per_timestep, "KL per Timestep (observe)", "KL", out_dir / "latent_kl_per_timestep.png")
+    _plot_latent_traversal(
+        traversal_deltas,
+        traversal_vals,
+        output_cols,
+        out_dir / "latent_traversal.png",
+    )
+    _plot_reconstruction_overlay(
+        overlay_true,
+        overlay_recon,
+        output_cols,
+        out_dir / "reconstruction_overlay.png",
+    )
 
     if not cal_df.empty:
         plt.figure(figsize=(5, 5))
@@ -468,12 +1121,56 @@ def main():
         "horizon": int(horizon),
         "open_loop_horizon_summary": open_hsum,
         "closed_loop_horizon_summary": closed_hsum,
+        "open_loop_per_objective_summary": _per_objective_summary_dict(open_curves, output_cols),
+        "closed_loop_per_objective_summary": _per_objective_summary_dict(closed_curves, output_cols),
+        "coverage_table_levels": list(coverage_table_levels),
+        "calibration_levels": list(calibration_levels),
+        "coverage_table_open_loop": {
+            str(int(round(100 * float(row["nominal"])))): float(row["actual"])
+            for _, row in coverage_open_df.iterrows()
+        },
+        "coverage_table_closed_loop": {
+            str(int(round(100 * float(row["nominal"])))): float(row["actual"])
+            for _, row in coverage_closed_df.iterrows()
+        },
+        "sharpness_90_open_loop_mean": _finite_mean(
+            np.asarray(open_curves.get("sharpness_90", []), dtype=np.float32)
+        ),
+        "sharpness_90_closed_loop_mean": _finite_mean(
+            np.asarray(closed_curves.get("sharpness_90", []), dtype=np.float32)
+        ),
         "sigma_scale": float(sigma_scale),
         "coverage_95_mean": coverage95,
         "open_loop_rmse_h20_over_h1": rmse_ratio_h20_h1,
         "intervention_direction_mean_raw": direction_mean_raw,
         "intervention_direction_mean_aligned": direction_mean_aligned,
         "intervention_expected_sign": expected_sign,
+        "interventional_suite": {
+            "control_sensitivity_diff_rate": intervention_suite["control_sensitivity"]["diff_rate"],
+            "exogenous_sensitivity_diff_rate": intervention_suite["exogenous_sensitivity"]["diff_rate"],
+            "direction_agreement_rate": intervention_suite["direction_check"]["agreement_rate"],
+            "control_irrelevance_overall_pass_rate": intervention_suite["control_irrelevance"]["overall_pass_rate"],
+            "extreme_control_finite_rate": intervention_suite["extreme_control"]["finite_rate"],
+            "extreme_control_widen_rate": intervention_suite["extreme_control"]["widen_rate"],
+            "extreme_control_not_confident_rate": intervention_suite["extreme_control"]["not_confident_rate"],
+        },
+        "latent_space": {
+            "free_nats": float(free_nats),
+            "kl_timestep_mean": kl_timestep_mean,
+            "kl_timestep_std": kl_timestep_std,
+            "kl_positions_above_free_ratio": kl_above_free_ratio,
+            "kl_flat_at_free": bool(kl_flat_at_free),
+            "prior_posterior_kl_mean": mean_test_kl,
+            "prior_posterior_kl_reasonable_range": bool(
+                np.isfinite(mean_test_kl) and 1.0 <= mean_test_kl <= 50.0
+            ),
+            "latent_traversal_dim": int(latent_traversal.get("latent_dim", -1)),
+            "latent_traversal_sigma": float(latent_traversal.get("latent_sigma", np.nan)),
+            "latent_traversal_smoothness_ratio": float(latent_traversal.get("smoothness_ratio", np.nan)),
+            "latent_traversal_effect_range_mean": float(latent_traversal.get("effect_range_mean", np.nan)),
+            "reconstruction_rmse_mean": float(reconstruction.get("rmse_mean", np.nan)),
+            "reconstruction_corr_mean": float(reconstruction.get("corr_mean", np.nan)),
+        },
         "latent_kl_mean": mean_test_kl,
         "latent_kl_window_count": int(kl_window_means.size),
         "latent_kl_window_p25": float(np.nanpercentile(kl_window_means, 25))
@@ -490,6 +1187,52 @@ def main():
                 np.isfinite(direction_mean_aligned)
                 and direction_mean_aligned > 0.0
             ),
+            "control_sensitivity_diff_positive": bool(
+                np.isfinite(float(intervention_suite["control_sensitivity"]["diff_rate"]))
+                and float(intervention_suite["control_sensitivity"]["diff_rate"]) > 0.0
+            ),
+            "exogenous_sensitivity_diff_positive": bool(
+                np.isfinite(float(intervention_suite["exogenous_sensitivity"]["diff_rate"]))
+                and float(intervention_suite["exogenous_sensitivity"]["diff_rate"]) > 0.0
+            ),
+            "direction_agreement_gt_50pct": bool(
+                np.isfinite(float(intervention_suite["direction_check"]["agreement_rate"]))
+                and float(intervention_suite["direction_check"]["agreement_rate"]) >= 0.5
+            ),
+            "extreme_control_finite_all": bool(
+                np.isfinite(float(intervention_suite["extreme_control"]["finite_rate"]))
+                and float(intervention_suite["extreme_control"]["finite_rate"]) >= 1.0
+            ),
+            "extreme_control_widen_majority": bool(
+                np.isfinite(float(intervention_suite["extreme_control"]["widen_rate"]))
+                and float(intervention_suite["extreme_control"]["widen_rate"]) >= 0.5
+            ),
+            "extreme_control_not_confident_majority": bool(
+                np.isfinite(float(intervention_suite["extreme_control"]["not_confident_rate"]))
+                and float(intervention_suite["extreme_control"]["not_confident_rate"]) >= 0.5
+            ),
+            "control_irrelevance_majority_pass": bool(
+                np.isfinite(float(intervention_suite["control_irrelevance"]["overall_pass_rate"]))
+                and float(intervention_suite["control_irrelevance"]["overall_pass_rate"]) >= 0.5
+            ),
+            "latent_kl_most_positions_gt_free": bool(
+                np.isfinite(kl_above_free_ratio) and kl_above_free_ratio >= 0.5
+            ),
+            "latent_kl_not_flat_at_free": bool(not kl_flat_at_free),
+            "prior_posterior_kl_gt_1": bool(np.isfinite(mean_test_kl) and mean_test_kl > 1.0),
+            "prior_posterior_kl_lt_50": bool(np.isfinite(mean_test_kl) and mean_test_kl < 50.0),
+            "latent_traversal_smooth": bool(
+                np.isfinite(float(latent_traversal.get("smoothness_ratio", np.nan)))
+                and float(latent_traversal.get("smoothness_ratio", np.nan)) < 2.0
+            ),
+            "latent_traversal_changes_output": bool(
+                np.isfinite(float(latent_traversal.get("effect_range_mean", np.nan)))
+                and float(latent_traversal.get("effect_range_mean", np.nan)) > 0.0
+            ),
+            "reconstruction_corr_gt_0_9": bool(
+                np.isfinite(float(reconstruction.get("corr_mean", np.nan)))
+                and float(reconstruction.get("corr_mean", np.nan)) >= 0.9
+            ),
         },
     }
     with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
@@ -502,6 +1245,21 @@ def main():
     print(f"  Open RMSE h1/h20 ratio: {rmse_ratio_h20_h1:.4f}" if np.isfinite(rmse_ratio_h20_h1) else "  Open RMSE h1/h20 ratio: nan")
     print(f"  Coverage@95 mean: {coverage95:.4f}" if np.isfinite(coverage95) else "  Coverage@95 mean: nan")
     print(f"  Latent KL mean: {mean_test_kl:.4f}" if np.isfinite(mean_test_kl) else "  Latent KL mean: nan")
+    print(
+        f"  KL>free_nats ratio: {kl_above_free_ratio:.4f}"
+        if np.isfinite(kl_above_free_ratio)
+        else "  KL>free_nats ratio: nan"
+    )
+    print(
+        f"  Latent traversal smoothness: {float(latent_traversal.get('smoothness_ratio', np.nan)):.4f}"
+        if np.isfinite(float(latent_traversal.get("smoothness_ratio", np.nan)))
+        else "  Latent traversal smoothness: nan"
+    )
+    print(
+        f"  Recon corr mean: {float(reconstruction.get('corr_mean', np.nan)):.4f}"
+        if np.isfinite(float(reconstruction.get("corr_mean", np.nan)))
+        else "  Recon corr mean: nan"
+    )
 
 
 if __name__ == "__main__":

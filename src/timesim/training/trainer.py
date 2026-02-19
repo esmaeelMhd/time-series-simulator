@@ -123,6 +123,7 @@ class WorldModelTrainer:
         writer: Optional["SummaryWriter"] = None, # type: ignore
         probabilistic_cfg: Optional[Dict[str, Any]] = None,
         sequence_curriculum_cfg: Optional[Dict[str, Any]] = None,
+        checkpoint_metadata: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
     ):
         self.model = model
@@ -220,7 +221,8 @@ class WorldModelTrainer:
         self.kl_beta_end = float(prob_cfg.get("kl_beta_end", 1.0))
         self.kl_warmup_epochs = max(1, int(prob_cfg.get("kl_warmup_epochs", 1)))
         self.grad_clip_norm = float(prob_cfg.get("grad_clip_norm", 100.0))
-        self.lr_warmup_steps = max(0, int(prob_cfg.get("lr_warmup_steps", 1000)))
+        # Mandatory warmup for stable RSSM optimization.
+        self.lr_warmup_steps = max(1, int(prob_cfg.get("lr_warmup_steps", 1000)))
         self.lr_min_ratio = float(prob_cfg.get("lr_min_ratio", 0.01))
         self.collapse_kl_threshold = float(prob_cfg.get("collapse_kl_threshold", 0.1))
         self.collapse_patience_epochs = max(1, int(prob_cfg.get("collapse_patience_epochs", 3)))
@@ -303,7 +305,7 @@ class WorldModelTrainer:
                     f.write(
                         "epoch,train_loss,val_loss,loss_std,loss_total,recon_nll,kl,kl_raw,aux_nll,"
                         "rollout_nll,rollout_dtw,rollout_total,rollout_weight_eff,"
-                        "rollout_ramp,horizon_schedule,context_len,grad_norm,lr\n"
+                        "rollout_ramp,horizon_schedule,context_len,grad_norm,grad_norm_pre,lr\n"
                     )
         else:
             self.writer = writer
@@ -312,6 +314,7 @@ class WorldModelTrainer:
         # Random number generator for reproducibility
         self.seed = None if seed is None else int(seed)
         self.rng = np.random.default_rng(self.seed)
+        self.checkpoint_metadata: Dict[str, Any] = dict(checkpoint_metadata or {})
 
     def _rollout_schedule(self) -> tuple[int, int, float]:
         """Return (horizon, context_len, ramp_factor) for rollout losses."""
@@ -626,19 +629,22 @@ class WorldModelTrainer:
         
         # Backward pass
         grad_norm_value = float("nan")
+        grad_norm_preclip = float("nan")
         if self.amp_enabled:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             if self.grad_clip_norm > 0:
                 gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-                grad_norm_value = float(gn.detach().item() if torch.is_tensor(gn) else gn)
+                grad_norm_preclip = float(gn.detach().item() if torch.is_tensor(gn) else gn)
+                grad_norm_value = float(min(grad_norm_preclip, self.grad_clip_norm))
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
             if self.grad_clip_norm > 0:
                 gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-                grad_norm_value = float(gn.detach().item() if torch.is_tensor(gn) else gn)
+                grad_norm_preclip = float(gn.detach().item() if torch.is_tensor(gn) else gn)
+                grad_norm_value = float(min(grad_norm_preclip, self.grad_clip_norm))
             self.optimizer.step()
         if self.grad_clip_norm <= 0:
             sq = 0.0
@@ -647,9 +653,11 @@ class WorldModelTrainer:
                     g = p.grad.detach()
                     sq += float(torch.sum(g * g).item())
             grad_norm_value = float(math.sqrt(max(0.0, sq)))
+            grad_norm_preclip = grad_norm_value
 
         if self.is_probabilistic_model and self._last_prob_info is not None:
             self._last_prob_info["grad_norm"] = float(grad_norm_value)
+            self._last_prob_info["grad_norm_pre"] = float(grad_norm_preclip)
             self._last_prob_info["lr"] = float(self.optimizer.param_groups[0].get("lr", float("nan")))
             self._last_prob_info["horizon_schedule"] = float(sched_horizon)
             self._last_prob_info["context_len"] = float(context_len)
@@ -672,6 +680,7 @@ class WorldModelTrainer:
                     "horizon_schedule",
                     "context_len",
                     "grad_norm",
+                    "grad_norm_pre",
                     "lr",
                 ]:
                     if key in self._last_prob_info:
@@ -941,6 +950,7 @@ class WorldModelTrainer:
                 "horizon_schedule": [],
                 "context_len": [],
                 "grad_norm": [],
+                "grad_norm_pre": [],
                 "lr": [],
             }
             
@@ -1013,7 +1023,22 @@ class WorldModelTrainer:
                         for k, v in self.model.state_dict().items()
                     }
                     if checkpoint_target is not None:
-                        torch.save(best_state_dict, checkpoint_target)
+                        best_bundle = {
+                            "epoch": int(epoch),
+                            "checkpoint_label": str(checkpoint_label),
+                            "checkpoint_score": float(checkpoint_score),
+                            "model_state_dict": best_state_dict,
+                            "optimizer_state_dict": self.optimizer.state_dict(),
+                            "trainer_state": {
+                                "global_step": int(self._global_step),
+                                "fit_epochs": int(self._fit_epochs),
+                                "current_epoch": int(self._current_epoch),
+                                "base_lrs": list(self._base_lrs),
+                            },
+                        }
+                        if self.checkpoint_metadata:
+                            best_bundle["metadata"] = self.checkpoint_metadata
+                        torch.save(best_bundle, checkpoint_target)
                         if verbose:
                             if prev_best is None:
                                 print(
@@ -1059,6 +1084,8 @@ class WorldModelTrainer:
                                 "base_lrs": list(self._base_lrs),
                             },
                         }
+                        if self.checkpoint_metadata:
+                            checkpoint_bundle["metadata"] = self.checkpoint_metadata
                         torch.save(checkpoint_bundle, bundle_path)
                         topk_checkpoints.append((float(checkpoint_score), bundle_path))
                         topk_checkpoints.sort(key=lambda x: x[0])
@@ -1146,7 +1173,7 @@ class WorldModelTrainer:
                         f"{_m('recon_nll')},{_m('kl')},{_m('kl_raw')},{_m('aux_nll')},"
                         f"{_m('rollout_nll')},{_m('rollout_dtw')},{_m('rollout_total')},"
                         f"{_m('rollout_weight_eff')},{_m('rollout_ramp')},"
-                        f"{_m('horizon_schedule')},{_m('context_len')},{_m('grad_norm')},{_m('lr')}\n"
+                        f"{_m('horizon_schedule')},{_m('context_len')},{_m('grad_norm')},{_m('grad_norm_pre')},{_m('lr')}\n"
                     )
             
             # Early stopping

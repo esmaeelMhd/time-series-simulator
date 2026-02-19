@@ -10,7 +10,7 @@ models:
     latent_dim: 24
     num_layers: 1
     dropout: 0.10
-    learning_rate: 0.0005
+    learning_rate: 0.0003
     min_scale: 0.02
     use_symlog: true
     min_df: 2.2

@@ -32,6 +32,15 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 
+# Ensure Unicode-safe console output on Windows terminals (cp1252 by default).
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
 from timesim.data.schema import VariableSchema
@@ -290,6 +299,43 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
 
     print(f"  Sampling strategy: {sampling_desc}")
 
+    variable_schema_payload: Dict[str, Any] = {}
+    schema_obj = getattr(train_dataset, "variable_schema", None)
+    if schema_obj is not None and hasattr(schema_obj, "to_groups"):
+        try:
+            variable_schema_payload = dict(schema_obj.to_groups())
+        except Exception:
+            variable_schema_payload = {}
+
+    normalization_stats_payload: Dict[str, Any] = {}
+    scaler_obj = getattr(train_dataset, "scaler", None)
+    if scaler_obj is not None:
+        normalization_stats_payload["scaler_class"] = scaler_obj.__class__.__name__
+        for attr in (
+            "feature_range",
+            "data_min_",
+            "data_max_",
+            "data_range_",
+            "scale_",
+            "min_",
+            "n_features_in_",
+        ):
+            if not hasattr(scaler_obj, attr):
+                continue
+            val = getattr(scaler_obj, attr)
+            if isinstance(val, np.ndarray):
+                normalization_stats_payload[attr] = val.tolist()
+            elif isinstance(val, (list, tuple)):
+                normalization_stats_payload[attr] = list(val)
+            elif isinstance(val, (int, float, str, bool)):
+                normalization_stats_payload[attr] = val
+
+    checkpoint_metadata = {
+        "normalization_stats": normalization_stats_payload,
+        "variable_schema": variable_schema_payload,
+        "config": config,
+    }
+
     trainer = WorldModelTrainer(
         model=model,
         dataset=train_dataset,
@@ -314,6 +360,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         run_dir=model_dir,
         probabilistic_cfg=prob_cfg,
         sequence_curriculum_cfg=tcfg.get("sequence_curriculum", None),
+        checkpoint_metadata=checkpoint_metadata,
         seed=int(config.get("misc", {}).get("seed", 42)),
     )
 
@@ -460,6 +507,41 @@ def _save_model_artifacts(model_dir: Path, dataset, scaler) -> None:
     from joblib import dump
     dump(scaler, model_dir / "scaler.pkl")
     dump(scaler, model_dir / "normalization_stats.pkl")
+
+
+def _log_trainer_metrics_csv(
+    tracker: ExperimentTracker,
+    metrics_path: Path,
+    metric_prefix: str,
+    start_row: int = 0,
+) -> int:
+    """Log detailed trainer metrics (loss terms, LR, grad norm, schedules) to tracker."""
+    if not metrics_path.exists():
+        return int(start_row)
+    try:
+        df = pd.read_csv(metrics_path)
+    except Exception:
+        return int(start_row)
+    if start_row >= len(df):
+        return int(len(df))
+
+    new_rows = df.iloc[int(start_row):]
+    for idx, row in new_rows.iterrows():
+        metrics: Dict[str, float] = {}
+        for col, val in row.items():
+            if col == "epoch":
+                continue
+            if isinstance(val, (int, float)) and np.isfinite(val):
+                metrics[f"{metric_prefix}/{col}"] = float(val)
+        if not metrics:
+            continue
+        epoch_val = row.get("epoch", np.nan)
+        if isinstance(epoch_val, (int, float)) and np.isfinite(epoch_val):
+            step = int(epoch_val)
+        else:
+            step = int(idx + 1)
+        tracker.log_metrics(metrics, step=step)
+    return int(len(df))
 
 
 def _build_simulation_start_idx_schedule(
@@ -831,6 +913,7 @@ def main():
     cumul_val_losses = {}
     cumul_time = {}
     model_last_round = {}
+    trainer_metric_row_offsets: Dict[str, int] = {}
 
     for round_cfg in training_rounds:
         round_name = round_cfg.get("name", "train")
@@ -1030,6 +1113,12 @@ def main():
                         training_overrides=train_overrides,
                         checkpoint_path=model_dir / f"{round_name}_checkpoint.pth",
                         checkpoint_callback=checkpoint_callback,
+                    )
+                    trainer_metric_row_offsets[model_type] = _log_trainer_metrics_csv(
+                        tracker=tracker,
+                        metrics_path=model_dir / "metrics.csv",
+                        metric_prefix=f"{model_type}/{round_name}",
+                        start_row=trainer_metric_row_offsets.get(model_type, 0),
                     )
                 else:
                     train_losses, val_losses = train_xgboost_model(
