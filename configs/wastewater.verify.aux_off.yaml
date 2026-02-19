@@ -13,5 +13,6 @@ models:
     learning_rate: 0.0005
     min_df: 2.2
     use_aux_decoder: false
+    allow_disable_aux_decoder_for_ablation: true
     use_dual_path: true
     leak_objective_to_transition: false

@@ -65,6 +65,26 @@ python scripts/train_hydra.py base_config=configs/wastewater.yaml overrides.trai
 python scripts/train_lightning.py --config configs/wastewater.yaml --model latent_ssm
 ```
 
+## Repository Layout
+
+Source code now follows `src/` layout:
+
+- `src/timesim/data`: schema, datasets, preprocessing, datamodule
+- `src/timesim/models`: RSSM/world-model components and model factory
+- `src/timesim/training`: losses, trainer, Lightning wrapper
+- `src/timesim/evaluation`: rollout/interventional evaluation and metrics
+- `src/timesim/serving`: FastAPI + simulator wrappers + dashboard launcher
+- `src/timesim/optimization`: Optuna wrapper
+- `src/timesim/utils`: common helpers including `symlog`
+
+Config groups are organized under `configs/`:
+
+- `configs/config.yaml`
+- `configs/model/*.yaml`
+- `configs/training/*.yaml`
+- `configs/data/*.yaml`
+- `configs/serving/*.yaml`
+
 ### Requirements
 
 - Python >= 3.10

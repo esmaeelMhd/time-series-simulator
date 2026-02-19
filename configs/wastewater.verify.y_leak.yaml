@@ -15,3 +15,4 @@ models:
     use_aux_decoder: true
     use_dual_path: true
     leak_objective_to_transition: true
+    allow_objective_leak_for_ablation: true

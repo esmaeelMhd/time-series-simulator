@@ -9,9 +9,11 @@ import torch
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
 from timesim.models.factory import build_model
 from timesim.lightning import WorldModelLightningModule
+from timesim.utils.misc import seed_everything, resolve_device
 
 
 def parse_args():
@@ -29,7 +31,12 @@ def main():
     if args.device:
         cfg.setdefault("misc", {})
         cfg["misc"]["device"] = args.device
-    device = cfg.get("misc", {}).get("device", "cpu")
+    seed = int(cfg.get("misc", {}).get("seed", 42))
+    deterministic = bool(cfg.get("misc", {}).get("deterministic", False))
+    seed_everything(seed, deterministic=deterministic)
+    device = resolve_device(cfg.get("misc", {}).get("device", "auto"))
+    cfg.setdefault("misc", {})
+    cfg["misc"]["device"] = device
 
     dcfg = cfg["dataset"]
     data_cfg = cfg.get("data", {})
@@ -38,6 +45,7 @@ def main():
     batch_size = int(dcfg["batch_size"])
 
     groups = dcfg["variables"]
+    schema = VariableSchema.from_groups(groups)
     input_groups = cfg["model_io"]["input_groups"]
     output_groups = cfg["model_io"]["output_groups"]
 
@@ -49,6 +57,7 @@ def main():
     df = load_csv_dataset(
         dcfg["csv"],
         index_col=dcfg.get("index_col", data_cfg.get("index_col", "date")),
+        parse_dates=bool(data_cfg.get("parse_dates", True)),
         slice_cfg=dcfg.get("slice"),
         engine=str(data_cfg.get("csv_engine", "pandas")),
         validation_cfg=data_cfg.get("validation", None),
@@ -61,14 +70,18 @@ def main():
         seq_len=seq_len,
         pred_len=pred_len,
         batch_size=batch_size,
-        train_split=dcfg.get("train_split", data_cfg.get("train_split", 0.8)),
+        train_split=dcfg.get("train_split", data_cfg.get("train_split", 0.7)),
+        split_cfg=data_cfg.get("splits", None),
+        seed=seed,
+        shuffle_train=bool(data_cfg.get("shuffle_train", True)),
+        drop_last=bool(data_cfg.get("drop_last", True)),
         add_time=add_time,
         time_features_cfg=tf_cfg,
         require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
 
-    input_cols = sum((groups[g] for g in input_groups), [])
-    output_cols = sum((groups[g] for g in output_groups), [])
+    input_cols = schema.columns_for_group_names(input_groups)
+    output_cols = schema.columns_for_group_names(output_groups)
     input_dim = len(set(input_cols) | set(output_cols))
     if add_time:
         input_dim += len(

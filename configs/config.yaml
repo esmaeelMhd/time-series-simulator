@@ -1,0 +1,20 @@
+defaults:
+  - model: rssm_base
+  - training: default
+  - data: default
+  - serving: default
+  - _self_
+
+# Bridge to the existing non-Hydra config chain used by scripts/train.py.
+base_config: configs/wastewater.yaml
+
+# Optional deep overrides merged by scripts/train_hydra.py.
+overrides: {}
+
+# Optional CLI passthrough knobs for scripts/train.py.
+models: null
+epochs: null
+steps_per_epoch: null
+device: null
+seed: null
+deterministic: null

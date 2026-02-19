@@ -48,8 +48,10 @@ import yaml
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
 from timesim.utils.plotting import save_forecast_plot
+from timesim.utils.misc import seed_everything, resolve_device
 from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
 
 try:
@@ -203,7 +205,7 @@ def parse_args():
                         help="Specific round to load (e.g. 'train', 'retrain'). "
                              "Default: latest available checkpoint.")
     parser.add_argument("--device", type=str, default=None,
-                        help="Override device (cpu / cuda)")
+                        help="Override device (auto / cpu / cuda)")
     parser.add_argument(
         "--use-optuna-best-params",
         dest="use_optuna_best_params",
@@ -268,10 +270,12 @@ def main():
         config.setdefault("training", {})
         config["training"]["optuna_summary_path"] = args.optuna_summary
 
-    seed = config["misc"].get("seed", 42)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    device = config["misc"].get("device", "cpu")
+    seed = int(config["misc"].get("seed", 42))
+    deterministic = bool(config.get("misc", {}).get("deterministic", False))
+    seed_everything(seed, deterministic=deterministic)
+    device = resolve_device(config.get("misc", {}).get("device", "auto"))
+    config.setdefault("misc", {})
+    config["misc"]["device"] = device
 
     model_type = args.model.lower()
 
@@ -287,11 +291,12 @@ def main():
 
     # ── Dimensions ────────────────────────────────────────────────────
     groups = config["dataset"]["variables"]
+    schema = VariableSchema.from_groups(groups)
     input_groups = config["model_io"]["input_groups"]
     output_groups = config["model_io"]["output_groups"]
 
-    input_cols = sum((groups[g] for g in input_groups), [])
-    output_cols = sum((groups[g] for g in output_groups), [])
+    input_cols = schema.columns_for_group_names(input_groups)
+    output_cols = schema.columns_for_group_names(output_groups)
 
     seq_len = config["dataset"]["seq_len"]
     pred_len = config["dataset"]["pred_len"]
@@ -416,7 +421,7 @@ def main():
     index_col = config["dataset"].get("index_col",
                                        data_cfg.get("index_col", "date"))
     train_split = config["dataset"].get("train_split",
-                                         data_cfg.get("train_split", 0.8))
+                                         data_cfg.get("train_split", 0.7))
 
     scaler_path = run_dir / "scaler.pkl"
     if not scaler_path.exists():
@@ -430,6 +435,7 @@ def main():
     df = load_csv_dataset(
         config["dataset"]["csv"],
         index_col=index_col,
+        parse_dates=bool(data_cfg.get("parse_dates", True)),
         slice_cfg=config["dataset"].get("slice"),
         engine=str(data_cfg.get("csv_engine", "pandas")),
         validation_cfg=data_cfg.get("validation", None),
@@ -440,8 +446,17 @@ def main():
         seq_len=seq_len, pred_len=pred_len,
         batch_size=config["dataset"]["batch_size"],
         train_split=train_split,
+        split_cfg=data_cfg.get("splits", None),
         add_time=add_time_features,
         time_features_cfg=time_features_cfg,
+        seed=seed,
+        shuffle_train=bool(data_cfg.get("shuffle_train", True)),
+        drop_last=bool(data_cfg.get("drop_last", True)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        stride=int(data_cfg.get("window_stride", 1)),
+        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
+        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
         existing_scaler=scaler,
         require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )

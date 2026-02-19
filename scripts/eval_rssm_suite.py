@@ -17,9 +17,15 @@ import yaml
 from joblib import load as joblib_load
 
 from timesim.utils.config import load_config
-from timesim.data.loader import load_csv_dataset
+from timesim.data.loader import (
+    load_csv_dataset,
+    resolve_split_ratios,
+    chronological_split_dataframe,
+)
 from timesim.data.dataset import GroupedTimeSeriesDataset
+from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
+from timesim.utils.misc import seed_everything, resolve_device
 from timesim.evaluation import (
     open_loop_evaluate,
     closed_loop_evaluate,
@@ -94,25 +100,31 @@ def _build_test_dataset(config: Dict[str, Any], scaler) -> GroupedTimeSeriesData
     df = load_csv_dataset(
         dcfg["csv"],
         index_col=dcfg.get("index_col", data_cfg.get("index_col", "date")),
+        parse_dates=bool(data_cfg.get("parse_dates", True)),
         slice_cfg=dcfg.get("slice"),
         engine=str(data_cfg.get("csv_engine", "pandas")),
         validation_cfg=data_cfg.get("validation", None),
     )
 
-    train_split = float(dcfg.get("train_split", data_cfg.get("train_split", 0.8)))
     eval_cfg = config.get("evaluation", {}) or {}
     test_split = eval_cfg.get("test_split", None)
     if test_split is None:
-        test_start = max(0, int(len(df) * train_split) - seq_len)
-        print(
-            "Warning: evaluation.test_split is not set; using validation tail as test proxy "
-            f"(start={test_start})."
+        ratios = resolve_split_ratios(
+            split_cfg=data_cfg.get("splits", None),
+            train_split=dcfg.get("train_split", data_cfg.get("train_split", None)),
+            default=(
+                float(data_cfg.get("default_train_ratio", 0.70)),
+                float(data_cfg.get("default_val_ratio", 0.15)),
+                float(data_cfg.get("default_test_ratio", 0.15)),
+            ),
         )
+        _, _, test_df = chronological_split_dataframe(df, split_ratios=ratios)
+        test_start = len(df) - len(test_df)
     else:
         test_split = float(test_split)
         test_count = max(seq_len + pred_len + 1, int(round(len(df) * test_split)))
         test_start = max(0, len(df) - test_count - seq_len)
-    test_df = df.iloc[test_start:].copy()
+        test_df = df.iloc[test_start:].copy()
 
     add_time = bool(data_cfg.get("add_time_features", False))
     tf_cfg = data_cfg.get("time_features", {}) or {}
@@ -251,7 +263,12 @@ def main():
     if args.device:
         config.setdefault("misc", {})
         config["misc"]["device"] = args.device
-    device = config.get("misc", {}).get("device", "cpu")
+    seed = int(config.get("misc", {}).get("seed", 42))
+    deterministic = bool(config.get("misc", {}).get("deterministic", False))
+    seed_everything(seed, deterministic=deterministic)
+    device = resolve_device(config.get("misc", {}).get("device", "auto"))
+    config.setdefault("misc", {})
+    config["misc"]["device"] = device
 
     checkpoint = _resolve_checkpoint(config, args.checkpoint)
     model_dir = checkpoint.resolve().parent
@@ -276,10 +293,11 @@ def main():
 
     dcfg = config["dataset"]
     groups = dcfg["variables"]
+    schema = VariableSchema.from_groups(groups)
     input_groups = config["model_io"]["input_groups"]
     output_groups = config["model_io"]["output_groups"]
-    input_cols = sum((groups[g] for g in input_groups), [])
-    output_cols = sum((groups[g] for g in output_groups), [])
+    input_cols = schema.columns_for_group_names(input_groups)
+    output_cols = schema.columns_for_group_names(output_groups)
     input_dim = len(set(input_cols) | set(output_cols))
 
     data_cfg = config.get("data", {})

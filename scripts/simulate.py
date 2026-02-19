@@ -22,7 +22,9 @@ import yaml
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset
 from timesim.data.dataset import GroupedTimeSeriesDataset
+from timesim.data.schema import VariableSchema
 from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
+from timesim.utils.misc import seed_everything, resolve_device
 
 try:
     from timesim.models.xgboost_model import XGBoostForecaster
@@ -69,7 +71,7 @@ def parse_args():
     parser.add_argument("--round", type=str, default=None,
                         help="Checkpoint round name to load (default: latest)")
     parser.add_argument("--device", type=str, default=None,
-                        help="Override device (cpu / cuda)")
+                        help="Override device (auto / cpu / cuda)")
 
     sim_grp = parser.add_argument_group("simulation")
     sim_grp.add_argument("--horizon", type=int, default=None,
@@ -97,10 +99,12 @@ def main():
     if args.device:
         config["misc"]["device"] = args.device
 
-    seed = args.seed if args.seed is not None else config["misc"].get("seed", 42)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    device = config["misc"].get("device", "cpu")
+    seed = int(args.seed if args.seed is not None else config["misc"].get("seed", 42))
+    deterministic = bool(config.get("misc", {}).get("deterministic", False))
+    seed_everything(seed, deterministic=deterministic)
+    device = resolve_device(config.get("misc", {}).get("device", "auto"))
+    config.setdefault("misc", {})
+    config["misc"]["device"] = device
 
     model_type = args.model.lower()
 
@@ -116,11 +120,12 @@ def main():
 
     # ── Dimensions / groups ───────────────────────────────────────────
     groups = config["dataset"]["variables"]
+    schema = VariableSchema.from_groups(groups)
     input_groups = config["model_io"]["input_groups"]
     output_groups = config["model_io"]["output_groups"]
 
-    input_cols = sum((groups[g] for g in input_groups), [])
-    output_cols = sum((groups[g] for g in output_groups), [])
+    input_cols = schema.columns_for_group_names(input_groups)
+    output_cols = schema.columns_for_group_names(output_groups)
 
     seq_len = config["dataset"]["seq_len"]
     pred_len = config["dataset"]["pred_len"]
@@ -196,6 +201,7 @@ def main():
     df = load_csv_dataset(
         config["dataset"]["csv"],
         index_col=index_col,
+        parse_dates=bool(data_cfg.get("parse_dates", True)),
         slice_cfg=slice_cfg,
         engine=str(data_cfg.get("csv_engine", "pandas")),
         validation_cfg=data_cfg.get("validation", None),
@@ -209,6 +215,10 @@ def main():
         seq_len=seq_len,
         pred_len=pred_len,
         scaler=scaler,
+        stride=int(data_cfg.get("window_stride", 1)),
+        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
+        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
+        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
 
     n_total = len(dataset_full.values)

@@ -399,6 +399,7 @@ def test_latent_ssm_aux_decoder_ablation_returns_zero_aux():
         hidden_dim=16,
         latent_dim=8,
         use_aux_decoder=False,
+        allow_disable_aux_decoder_for_ablation=True,
     )
     model.eval()
     controls = torch.randn(2, 6, 2)

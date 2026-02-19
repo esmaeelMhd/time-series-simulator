@@ -34,6 +34,7 @@ matplotlib.use("Agg")
 
 from timesim.utils.config import load_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
 from timesim.data.sampling import (
     RandomStartFixedHorizon,
@@ -43,9 +44,15 @@ from timesim.data.sampling import (
     StrideBasedSampling,
 )
 from timesim.training import WorldModelTrainer
+from timesim.training.safety import (
+    merged_latent_ssm_params,
+    merged_probabilistic_cfg,
+    validate_latent_ssm_do_not,
+)
 from timesim.utils.plotting import save_loss_plot, save_forecast_plot
 from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
 from timesim.utils.tracking import ExperimentTracker
+from timesim.utils.misc import seed_everything, resolve_device
 
 # Shared eval / simulation utilities  (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -307,6 +314,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
         run_dir=model_dir,
         probabilistic_cfg=prob_cfg,
         sequence_curriculum_cfg=tcfg.get("sequence_curriculum", None),
+        seed=int(config.get("misc", {}).get("seed", 42)),
     )
 
     train_losses, val_losses = trainer.fit(
@@ -442,7 +450,7 @@ def train_xgboost_model(model, train_dataset, val_dataset, config, model_dir):
 
 
 def _save_model_artifacts(model_dir: Path, dataset, scaler) -> None:
-    """Save schema and scaler next to model checkpoints."""
+    """Save schema and normalization stats next to model checkpoints."""
     model_dir.mkdir(parents=True, exist_ok=True)
     schema = getattr(dataset, "variable_schema", None)
     if schema is not None:
@@ -451,6 +459,7 @@ def _save_model_artifacts(model_dir: Path, dataset, scaler) -> None:
 
     from joblib import dump
     dump(scaler, model_dir / "scaler.pkl")
+    dump(scaler, model_dir / "normalization_stats.pkl")
 
 
 def _build_simulation_start_idx_schedule(
@@ -528,7 +537,7 @@ def parse_args():
     parser.add_argument("--steps-per-epoch", type=int,
                         help="Override steps per epoch for all rounds")
     parser.add_argument("--device", type=str,
-                        help="Override device (cpu / cuda)")
+                        help="Override device (auto / cpu / cuda)")
     parser.add_argument(
         "--use-optuna-best-params",
         dest="use_optuna_best_params",
@@ -571,10 +580,12 @@ def main():
         config.setdefault("training", {})
         config["training"]["optuna_summary_path"] = args.optuna_summary
 
-    seed = config["misc"].get("seed", 42)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    device = config["misc"].get("device", "cpu")
+    seed = int(config["misc"].get("seed", 42))
+    deterministic = bool(config.get("misc", {}).get("deterministic", False))
+    seed_everything(seed, deterministic=deterministic)
+    device = resolve_device(config.get("misc", {}).get("device", "auto"))
+    config.setdefault("misc", {})
+    config["misc"]["device"] = device
 
     # ── Config sub-dicts ──────────────────────────────────────────────
     tcfg = config.get("training", {})
@@ -603,13 +614,36 @@ def main():
     else:
         model_names = [config.get("model", {}).get("type", "lstm")]
 
+    # Enforce RSSM "DO NOT" policy upfront for selected models.
+    for model_name in model_names:
+        if model_name != "latent_ssm":
+            continue
+        per_model_cfg = models_cfg_map.get(model_name, {"type": model_name})
+        effective_model = merged_latent_ssm_params(
+            model_defaults_cfg=model_defaults_cfg,
+            per_model_cfg=per_model_cfg,
+            model_overrides=None,
+        )
+        effective_prob = merged_probabilistic_cfg(
+            training_cfg=tcfg,
+            training_overrides=None,
+        )
+        validate_latent_ssm_do_not(
+            model_name=model_name,
+            model_params=effective_model,
+            prob_cfg=effective_prob,
+            data_cfg=data_cfg,
+            context="base_config",
+        )
+
     # ── Dimension setup ───────────────────────────────────────────────
     groups = config["dataset"]["variables"]
+    schema = VariableSchema.from_groups(groups)
     input_groups = config["model_io"]["input_groups"]
     output_groups = config["model_io"]["output_groups"]
 
-    input_cols = sum((groups[g] for g in input_groups), [])
-    output_cols = sum((groups[g] for g in output_groups), [])
+    input_cols = schema.columns_for_group_names(input_groups)
+    output_cols = schema.columns_for_group_names(output_groups)
 
     seq_len = config["dataset"]["seq_len"]
     pred_len = config["dataset"]["pred_len"]
@@ -743,12 +777,13 @@ def main():
     index_col = config["dataset"].get("index_col",
                                        data_cfg.get("index_col", "date"))
     train_split = config["dataset"].get("train_split",
-                                         data_cfg.get("train_split", 0.8))
+                                         data_cfg.get("train_split", 0.7))
 
     print("Loading dataset...")
     df = load_csv_dataset(
         config["dataset"]["csv"],
         index_col=index_col,
+        parse_dates=bool(data_cfg.get("parse_dates", True)),
         slice_cfg=config["dataset"].get("slice"),
         engine=str(data_cfg.get("csv_engine", "pandas")),
         validation_cfg=data_cfg.get("validation", None),
@@ -760,8 +795,17 @@ def main():
         seq_len=seq_len, pred_len=pred_len,
         batch_size=config["dataset"]["batch_size"],
         train_split=train_split,
+        split_cfg=data_cfg.get("splits", None),
         add_time=add_time_features,
         time_features_cfg=time_features_cfg,
+        seed=seed,
+        shuffle_train=bool(data_cfg.get("shuffle_train", True)),
+        drop_last=bool(data_cfg.get("drop_last", True)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        stride=int(data_cfg.get("window_stride", 1)),
+        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
+        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
         require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
     )
 
@@ -775,6 +819,7 @@ def main():
     from joblib import dump
     scaler_path = out_dir / "scaler.pkl"
     dump(scaler, scaler_path)
+    dump(scaler, out_dir / "normalization_stats.pkl")
     print(f"  Saved scaler -> {scaler_path}")
 
     # ══════════════════════════════════════════════════════════════════
@@ -830,6 +875,24 @@ def main():
                 print(
                     f"  Optuna overrides for {model_type}: "
                     f"model={model_overrides} training={train_overrides}"
+                )
+
+            if model_type == "latent_ssm":
+                effective_model = merged_latent_ssm_params(
+                    model_defaults_cfg=model_defaults_cfg,
+                    per_model_cfg=mc,
+                    model_overrides=model_overrides,
+                )
+                effective_prob = merged_probabilistic_cfg(
+                    training_cfg=tcfg,
+                    training_overrides=train_overrides,
+                )
+                validate_latent_ssm_do_not(
+                    model_name=model_type,
+                    model_params=effective_model,
+                    prob_cfg=effective_prob,
+                    data_cfg=data_cfg,
+                    context=f"round={round_name}",
                 )
 
             # ── Decide: new model, resume in-memory, or load checkpoint ──

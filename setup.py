@@ -35,7 +35,8 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/time-series-simulator",
-    packages=find_packages(exclude=["tests", "examples", "docs"]),
+    packages=find_packages(where="src", exclude=["tests", "examples", "docs"]),
+    package_dir={"": "src"},
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",

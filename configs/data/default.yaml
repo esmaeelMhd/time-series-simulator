@@ -1,0 +1,29 @@
+csv_engine: pandas
+train_split: 0.7
+splits:
+  train: 0.70
+  val: 0.15
+  test: 0.15
+default_train_ratio: 0.70
+default_val_ratio: 0.15
+default_test_ratio: 0.15
+shuffle_train: true
+drop_last: true
+batch_size: 32
+num_workers: 0
+pin_memory: false
+window_stride: 1
+shuffle_within_window: false
+index_col: date
+require_full_role_mapping: true
+validation:
+  enabled: true
+  strict: false
+  require_datetime_index: true
+  require_monotonic_index: true
+  require_numeric_dtypes: true
+  allow_nan: false
+  coerce_numeric: false
+symlog:
+  enabled: false
+  columns: null

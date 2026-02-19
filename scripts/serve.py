@@ -11,6 +11,8 @@ from joblib import load
 
 from timesim.utils.config import load_config
 from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
+from timesim.data.schema import VariableSchema
+from timesim.utils.misc import resolve_device
 from timesim.models.factory import build_model
 from timesim.serving import create_app
 from timesim.simulator import RSSMSimulator
@@ -41,7 +43,7 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--device", type=str, default="auto")
     p.add_argument("--session-ttl", type=int, default=3600)
     p.add_argument("--sigma-scale", type=float, default=None)
     return p.parse_args()
@@ -50,6 +52,8 @@ def parse_args():
 def main():
     args = parse_args()
     config = load_config(args.config)
+    device = resolve_device(args.device if args.device is not None else config.get("misc", {}).get("device", "auto"))
+    seed = int(config.get("misc", {}).get("seed", 42))
 
     dcfg = config["dataset"]
     data_cfg = config.get("data", {})
@@ -58,6 +62,7 @@ def main():
     if isinstance(tf_cfg, dict) and "enabled" in tf_cfg:
         add_time = bool(tf_cfg.get("enabled")) or add_time
     groups = dcfg["variables"]
+    schema = VariableSchema.from_groups(groups)
     input_groups = config["model_io"]["input_groups"]
     output_groups = config["model_io"]["output_groups"]
 
@@ -65,14 +70,15 @@ def main():
     pred_len = int(dcfg["pred_len"])
     batch_size = int(dcfg["batch_size"])
 
-    input_cols = sum((groups[g] for g in input_groups), [])
-    output_cols = sum((groups[g] for g in output_groups), [])
+    input_cols = schema.columns_for_group_names(input_groups)
+    output_cols = schema.columns_for_group_names(output_groups)
     input_dim = len(set(input_cols) | set(output_cols))
     output_dim = len(output_cols)
 
     df = load_csv_dataset(
         dcfg["csv"],
         index_col=dcfg.get("index_col", data_cfg.get("index_col", "date")),
+        parse_dates=bool(data_cfg.get("parse_dates", True)),
         slice_cfg=dcfg.get("slice"),
         engine=str(data_cfg.get("csv_engine", "pandas")),
         validation_cfg=data_cfg.get("validation", None),
@@ -91,7 +97,16 @@ def main():
         seq_len=seq_len,
         pred_len=pred_len,
         batch_size=batch_size,
-        train_split=dcfg.get("train_split", data_cfg.get("train_split", 0.8)),
+        train_split=dcfg.get("train_split", data_cfg.get("train_split", 0.7)),
+        split_cfg=data_cfg.get("splits", None),
+        seed=seed,
+        shuffle_train=False,
+        drop_last=bool(data_cfg.get("drop_last", True)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        stride=int(data_cfg.get("window_stride", 1)),
+        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
+        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
         add_time=add_time,
         time_features_cfg=tf_cfg,
         existing_scaler=scaler,
@@ -111,8 +126,8 @@ def main():
         per_model_cfg=latent_cfg,
         model_defaults_cfg=config.get("model_defaults", {}),
     )
-    _load_model_state(model, args.checkpoint, args.device)
-    model.to(args.device)
+    _load_model_state(model, args.checkpoint, device)
+    model.to(device)
     model.eval()
 
     serving_cfg = config.get("serving", {}) or {}
@@ -139,7 +154,7 @@ def main():
         known_exo_positions=dataset.known_exo_positions,
         scaler=dataset.scaler,
         sigma_scale=sigma_scale,
-        device=args.device,
+        device=device,
     )
 
     app = create_app(simulator_template, session_ttl_seconds=args.session_ttl)

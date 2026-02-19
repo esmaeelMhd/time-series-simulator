@@ -85,4 +85,4 @@ model_io:
 
 # ---------- misc ----------
 misc:
-  device: cpu
+  device: auto

@@ -71,7 +71,7 @@ if st.button("Initialize Simulator", type="primary"):
             seq_len=int(seq_len),
             pred_len=int(pred_len),
             batch_size=64,
-            train_split=0.8,
+            train_split=0.7,
             add_time=False,
             require_full_role_mapping=True,
         )

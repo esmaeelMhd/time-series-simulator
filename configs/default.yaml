@@ -122,14 +122,29 @@ optimization:
 #  DATA
 # ══════════════════════════════════════════════════════════════════════
 data:
-  train_split: 0.8
+  train_split: 0.7
+  splits:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  default_train_ratio: 0.70
+  default_val_ratio: 0.15
+  default_test_ratio: 0.15
   shuffle_train: true
+  shuffle_within_window: false      # DO-NOT: never shuffle timesteps inside a sequence window
   drop_last: true
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  window_stride: 1
   csv_engine: pandas                 # pandas | polars
   validation:
-    enabled: false                   # optional Pandera validation
+    enabled: true                    # optional Pandera validation
     strict: false                    # if true, require pandera installed
     require_datetime_index: true
+    require_monotonic_index: true
+    require_numeric_dtypes: true
+    allow_nan: false
     required_columns: null
   require_full_role_mapping: true      # require every dataset column be mapped to control/exogenous/objective
   scale: true                        # apply MinMaxScaler
@@ -138,6 +153,9 @@ data:
     enabled: false
     features: [hour]                 # hour | day_of_week | day_of_month | month | day_of_year | week_of_year
     encoding: cyclical               # raw | cyclical | both | onehot
+  symlog:
+    enabled: false
+    columns: null                    # null | all | [col1, col2, ...]
   index_col: date                    # name of datetime index column
   parse_dates: true
 
@@ -196,6 +214,8 @@ model_defaults:
     use_aux_decoder: true
     use_dual_path: true
     leak_objective_to_transition: false
+    allow_objective_leak_for_ablation: false
+    allow_disable_aux_decoder_for_ablation: false
   xgboost:
     n_estimators: 100
     max_depth: 6
@@ -241,5 +261,6 @@ tracking:
 #  MISC
 # ══════════════════════════════════════════════════════════════════════
 misc:
-  device: cpu
+  device: auto
   seed: 42
+  deterministic: false
