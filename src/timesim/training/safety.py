@@ -50,6 +50,12 @@ def validate_latent_ssm_do_not(
     allow_leak = _as_bool(model_params.get("allow_objective_leak_for_ablation", False))
     use_aux = _as_bool(model_params.get("use_aux_decoder", True), default=True)
     allow_no_aux = _as_bool(model_params.get("allow_disable_aux_decoder_for_ablation", False))
+    share_enc = _as_bool(model_params.get("share_encoder_weights", False))
+    allow_share_enc = _as_bool(model_params.get("allow_shared_encoder_for_ablation", False))
+    use_stochastic = _as_bool(model_params.get("use_stochastic_path", True), default=True)
+    allow_no_stochastic = _as_bool(
+        model_params.get("allow_disable_stochastic_for_ablation", False)
+    )
 
     if leak_y and not allow_leak:
         raise ValueError(
@@ -60,6 +66,16 @@ def validate_latent_ssm_do_not(
         raise ValueError(
             f"[{model_name}{where}] DO-NOT violation: auxiliary exogenous decoder cannot be disabled by default. "
             "Set `allow_disable_aux_decoder_for_ablation: true` only for explicit ablation runs."
+        )
+    if share_enc and not allow_share_enc:
+        raise ValueError(
+            f"[{model_name}{where}] DO-NOT violation: shared encoder weights across roles are blocked by default. "
+            "Set `allow_shared_encoder_for_ablation: true` only for explicit ablation runs."
+        )
+    if (not use_stochastic) and (not allow_no_stochastic):
+        raise ValueError(
+            f"[{model_name}{where}] DO-NOT violation: stochastic latent path cannot be disabled by default. "
+            "Set `allow_disable_stochastic_for_ablation: true` only for explicit ablation runs."
         )
 
     prob_enabled = _as_bool(prob_cfg.get("enabled", True), default=True)

@@ -35,12 +35,17 @@ from timesim.evaluation import (
     latent_diagnostics,
 )
 from timesim.models.factory import build_model
+from timesim.training.losses import soft_dtw_distance
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run RSSM training/eval checklist suite")
     p.add_argument("--config", type=str, required=True)
     p.add_argument("--checkpoint", type=str, default=None)
+    p.add_argument("--compare-checkpoint", type=str, default=None)
+    p.add_argument("--compare-config", type=str, default=None)
+    p.add_argument("--main-label", type=str, default="rollout")
+    p.add_argument("--compare-label", type=str, default="standard")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--horizon", type=int, default=None)
     p.add_argument("--n-windows", type=int, default=None)
@@ -619,6 +624,209 @@ def _plot_reconstruction_overlay(
     plt.close()
 
 
+def _window_starts(total_len: int, warmup_len: int, horizon: int, n_windows: int) -> list[int]:
+    max_start = total_len - (warmup_len + horizon)
+    if max_start < 0:
+        return []
+    if n_windows <= 1:
+        return [0]
+    return np.linspace(0, max_start, num=n_windows, dtype=int).tolist()
+
+
+def _split_controls_exogenous(
+    dataset: GroupedTimeSeriesDataset,
+    input_arr: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    cpos = list(getattr(dataset, "control_positions", []))
+    xpos = list(getattr(dataset, "known_exo_positions", []))
+    controls = input_arr[:, cpos] if cpos else np.zeros((input_arr.shape[0], 0), dtype=np.float32)
+    exogenous = input_arr[:, xpos] if xpos else np.zeros((input_arr.shape[0], 0), dtype=np.float32)
+    return controls.astype(np.float32, copy=False), exogenous.astype(np.float32, copy=False)
+
+
+def _apply_sigma_scale_to_samples(samples: np.ndarray, sigma_scale: float) -> np.ndarray:
+    scale = float(max(1e-6, sigma_scale))
+    if np.isclose(scale, 1.0):
+        return samples
+    mean = np.mean(samples, axis=0, keepdims=True)
+    return (mean + scale * (samples - mean)).astype(np.float32, copy=False)
+
+
+def _rollout_dtw_and_sigma_curve(
+    model,
+    dataset: GroupedTimeSeriesDataset,
+    warmup_len: int,
+    horizon: int,
+    n_windows: int,
+    n_samples: int,
+    sigma_scale: float,
+    device: str | torch.device,
+    denormalize: bool = True,
+    dtw_gamma: float = 0.1,
+) -> Dict[str, Any]:
+    starts = _window_starts(len(dataset.values), warmup_len, horizon, n_windows)
+    if not starts:
+        return {
+            "starts": np.empty((0,), dtype=np.int64),
+            "dtw_per_window": np.empty((0,), dtype=np.float32),
+            "dtw_mean": np.nan,
+            "dtw_std": np.nan,
+            "sigma_curve_mean": np.empty((0,), dtype=np.float32),
+            "sigma_curve_std": np.empty((0,), dtype=np.float32),
+        }
+
+    dtw_vals: list[float] = []
+    sigma_curves: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for s in starts:
+            warmup = dataset.values[s:s + warmup_len]
+            future = dataset.values[s + warmup_len:s + warmup_len + horizon]
+
+            warmup_inputs = warmup[:, dataset.in_idx]
+            future_inputs = future[:, dataset.in_idx]
+            history_y = warmup[:, dataset.out_idx].astype(np.float32, copy=False)
+            target_y = future[:, dataset.out_idx].astype(np.float32, copy=False)
+            history_c, history_x = _split_controls_exogenous(dataset, warmup_inputs)
+            future_c, future_x = _split_controls_exogenous(dataset, future_inputs)
+
+            out = model.condition_then_simulate(
+                history_controls=torch.from_numpy(history_c).unsqueeze(0).to(device),
+                history_exogenous=torch.from_numpy(history_x).unsqueeze(0).to(device),
+                history_objectives=torch.from_numpy(history_y).unsqueeze(0).to(device),
+                future_controls=torch.from_numpy(future_c).unsqueeze(0).to(device),
+                future_exogenous=torch.from_numpy(future_x).unsqueeze(0).to(device),
+                n_steps=horizon,
+                n_samples=n_samples,
+            )
+
+            pred_mean: np.ndarray
+            pred_std: np.ndarray
+            if "samples" in out:
+                samples = out["samples"].squeeze(1).cpu().numpy().astype(np.float32, copy=False)  # (N,H,O)
+                samples = _apply_sigma_scale_to_samples(samples, sigma_scale=sigma_scale)
+                if denormalize:
+                    samples = _inverse_outputs(dataset, samples)
+                    target_eval = _inverse_outputs(dataset, target_y)
+                else:
+                    target_eval = target_y
+                pred_mean = np.mean(samples, axis=0).astype(np.float32, copy=False)
+                pred_std = np.std(samples, axis=0).astype(np.float32, copy=False)
+            else:
+                pred_mean = out["predictions"].squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+                if denormalize:
+                    pred_mean = _inverse_outputs(dataset, pred_mean)
+                    target_eval = _inverse_outputs(dataset, target_y)
+                else:
+                    target_eval = target_y
+                if "dist_scale" in out:
+                    pred_std = (
+                        out["dist_scale"].squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+                        * float(max(1e-6, sigma_scale))
+                    )
+                else:
+                    pred_std = np.full_like(pred_mean, np.nan, dtype=np.float32)
+
+            dtw_val = soft_dtw_distance(
+                torch.from_numpy(pred_mean).unsqueeze(0),
+                torch.from_numpy(target_eval).unsqueeze(0),
+                gamma=float(dtw_gamma),
+            )
+            dtw_vals.append(float(dtw_val.detach().cpu().item()))
+            sigma_curves.append(np.mean(pred_std, axis=-1).astype(np.float32, copy=False))
+
+    dtw_arr = np.asarray(dtw_vals, dtype=np.float32)
+    sigma_arr = np.stack(sigma_curves, axis=0).astype(np.float32, copy=False) if sigma_curves else np.empty((0, horizon), dtype=np.float32)
+    sigma_mean = np.nanmean(sigma_arr, axis=0).astype(np.float32, copy=False) if sigma_arr.size > 0 else np.empty((0,), dtype=np.float32)
+    sigma_std = np.nanstd(sigma_arr, axis=0).astype(np.float32, copy=False) if sigma_arr.size > 0 else np.empty((0,), dtype=np.float32)
+    return {
+        "starts": np.asarray(starts, dtype=np.int64),
+        "dtw_per_window": dtw_arr,
+        "dtw_mean": float(np.nanmean(dtw_arr)) if dtw_arr.size > 0 else np.nan,
+        "dtw_std": float(np.nanstd(dtw_arr)) if dtw_arr.size > 0 else np.nan,
+        "sigma_curve_mean": sigma_mean,
+        "sigma_curve_std": sigma_std,
+    }
+
+
+def _fit_r2(x: np.ndarray, y: np.ndarray) -> float:
+    x_f = np.asarray(x, dtype=np.float32)
+    y_f = np.asarray(y, dtype=np.float32)
+    mask = np.isfinite(x_f) & np.isfinite(y_f)
+    if int(mask.sum()) < 3:
+        return np.nan
+    x_m = x_f[mask]
+    y_m = y_f[mask]
+    a, b = np.polyfit(x_m, y_m, 1)
+    y_hat = a * x_m + b
+    ss_res = float(np.sum((y_m - y_hat) ** 2))
+    ss_tot = float(np.sum((y_m - np.mean(y_m)) ** 2))
+    if ss_tot <= 1e-12:
+        return np.nan
+    return float(max(0.0, min(1.0, 1.0 - ss_res / ss_tot)))
+
+
+def _uncertainty_growth_summary(
+    sigma_curve: np.ndarray,
+    constant_ratio_threshold: float = 1.1,
+    exploding_ratio_threshold: float = 5.0,
+) -> Dict[str, Any]:
+    sig = np.asarray(sigma_curve, dtype=np.float32)
+    if sig.size == 0:
+        return {
+            "curve": sig,
+            "ratio_last_first": np.nan,
+            "r2_sqrt": np.nan,
+            "r2_linear": np.nan,
+            "best_fit": "unknown",
+            "is_constant_like": False,
+            "is_exploding": False,
+        }
+    steps = np.arange(1, sig.size + 1, dtype=np.float32)
+    r2_sqrt = _fit_r2(np.sqrt(steps), sig)
+    r2_linear = _fit_r2(steps, sig)
+    ratio = float(sig[-1] / max(abs(float(sig[0])), 1e-8))
+    best = "sqrt" if (np.isfinite(r2_sqrt) and (not np.isfinite(r2_linear) or r2_sqrt >= r2_linear)) else "linear"
+    is_constant = bool(np.isfinite(ratio) and ratio <= float(constant_ratio_threshold))
+    is_exploding = bool(np.isfinite(ratio) and ratio >= float(exploding_ratio_threshold))
+    return {
+        "curve": sig,
+        "ratio_last_first": ratio,
+        "r2_sqrt": r2_sqrt,
+        "r2_linear": r2_linear,
+        "best_fit": best,
+        "is_constant_like": is_constant,
+        "is_exploding": is_exploding,
+    }
+
+
+def _plot_uncertainty_growth(
+    sigma_main: np.ndarray,
+    sigma_compare: Optional[np.ndarray],
+    out_path: Path,
+    main_label: str,
+    compare_label: str,
+) -> None:
+    s_main = np.asarray(sigma_main, dtype=np.float32)
+    if s_main.size == 0:
+        return
+    x = np.arange(1, s_main.size + 1)
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, s_main, linewidth=2.0, label=f"{main_label} sigma")
+    if sigma_compare is not None:
+        s_cmp = np.asarray(sigma_compare, dtype=np.float32)
+        if s_cmp.size == s_main.size:
+            plt.plot(x, s_cmp, linewidth=1.8, linestyle="--", label=f"{compare_label} sigma")
+    plt.xlabel("Horizon")
+    plt.ylabel("Predicted Sigma")
+    plt.title("Uncertainty Growth vs Horizon")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140)
+    plt.close()
+
+
 def _compute_latent_kl_windows(
     model,
     dataset: GroupedTimeSeriesDataset,
@@ -776,6 +984,12 @@ def main():
     interval_levels = tuple(
         sorted(set(coverage_table_levels) | set(calibration_levels))
     )
+    rollout_eval_cfg = eval_cfg.get("rollout_specific", {}) or {}
+    dtw_gamma = float(rollout_eval_cfg.get("dtw_gamma", 0.1))
+    uncertainty_constant_ratio = float(rollout_eval_cfg.get("uncertainty_constant_ratio_threshold", 1.1))
+    uncertainty_exploding_ratio = float(rollout_eval_cfg.get("uncertainty_exploding_ratio_threshold", 5.0))
+    main_label = str(args.main_label or "rollout")
+    compare_label = str(args.compare_label or "standard")
 
     open_curves = open_loop_evaluate(
         model=model,
@@ -800,6 +1014,23 @@ def main():
         denormalize=True,
         interval_levels=interval_levels,
         sigma_scale=sigma_scale,
+    )
+    rollout_specific_main = _rollout_dtw_and_sigma_curve(
+        model=model,
+        dataset=dataset,
+        warmup_len=warmup_len,
+        horizon=horizon,
+        n_windows=n_windows,
+        n_samples=mc_samples,
+        sigma_scale=sigma_scale,
+        device=device,
+        denormalize=True,
+        dtw_gamma=dtw_gamma,
+    )
+    uncertainty_main = _uncertainty_growth_summary(
+        rollout_specific_main["sigma_curve_mean"],
+        constant_ratio_threshold=uncertainty_constant_ratio,
+        exploding_ratio_threshold=uncertainty_exploding_ratio,
     )
     inter_cfg = eval_cfg.get("interventional", {}) or {}
     inter_control_index: Optional[int] = (
@@ -920,6 +1151,100 @@ def main():
         n_windows=max(1, n_windows),
         device=device,
     )
+    compare_checkpoint: Optional[Path] = None
+    compare_open_curves: Optional[Dict[str, Any]] = None
+    compare_rollout_specific: Optional[Dict[str, Any]] = None
+    uncertainty_compare: Optional[Dict[str, Any]] = None
+    if args.compare_checkpoint:
+        compare_cfg = load_config(args.compare_config) if args.compare_config else config
+        compare_cfg.setdefault("misc", {})
+        compare_cfg["misc"]["device"] = device
+        compare_checkpoint = _resolve_checkpoint(compare_cfg, args.compare_checkpoint)
+        compare_model_dir = compare_checkpoint.resolve().parent
+        if compare_model_dir.name == "checkpoints":
+            compare_model_dir = compare_model_dir.parent
+        compare_scaler_path = compare_model_dir / "scaler.pkl"
+        if not compare_scaler_path.exists():
+            parent_scaler = compare_model_dir.parent / "scaler.pkl"
+            if parent_scaler.exists():
+                compare_scaler_path = parent_scaler
+            else:
+                raise FileNotFoundError(
+                    f"Scaler not found in {compare_model_dir} or {compare_model_dir.parent}"
+                )
+        compare_scaler = joblib_load(compare_scaler_path)
+        compare_dataset = _build_test_dataset(compare_cfg, scaler=compare_scaler)
+
+        compare_dcfg = compare_cfg["dataset"]
+        compare_groups = compare_dcfg["variables"]
+        compare_schema = VariableSchema.from_groups(compare_groups)
+        compare_input_groups = compare_cfg["model_io"]["input_groups"]
+        compare_output_groups = compare_cfg["model_io"]["output_groups"]
+        compare_input_cols = compare_schema.columns_for_group_names(compare_input_groups)
+        compare_output_cols = compare_schema.columns_for_group_names(compare_output_groups)
+        compare_input_dim = len(set(compare_input_cols) | set(compare_output_cols))
+
+        compare_data_cfg = compare_cfg.get("data", {})
+        compare_add_time = bool(compare_data_cfg.get("add_time_features", False))
+        compare_tf_cfg = compare_data_cfg.get("time_features", {}) or {}
+        if isinstance(compare_tf_cfg, dict) and "enabled" in compare_tf_cfg:
+            compare_add_time = bool(compare_tf_cfg.get("enabled")) or compare_add_time
+        if compare_add_time:
+            compare_input_dim += len(
+                get_time_feature_columns(
+                    features=compare_tf_cfg.get("features"),
+                    encoding=compare_tf_cfg.get("encoding", "cyclical"),
+                )
+            )
+        compare_output_dim = len(compare_output_cols)
+        if compare_output_dim != output_dim:
+            raise ValueError(
+                "compare checkpoint output dimension does not match main model: "
+                f"{compare_output_dim} vs {output_dim}"
+            )
+        compare_seq_len = int(compare_dcfg["seq_len"])
+        compare_pred_len = int(compare_dcfg["pred_len"])
+        compare_models_cfg = {m["type"]: m for m in compare_cfg.get("models", [])}
+        compare_latent_cfg = compare_models_cfg.get("latent_ssm", {"type": "latent_ssm"})
+        compare_model = build_model(
+            "latent_ssm",
+            input_dim=compare_input_dim,
+            output_dim=compare_output_dim,
+            seq_len=compare_seq_len,
+            pred_len=compare_pred_len,
+            per_model_cfg=compare_latent_cfg,
+            model_defaults_cfg=compare_cfg.get("model_defaults", {}),
+        )
+        _load_model(compare_model, compare_checkpoint, device)
+        compare_open_curves = open_loop_evaluate(
+            model=compare_model,
+            dataset=compare_dataset,
+            warmup_len=warmup_len,
+            horizon=horizon,
+            n_windows=n_windows,
+            n_samples=mc_samples,
+            device=device,
+            denormalize=True,
+            interval_levels=interval_levels,
+            sigma_scale=sigma_scale,
+        )
+        compare_rollout_specific = _rollout_dtw_and_sigma_curve(
+            model=compare_model,
+            dataset=compare_dataset,
+            warmup_len=warmup_len,
+            horizon=horizon,
+            n_windows=n_windows,
+            n_samples=mc_samples,
+            sigma_scale=sigma_scale,
+            device=device,
+            denormalize=True,
+            dtw_gamma=dtw_gamma,
+        )
+        uncertainty_compare = _uncertainty_growth_summary(
+            compare_rollout_specific["sigma_curve_mean"],
+            constant_ratio_threshold=uncertainty_constant_ratio,
+            exploding_ratio_threshold=uncertainty_exploding_ratio,
+        )
 
     # Persist metrics.
     _save_horizon_csv(out_dir / "open_loop_horizon_metrics.csv", open_curves, coverage_table_levels)
@@ -1007,6 +1332,54 @@ def main():
     cal_df = _calibration_summary(open_curves, calibration_levels)
     cal_df.to_csv(out_dir / "calibration_curve.csv", index=False)
 
+    # Rollout-specific (5E): DTW and uncertainty growth.
+    pd.DataFrame(
+        {
+            "window_index": np.arange(1, len(rollout_specific_main["dtw_per_window"]) + 1),
+            "dtw": rollout_specific_main["dtw_per_window"],
+            "model_label": main_label,
+        }
+    ).to_csv(out_dir / "rollout_dtw_main.csv", index=False)
+    sigma_main_curve = np.asarray(rollout_specific_main["sigma_curve_mean"], dtype=np.float32)
+    sigma_main_std = np.asarray(rollout_specific_main["sigma_curve_std"], dtype=np.float32)
+    pd.DataFrame(
+        {
+            "horizon": np.arange(1, len(sigma_main_curve) + 1),
+            "sigma_mean": sigma_main_curve,
+            "sigma_std": sigma_main_std if sigma_main_std.size == sigma_main_curve.size else np.nan,
+            "model_label": main_label,
+        }
+    ).to_csv(out_dir / "uncertainty_growth_main.csv", index=False)
+
+    if compare_rollout_specific is not None:
+        pd.DataFrame(
+            {
+                "window_index": np.arange(1, len(compare_rollout_specific["dtw_per_window"]) + 1),
+                "dtw": compare_rollout_specific["dtw_per_window"],
+                "model_label": compare_label,
+            }
+        ).to_csv(out_dir / "rollout_dtw_compare.csv", index=False)
+        sigma_cmp_curve = np.asarray(compare_rollout_specific["sigma_curve_mean"], dtype=np.float32)
+        sigma_cmp_std = np.asarray(compare_rollout_specific["sigma_curve_std"], dtype=np.float32)
+        pd.DataFrame(
+            {
+                "horizon": np.arange(1, len(sigma_cmp_curve) + 1),
+                "sigma_mean": sigma_cmp_curve,
+                "sigma_std": sigma_cmp_std if sigma_cmp_std.size == sigma_cmp_curve.size else np.nan,
+                "model_label": compare_label,
+            }
+        ).to_csv(out_dir / "uncertainty_growth_compare.csv", index=False)
+
+        if sigma_cmp_curve.size == sigma_main_curve.size and sigma_main_curve.size > 0:
+            pd.DataFrame(
+                {
+                    "horizon": np.arange(1, len(sigma_main_curve) + 1),
+                    f"sigma_{main_label}": sigma_main_curve,
+                    f"sigma_{compare_label}": sigma_cmp_curve,
+                    f"delta_{main_label}_minus_{compare_label}": sigma_main_curve - sigma_cmp_curve,
+                }
+            ).to_csv(out_dir / "uncertainty_growth_comparison.csv", index=False)
+
     pd.DataFrame(
         {
             "timestep": np.arange(1, len(kl_per_timestep) + 1),
@@ -1077,6 +1450,15 @@ def main():
     _plot_curve(closed_curves.get("crps", np.empty((0,))), "Closed-loop CRPS vs Horizon", "CRPS", out_dir / "closed_loop_crps.png")
     _plot_curve(open_curves.get("sharpness_90", np.empty((0,))), "Open-loop 90% Interval Width", "Width", out_dir / "open_loop_sharpness90.png")
     _plot_curve(kl_per_timestep, "KL per Timestep (observe)", "KL", out_dir / "latent_kl_per_timestep.png")
+    _plot_uncertainty_growth(
+        sigma_main_curve,
+        np.asarray(compare_rollout_specific["sigma_curve_mean"], dtype=np.float32)
+        if compare_rollout_specific is not None
+        else None,
+        out_dir / "uncertainty_growth.png",
+        main_label=main_label,
+        compare_label=compare_label,
+    )
     _plot_latent_traversal(
         traversal_deltas,
         traversal_vals,
@@ -1106,14 +1488,50 @@ def main():
 
     open_hsum = summarize_horizons(open_curves)
     closed_hsum = summarize_horizons(closed_curves)
+    compare_open_hsum = summarize_horizons(compare_open_curves) if compare_open_curves is not None else {}
     rmse_h1 = float(open_hsum.get("rmse", {}).get(1, np.nan))
     rmse_h20 = float(open_hsum.get("rmse", {}).get(20, np.nan))
     rmse_ratio_h20_h1 = float(rmse_h20 / rmse_h1) if np.isfinite(rmse_h1) and rmse_h1 > 0 else np.nan
+    rmse_h10 = float(open_hsum.get("rmse", {}).get(10, np.nan))
+    compare_rmse_h10 = float(compare_open_hsum.get("rmse", {}).get(10, np.nan)) if compare_open_hsum else np.nan
+    compare_rmse_h20 = float(compare_open_hsum.get("rmse", {}).get(20, np.nan)) if compare_open_hsum else np.nan
+    rollout_better_h10 = bool(
+        np.isfinite(rmse_h10) and np.isfinite(compare_rmse_h10) and rmse_h10 < compare_rmse_h10
+    )
+    rollout_better_h20 = bool(
+        np.isfinite(rmse_h20) and np.isfinite(compare_rmse_h20) and rmse_h20 < compare_rmse_h20
+    )
+    dtw_main = float(rollout_specific_main.get("dtw_mean", np.nan))
+    dtw_compare = float(compare_rollout_specific.get("dtw_mean", np.nan)) if compare_rollout_specific is not None else np.nan
+    dtw_rollout_better = bool(np.isfinite(dtw_main) and np.isfinite(dtw_compare) and dtw_main < dtw_compare)
 
     coverage95 = np.nan
     cov95_curve = open_curves.get("coverage", {}).get(0.95, np.empty((0,), dtype=np.float32))
     if cov95_curve.size > 0:
         coverage95 = float(np.mean(cov95_curve))
+
+    if compare_open_curves is not None:
+        compare_rows = [
+            {
+                "metric": "open_loop_rmse_h10",
+                main_label: rmse_h10,
+                compare_label: compare_rmse_h10,
+                f"{main_label}_better": rollout_better_h10,
+            },
+            {
+                "metric": "open_loop_rmse_h20",
+                main_label: rmse_h20,
+                compare_label: compare_rmse_h20,
+                f"{main_label}_better": rollout_better_h20,
+            },
+            {
+                "metric": "rollout_dtw_mean",
+                main_label: dtw_main,
+                compare_label: dtw_compare,
+                f"{main_label}_better": dtw_rollout_better,
+            },
+        ]
+        pd.DataFrame(compare_rows).to_csv(out_dir / "rollout_vs_standard_comparison.csv", index=False)
 
     summary = {
         "checkpoint": str(checkpoint),
@@ -1142,6 +1560,37 @@ def main():
         "sigma_scale": float(sigma_scale),
         "coverage_95_mean": coverage95,
         "open_loop_rmse_h20_over_h1": rmse_ratio_h20_h1,
+        "rollout_specific": {
+            "main_label": main_label,
+            "compare_label": compare_label if compare_checkpoint is not None else None,
+            "main_checkpoint": str(checkpoint),
+            "compare_checkpoint": str(compare_checkpoint) if compare_checkpoint is not None else None,
+            "main_open_loop_rmse_h10": rmse_h10,
+            "main_open_loop_rmse_h20": rmse_h20,
+            "compare_open_loop_rmse_h10": compare_rmse_h10,
+            "compare_open_loop_rmse_h20": compare_rmse_h20,
+            "main_rollout_dtw_mean": dtw_main,
+            "compare_rollout_dtw_mean": dtw_compare,
+            "rollout_better_h10": rollout_better_h10,
+            "rollout_better_h20": rollout_better_h20,
+            "rollout_better_dtw": dtw_rollout_better,
+            "uncertainty_main": {
+                "ratio_last_first": float(uncertainty_main.get("ratio_last_first", np.nan)),
+                "r2_sqrt": float(uncertainty_main.get("r2_sqrt", np.nan)),
+                "r2_linear": float(uncertainty_main.get("r2_linear", np.nan)),
+                "best_fit": str(uncertainty_main.get("best_fit", "unknown")),
+                "is_constant_like": bool(uncertainty_main.get("is_constant_like", False)),
+                "is_exploding": bool(uncertainty_main.get("is_exploding", False)),
+            },
+            "uncertainty_compare": {
+                "ratio_last_first": float(uncertainty_compare.get("ratio_last_first", np.nan)),
+                "r2_sqrt": float(uncertainty_compare.get("r2_sqrt", np.nan)),
+                "r2_linear": float(uncertainty_compare.get("r2_linear", np.nan)),
+                "best_fit": str(uncertainty_compare.get("best_fit", "unknown")),
+                "is_constant_like": bool(uncertainty_compare.get("is_constant_like", False)),
+                "is_exploding": bool(uncertainty_compare.get("is_exploding", False)),
+            } if uncertainty_compare is not None else None,
+        },
         "intervention_direction_mean_raw": direction_mean_raw,
         "intervention_direction_mean_aligned": direction_mean_aligned,
         "intervention_expected_sign": expected_sign,
@@ -1233,6 +1682,18 @@ def main():
                 np.isfinite(float(reconstruction.get("corr_mean", np.nan)))
                 and float(reconstruction.get("corr_mean", np.nan)) >= 0.9
             ),
+            "rollout_better_than_compare_h20": bool(
+                (compare_open_curves is not None) and rollout_better_h20
+            ),
+            "rollout_better_than_compare_dtw": bool(
+                (compare_rollout_specific is not None) and dtw_rollout_better
+            ),
+            "uncertainty_not_constant_like": bool(
+                not bool(uncertainty_main.get("is_constant_like", False))
+            ),
+            "uncertainty_not_exploding": bool(
+                not bool(uncertainty_main.get("is_exploding", False))
+            ),
         },
     }
     with open(out_dir / "summary.yaml", "w", encoding="utf-8") as f:
@@ -1259,6 +1720,22 @@ def main():
         f"  Recon corr mean: {float(reconstruction.get('corr_mean', np.nan)):.4f}"
         if np.isfinite(float(reconstruction.get("corr_mean", np.nan)))
         else "  Recon corr mean: nan"
+    )
+    print(
+        f"  Rollout DTW mean ({main_label}): {dtw_main:.4f}"
+        if np.isfinite(dtw_main)
+        else f"  Rollout DTW mean ({main_label}): nan"
+    )
+    if compare_open_curves is not None:
+        print(
+            f"  RMSE@20 {main_label} vs {compare_label}: {rmse_h20:.4f} vs {compare_rmse_h20:.4f}"
+            if np.isfinite(rmse_h20) and np.isfinite(compare_rmse_h20)
+            else f"  RMSE@20 {main_label} vs {compare_label}: nan"
+        )
+    print(
+        f"  Uncertainty growth ratio ({main_label}): {float(uncertainty_main.get('ratio_last_first', np.nan)):.4f}"
+        if np.isfinite(float(uncertainty_main.get("ratio_last_first", np.nan)))
+        else f"  Uncertainty growth ratio ({main_label}): nan"
     )
 
 

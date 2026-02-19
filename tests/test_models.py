@@ -439,5 +439,42 @@ def test_latent_ssm_single_path_ablation_runs():
     assert out["samples"].shape == (3, bsz, horizon, 1)
 
 
+def test_latent_ssm_shared_encoder_ablation_runs():
+    model = LatentSSMWorldModel(
+        input_dim=5,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+        share_encoder_weights=True,
+        allow_shared_encoder_for_ablation=True,
+    )
+    model.eval()
+    controls = torch.randn(2, 6, 2)
+    exogenous = torch.randn(2, 6, 1)
+    y = torch.randn(2, 6, 1)
+    with torch.no_grad():
+        out = model.observe(controls, exogenous, y, sample_posterior=False)
+    assert out["predictions"].shape == (2, 6, 1)
+
+
+def test_latent_ssm_no_stochastic_path_ablation_outputs_zero_latent():
+    model = LatentSSMWorldModel(
+        input_dim=5,
+        output_dim=1,
+        hidden_dim=16,
+        latent_dim=8,
+        use_stochastic_path=False,
+        allow_disable_stochastic_for_ablation=True,
+    )
+    model.eval()
+    controls = torch.randn(2, 6, 2)
+    exogenous = torch.randn(2, 6, 1)
+    y = torch.randn(2, 6, 1)
+    with torch.no_grad():
+        out = model.observe(controls, exogenous, y, sample_posterior=True)
+    assert torch.allclose(out["stoch"], torch.zeros_like(out["stoch"]))
+    assert torch.allclose(out["prior_mu"], torch.zeros_like(out["prior_mu"]))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

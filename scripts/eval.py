@@ -102,7 +102,10 @@ MODEL_PARAM_KEYS_BY_TYPE = {
     "latent_ssm": {
         "hidden_dim", "latent_dim", "num_layers", "dropout",
         "min_scale", "min_df", "encoder_dim", "decoder_layers", "use_symlog",
-        "use_aux_decoder", "use_dual_path", "leak_objective_to_transition",
+        "use_aux_decoder", "use_dual_path", "use_stochastic_path",
+        "share_encoder_weights", "leak_objective_to_transition",
+        "allow_objective_leak_for_ablation", "allow_disable_aux_decoder_for_ablation",
+        "allow_shared_encoder_for_ablation", "allow_disable_stochastic_for_ablation",
     },
     "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
 }

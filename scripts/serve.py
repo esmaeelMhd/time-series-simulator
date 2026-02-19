@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
+import logging
 
 import torch
 from joblib import load
+import numpy as np
+import pandas as pd
 
 from timesim.utils.config import load_config
 from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
@@ -143,19 +147,59 @@ def main():
         )
     sigma_scale = float(max(1e-6, sigma_scale))
 
-    simulator_template = RSSMSimulator(
+    simulator_template = RSSMSimulator.from_dataset(
         model=model,
-        feature_columns=dataset.feature_cols,
-        input_columns=dataset.input_cols,
-        output_columns=dataset.output_cols,
-        in_idx=dataset.in_idx,
-        out_idx=dataset.out_idx,
-        control_positions=dataset.control_positions,
-        known_exo_positions=dataset.known_exo_positions,
-        scaler=dataset.scaler,
+        dataset=dataset,
         sigma_scale=sigma_scale,
         device=device,
     )
+
+    serving_cfg = config.get("serving", {}) or {}
+    if bool(serving_cfg.get("benchmark_on_startup", True)):
+        logger = logging.getLogger("timesim.serve")
+        logger.setLevel(logging.INFO)
+        try:
+            sim = simulator_template.clone_empty()
+            hist_df = df[dataset.feature_cols].tail(seq_len).copy()
+            sim.reset(hist_df)
+            control_last = {
+                c: float(hist_df[c].iloc[-1]) for c in sim.control_columns
+            }
+            exo_last = {
+                c: float(hist_df[c].iloc[-1]) for c in sim.exogenous_columns
+            } if sim.exogenous_columns else {}
+
+            t0 = time.perf_counter()
+            _ = sim.step(control_last, exo_last if exo_last else None, n_samples=50)
+            step_ms = (time.perf_counter() - t0) * 1000.0
+
+            horizon = 50
+            ctrl_df = pd.DataFrame(
+                {
+                    c: np.full((horizon,), control_last[c], dtype=np.float32)
+                    for c in sim.control_columns
+                }
+            )
+            exo_df = (
+                pd.DataFrame(
+                    {
+                        c: np.full((horizon,), exo_last[c], dtype=np.float32)
+                        for c in sim.exogenous_columns
+                    }
+                )
+                if sim.exogenous_columns
+                else None
+            )
+            t1 = time.perf_counter()
+            _ = sim.rollout(ctrl_df, exo_df, n_samples=50)
+            rollout_ms = (time.perf_counter() - t1) * 1000.0
+            logger.info(
+                "Serving benchmark: step_1x50=%.3fms (target<10ms), rollout_50x50=%.3fms (target<500ms)",
+                step_ms,
+                rollout_ms,
+            )
+        except Exception as exc:
+            logger.warning("Serving benchmark failed: %s", exc)
 
     app = create_app(simulator_template, session_ttl_seconds=args.session_ttl)
 

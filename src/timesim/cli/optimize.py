@@ -220,26 +220,12 @@ def _suggest_overrides(
             "dropout": trial.suggest_float("dropout", 0.0, max_dropout, step=0.05),
         }
     if model_type == "latent_ssm":
-        hidden_choices = [32, 64, 96, 128] if profile == "fast_gpu" else [32, 64, 96, 128, 160, 192]
-        latent_choices = [8, 16, 24, 32] if profile == "fast_gpu" else [8, 16, 24, 32, 48, 64]
-        max_layers = 2 if profile == "fast_gpu" else 3
-        max_dropout = 0.3 if profile == "fast_gpu" else 0.4
-        encoder_choices = [32, 64, 96] if profile == "fast_gpu" else [32, 64, 96, 128]
+        # Phase-7 search space (required minimum):
+        # dim_h in {128,256,512}, dim_z in {32,64,128}, decoder_layers in {2,3,4}.
         return {
-            "hidden_dim": trial.suggest_categorical("hidden_dim", hidden_choices),
-            "latent_dim": trial.suggest_categorical("latent_dim", latent_choices),
-            "num_layers": trial.suggest_int("num_layers", 1, max_layers),
-            "dropout": trial.suggest_float("dropout", 0.0, max_dropout, step=0.05),
-            "min_scale": trial.suggest_float("min_scale", 1e-5, 1e-3, log=True),
-            "min_df": trial.suggest_float("min_df", 2.01, 5.0),
-            "encoder_dim": trial.suggest_categorical("encoder_dim", encoder_choices),
-            "decoder_layers": trial.suggest_int("decoder_layers", 1, 3),
-            "use_symlog": trial.suggest_categorical("use_symlog", [False, True]),
-            "use_aux_decoder": trial.suggest_categorical("use_aux_decoder", [True, False]),
-            "use_dual_path": trial.suggest_categorical("use_dual_path", [True, False]),
-            "leak_objective_to_transition": trial.suggest_categorical(
-                "leak_objective_to_transition", [False, True]
-            ),
+            "hidden_dim": trial.suggest_categorical("dim_h", [128, 256, 512]),
+            "latent_dim": trial.suggest_categorical("dim_z", [32, 64, 128]),
+            "decoder_layers": trial.suggest_categorical("decoder_layers", [2, 3, 4]),
         }
     if model_type == "xgboost":
         if profile == "fast_gpu":
@@ -273,9 +259,73 @@ def _sanitize_for_yaml(obj: Any):
     return obj
 
 
+def _save_optuna_importance_artifacts(study: "optuna.study.Study", out_dir: Path) -> None:
+    """Export parameter importances to CSV/YAML and a PNG bar chart."""
+    try:
+        import optuna.importance
+
+        importance = optuna.importance.get_param_importances(study)
+    except Exception as exc:
+        print(f"Warning: failed to compute parameter importances: {exc}")
+        return
+
+    if not importance:
+        print("Warning: no parameter importances available for this study.")
+        return
+
+    rows = [{"param": k, "importance": float(v)} for k, v in importance.items()]
+    try:
+        import pandas as pd
+
+        pd.DataFrame(rows).to_csv(out_dir / "param_importance.csv", index=False)
+    except Exception as exc:
+        print(f"Warning: failed to save param_importance.csv: {exc}")
+
+    try:
+        with open(out_dir / "param_importance.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(_sanitize_for_yaml(dict(importance)), f, sort_keys=False)
+    except Exception as exc:
+        print(f"Warning: failed to save param_importance.yaml: {exc}")
+
+    try:
+        import matplotlib.pyplot as plt
+
+        names = [r["param"] for r in rows][::-1]
+        vals = [r["importance"] for r in rows][::-1]
+        fig_h = max(3.0, 0.4 * len(names))
+        fig, ax = plt.subplots(figsize=(10, fig_h))
+        ax.barh(names, vals)
+        ax.set_title("Optuna Parameter Importance")
+        ax.set_xlabel("Importance")
+        ax.set_ylabel("Parameter")
+        fig.tight_layout()
+        fig.savefig(out_dir / "param_importance.png", dpi=150)
+        plt.close(fig)
+    except Exception as exc:
+        print(f"Warning: failed to save param_importance.png: {exc}")
+
+
 def _normalize_best_params(best_params: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize best params for downstream config compatibility."""
     normalized = dict(best_params)
+    # Normalize Phase-7 search aliases to train-time keys.
+    if "dim_h" in normalized and "hidden_dim" not in normalized:
+        normalized["hidden_dim"] = normalized["dim_h"]
+    if "dim_z" in normalized and "latent_dim" not in normalized:
+        normalized["latent_dim"] = normalized["dim_z"]
+    if "lr" in normalized and "learning_rate" not in normalized:
+        normalized["learning_rate"] = normalized["lr"]
+    if "w_rollout" in normalized and "rollout_weight" not in normalized:
+        normalized["rollout_weight"] = normalized["w_rollout"]
+    if "max_horizon" in normalized and "rollout_max_horizon" not in normalized:
+        normalized["rollout_max_horizon"] = normalized["max_horizon"]
+
+    normalized.pop("dim_h", None)
+    normalized.pop("dim_z", None)
+    normalized.pop("lr", None)
+    normalized.pop("w_rollout", None)
+    normalized.pop("max_horizon", None)
+
     optimizer_name = str(normalized.get("optimizer", "")).lower()
 
     if "weight_decay" not in normalized:
@@ -419,10 +469,10 @@ def main():
     search_space_profile = str(ocfg.get("search_space_profile", "fast_gpu"))
     enable_pruning = bool(ocfg.get("enable_pruning", True))
     pruner_startup_trials = int(ocfg.get("pruner_startup_trials", 5))
-    pruner_warmup_steps = int(ocfg.get("pruner_warmup_steps", 1))
-    pruner_min_epochs_default = 2 if fast_mode else 1
-    pruner_min_epochs = int(ocfg.get("pruner_min_epochs", pruner_min_epochs_default))
-    pruner_min_epochs = max(1, min(pruner_min_epochs, trial_epochs))
+    pruner_warmup_steps = int(ocfg.get("pruner_warmup_steps", 20))
+    pruner_min_epochs = int(ocfg.get("pruner_min_epochs", 20))
+    pruner_min_epochs = max(1, pruner_min_epochs)
+    objective_horizon = max(1, int(ocfg.get("objective_horizon", 10)))
 
     print("\n" + "=" * 70)
     print("  OPTUNA HYPERPARAMETER OPTIMIZATION")
@@ -438,6 +488,7 @@ def main():
     print(f"  Device          : {device}")
     print(f"  Search profile  : {search_space_profile}")
     print(f"  Fast mode       : {fast_mode}")
+    print(f"  Objective       : val_open_loop_crps@h{objective_horizon}")
     print(f"  Pruning         : {enable_pruning}")
     if enable_pruning:
         print(
@@ -488,19 +539,18 @@ def main():
         if model_type in NEURAL_MODELS:
             def objective(trial: "optuna.trial.Trial") -> float:
                 model_overrides = _suggest_overrides(trial, model_type, profile=search_space_profile)
-                if search_space_profile == "fast_gpu":
-                    lr = trial.suggest_float("learning_rate", 1e-4, 2e-3, log=True)
-                else:
-                    lr = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
+                lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
                 prob_cfg_default = tcfg.get("probabilistic", {}) or {}
                 if model_type == "latent_ssm":
-                    recon_weight = trial.suggest_float("recon_weight", 0.5, 2.0)
-                    kl_weight = trial.suggest_float("kl_weight", 0.05, 1.5)
-                    aux_weight = trial.suggest_float("aux_weight", 0.1, 2.0)
-                    kl_free_bits = trial.suggest_float("kl_free_bits", 0.1, 2.0)
-                    kl_balance = trial.suggest_float("kl_balance", 0.5, 0.95)
-                    use_kl_balancing = trial.suggest_categorical("use_kl_balancing", [True, False])
-                    use_free_bits = trial.suggest_categorical("use_free_bits", [True, False])
+                    recon_weight = float(prob_cfg_default.get("recon_weight", 1.0))
+                    kl_weight = trial.suggest_float("kl_weight", 0.1, 5.0)
+                    aux_weight = float(prob_cfg_default.get("aux_weight", 1.0))
+                    kl_free_bits = trial.suggest_float("kl_free_bits", 0.5, 3.0)
+                    kl_balance = float(prob_cfg_default.get("kl_balance", 0.8))
+                    use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", True))
+                    use_free_bits = bool(prob_cfg_default.get("use_free_bits", True))
+                    rollout_weight = trial.suggest_float("w_rollout", 0.1, 2.0)
+                    rollout_max_horizon = trial.suggest_categorical("max_horizon", [8, 16, 32])
                     # Keep KL warmup schedule fixed from training config.
                     kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
                     kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
@@ -513,6 +563,10 @@ def main():
                     kl_balance = float(prob_cfg_default.get("kl_balance", 0.8))
                     use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", True))
                     use_free_bits = bool(prob_cfg_default.get("use_free_bits", True))
+                    rollout_weight = float(prob_cfg_default.get("rollout_weight", 0.0))
+                    rollout_max_horizon = int(
+                        prob_cfg_default.get("rollout_max_horizon", max(1, pred_len))
+                    )
                     kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
                     kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
                     kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
@@ -583,6 +637,8 @@ def main():
                         "recon_weight": recon_weight,
                         "kl_weight": kl_weight,
                         "aux_weight": aux_weight,
+                        "rollout_weight": rollout_weight,
+                        "rollout_max_horizon": int(rollout_max_horizon),
                         "kl_free_bits": kl_free_bits,
                         "kl_balance": kl_balance,
                         "use_kl_balancing": use_kl_balancing,
@@ -628,20 +684,29 @@ def main():
 
                 score = float(best_score)
                 if model_type == "latent_ssm":
+                    score = float("inf")
                     try:
+                        available_h = max(1, len(val_dataset.values) - int(tcfg.get("warmup_len", seq_len)))
+                        eval_h = max(1, min(objective_horizon, available_h))
                         curves = open_loop_evaluate(
                             model=model,
                             dataset=val_dataset,
                             warmup_len=tcfg.get("warmup_len", seq_len),
-                            horizon=min(pred_len, int(tcfg.get("sampling_horizon", pred_len))),
+                            horizon=eval_h,
                             n_windows=max(2, int(ocfg.get("n_windows_eval", 4))),
                             n_samples=max(10, int(prob_cfg_default.get("mc_train_samples", 32))),
                             device=device,
                         )
                         crps_curve = curves.get("crps")
-                        if crps_curve is not None and len(crps_curve) > 0 and np.all(np.isfinite(crps_curve)):
-                            score = float(np.mean(crps_curve))
-                            trial.set_user_attr("open_loop_crps", score)
+                        if (
+                            crps_curve is not None
+                            and len(crps_curve) >= eval_h
+                            and np.all(np.isfinite(crps_curve))
+                        ):
+                            score = float(crps_curve[eval_h - 1])
+                            trial.set_user_attr(f"open_loop_crps_h{eval_h}", score)
+                            if eval_h != objective_horizon:
+                                trial.set_user_attr("objective_horizon_clamped_from", objective_horizon)
                     except Exception as exc:
                         trial.set_user_attr("open_loop_crps_error", str(exc))
                 if final_val is not None:
@@ -741,6 +806,7 @@ def main():
             df_trials.to_csv(model_opt_dir / "trials.csv", index=False)
         except Exception as exc:
             print(f"Warning: failed to export trials CSV for {model_type}: {exc}")
+        _save_optuna_importance_artifacts(study, model_opt_dir)
 
         all_summary[model_type] = best
         print(f"Best value: {best['best_value']:.6f}")

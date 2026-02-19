@@ -157,20 +157,21 @@ for i, col in enumerate(control_cols):
 
 if st.button("Run rollout"):
     with st.spinner("Simulating..."):
-        out = sim.rollout(scenario_controls, n_samples=50)
-    mean = np.asarray(out["mean"])
-    std = np.asarray(out["std"])
+        out_df = sim.rollout(scenario_controls, n_samples=50)
+    if not isinstance(out_df, pd.DataFrame):
+        st.error("Simulator returned invalid rollout payload.")
+        st.stop()
 
     for i, col in enumerate(obj_cols):
         chart_df = pd.DataFrame(
             {
-                "step": np.arange(mean.shape[0]),
-                "mean": mean[:, i],
-                "lower": mean[:, i] - 1.96 * std[:, i],
-                "upper": mean[:, i] + 1.96 * std[:, i],
+                "step": np.arange(len(out_df)),
+                "mean": out_df[f"{col}_mean"].to_numpy(dtype=np.float32),
+                "lower": out_df[f"{col}_p5"].to_numpy(dtype=np.float32),
+                "upper": out_df[f"{col}_p95"].to_numpy(dtype=np.float32),
             }
         ).set_index("step")
         st.line_chart(chart_df[["mean", "lower", "upper"]])
 
-    if out.get("warnings"):
-        st.warning("; ".join(out["warnings"]))
+    if sim.last_warnings:
+        st.warning("; ".join(sim.last_warnings))

@@ -72,9 +72,13 @@ _BUILTIN_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "use_symlog": False,
         "use_aux_decoder": True,
         "use_dual_path": True,
+        "use_stochastic_path": True,
+        "share_encoder_weights": False,
         "leak_objective_to_transition": False,
         "allow_objective_leak_for_ablation": False,
         "allow_disable_aux_decoder_for_ablation": False,
+        "allow_shared_encoder_for_ablation": False,
+        "allow_disable_stochastic_for_ablation": False,
     },
     "xgboost": {
         "n_estimators": 100,
@@ -215,9 +219,13 @@ def build_model(
             use_symlog=p.get("use_symlog", False),
             use_aux_decoder=p.get("use_aux_decoder", True),
             use_dual_path=p.get("use_dual_path", True),
+            use_stochastic_path=p.get("use_stochastic_path", True),
+            share_encoder_weights=p.get("share_encoder_weights", False),
             leak_objective_to_transition=p.get("leak_objective_to_transition", False),
             allow_objective_leak_for_ablation=p.get("allow_objective_leak_for_ablation", False),
             allow_disable_aux_decoder_for_ablation=p.get("allow_disable_aux_decoder_for_ablation", False),
+            allow_shared_encoder_for_ablation=p.get("allow_shared_encoder_for_ablation", False),
+            allow_disable_stochastic_for_ablation=p.get("allow_disable_stochastic_for_ablation", False),
         )
 
     elif model_type == "xgboost":

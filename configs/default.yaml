@@ -104,7 +104,8 @@ optimization:
   timeout: null                      # seconds per model; null = no timeout
   epochs: 5                          # training epochs per trial
   steps_per_epoch: 200               # null -> auto; set int for fast tuning
-  direction: minimize                # minimize validation loss
+  direction: minimize                # minimize objective metric (open-loop CRPS@horizon)
+  objective_horizon: 10              # objective = validation open-loop CRPS at this horizon
   search_space_profile: fast_gpu     # fast_gpu | wide
   seed: 42
   models: null                       # null -> use config.models list
@@ -115,8 +116,8 @@ optimization:
   fast_training_mode: one_step       # one_step | multi_step | combined for fast mode
   enable_pruning: true               # prune weak trials early
   pruner_startup_trials: 5           # full trials before pruning starts
-  pruner_warmup_steps: 1             # epochs reported before pruning eligibility
-  pruner_min_epochs: 1               # do not prune before this many epochs within a trial
+  pruner_warmup_steps: 20            # MedianPruner warmup epochs before pruning can trigger
+  pruner_min_epochs: 20              # hard floor: never prune before this many epochs in a trial
 
 # ══════════════════════════════════════════════════════════════════════
 #  DATA
@@ -213,9 +214,13 @@ model_defaults:
     use_symlog: false
     use_aux_decoder: true
     use_dual_path: true
+    use_stochastic_path: true
+    share_encoder_weights: false
     leak_objective_to_transition: false
     allow_objective_leak_for_ablation: false
     allow_disable_aux_decoder_for_ablation: false
+    allow_shared_encoder_for_ablation: false
+    allow_disable_stochastic_for_ablation: false
   xgboost:
     n_estimators: 100
     max_depth: 6

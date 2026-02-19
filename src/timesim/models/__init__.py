@@ -43,6 +43,7 @@ from .encoders import (
     ControlEncoder,
     ExogenousEncoder,
     ObservationEncoder,
+    UniversalSharedEncoder,
     assert_no_shared_encoder_params,
 )
 from .decoders import ObjectiveDecoder, AuxiliaryDecoder
@@ -175,6 +176,7 @@ __all__ = [
     "ControlEncoder",
     "ExogenousEncoder",
     "ObservationEncoder",
+    "UniversalSharedEncoder",
     "assert_no_shared_encoder_params",
     "ObjectiveDecoder",
     "AuxiliaryDecoder",

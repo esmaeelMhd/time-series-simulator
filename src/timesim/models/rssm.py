@@ -53,6 +53,7 @@ class RSSMCell(nn.Module):
         min_std: float = 0.01,
         use_dual_path: bool = True,
         leak_objective_to_transition: bool = False,
+        use_stochastic_path: bool = True,
     ):
         super().__init__()
         self.dim_h = int(dim_h)
@@ -62,6 +63,7 @@ class RSSMCell(nn.Module):
         self.dim_obs_embed = int(dim_obs_embed)
         self.use_dual_path = bool(use_dual_path)
         self.leak_objective_to_transition = bool(leak_objective_to_transition)
+        self.use_stochastic_path = bool(use_stochastic_path)
         self.min_std = float(max(0.01, float(min_std)))
 
         trans_hidden = int(transition_hidden_dim or self.dim_h)
@@ -119,7 +121,8 @@ class RSSMCell(nn.Module):
         exogenous_embed: torch.Tensor,
         observation_embed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pieces = [prev_state.z, control_embed, exogenous_embed]
+        prev_z = prev_state.z if self.use_stochastic_path else torch.zeros_like(prev_state.z)
+        pieces = [prev_z, control_embed, exogenous_embed]
         if self.leak_objective_to_transition:
             if observation_embed is None:
                 observation_embed = torch.zeros(
@@ -151,11 +154,29 @@ class RSSMCell(nn.Module):
     def prior_from_h(
         self, h_t: torch.Tensor
     ) -> tuple[torch.distributions.Distribution, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.use_stochastic_path:
+            mean = torch.zeros(h_t.shape[0], self.dim_z, device=h_t.device, dtype=h_t.dtype)
+            std = torch.full_like(mean, fill_value=self.min_std)
+            dist = torch.distributions.Independent(
+                torch.distributions.Normal(loc=mean, scale=std),
+                1,
+            )
+            logvar = 2.0 * torch.log(std)
+            return dist, mean, std, logvar
         return self._diag_gaussian(self.prior_head(h_t))
 
     def posterior_from_h(
         self, h_t: torch.Tensor, observation_embed: torch.Tensor
     ) -> tuple[torch.distributions.Distribution, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.use_stochastic_path:
+            mean = torch.zeros(h_t.shape[0], self.dim_z, device=h_t.device, dtype=h_t.dtype)
+            std = torch.full_like(mean, fill_value=self.min_std)
+            dist = torch.distributions.Independent(
+                torch.distributions.Normal(loc=mean, scale=std),
+                1,
+            )
+            logvar = 2.0 * torch.log(std)
+            return dist, mean, std, logvar
         post_in = torch.cat([h_t, observation_embed], dim=-1)
         return self._diag_gaussian(self.posterior_head(post_in))
 
@@ -177,6 +198,8 @@ class RSSMCell(nn.Module):
         prior_dist, prior_mean, prior_std, prior_logvar = self.prior_from_h(h_t)
         post_dist, post_mean, post_std, post_logvar = self.posterior_from_h(h_t, observation_embed)
         z_t = post_dist.rsample() if sample else post_mean
+        if not self.use_stochastic_path:
+            z_t = torch.zeros_like(z_t)
         state = RSSMState(h=h_t, z=z_t)
         return RSSMOutput(
             state=state,
@@ -207,6 +230,8 @@ class RSSMCell(nn.Module):
         )
         prior_dist, prior_mean, prior_std, prior_logvar = self.prior_from_h(h_t)
         z_t = prior_dist.rsample() if sample else prior_mean
+        if not self.use_stochastic_path:
+            z_t = torch.zeros_like(z_t)
         state = RSSMState(h=h_t, z=z_t)
         return RSSMOutput(
             state=state,

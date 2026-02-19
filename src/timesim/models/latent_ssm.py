@@ -21,6 +21,7 @@ from .encoders import (
     ControlEncoder,
     ExogenousEncoder,
     ObservationEncoder,
+    UniversalSharedEncoder,
     assert_no_shared_encoder_params,
 )
 from .rssm import RSSMCell, RSSMState
@@ -49,9 +50,13 @@ class LatentSSMWorldModel(WorldModelBase):
         use_symlog: bool = False,
         use_aux_decoder: bool = True,
         use_dual_path: bool = True,
+        use_stochastic_path: bool = True,
+        share_encoder_weights: bool = False,
         leak_objective_to_transition: bool = False,
         allow_objective_leak_for_ablation: bool = False,
         allow_disable_aux_decoder_for_ablation: bool = False,
+        allow_shared_encoder_for_ablation: bool = False,
+        allow_disable_stochastic_for_ablation: bool = False,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -69,10 +74,14 @@ class LatentSSMWorldModel(WorldModelBase):
         self.use_symlog = bool(use_symlog)
         self.use_aux_decoder = bool(use_aux_decoder)
         self.use_dual_path = bool(use_dual_path)
+        self.use_stochastic_path = bool(use_stochastic_path)
+        self.share_encoder_weights = bool(share_encoder_weights)
         self.leak_objective_to_transition = bool(leak_objective_to_transition)
         self.min_latent_std = float(max(0.01, float(min_scale)))
         self.allow_objective_leak_for_ablation = bool(allow_objective_leak_for_ablation)
         self.allow_disable_aux_decoder_for_ablation = bool(allow_disable_aux_decoder_for_ablation)
+        self.allow_shared_encoder_for_ablation = bool(allow_shared_encoder_for_ablation)
+        self.allow_disable_stochastic_for_ablation = bool(allow_disable_stochastic_for_ablation)
 
         if self.leak_objective_to_transition and not self.allow_objective_leak_for_ablation:
             raise ValueError(
@@ -84,24 +93,45 @@ class LatentSSMWorldModel(WorldModelBase):
                 "Auxiliary exogenous decoder disable is blocked by default. "
                 "Set `allow_disable_aux_decoder_for_ablation=True` only for explicit ablations."
             )
+        if self.share_encoder_weights and not self.allow_shared_encoder_for_ablation:
+            raise ValueError(
+                "Shared encoder weights across variable roles are blocked by default. "
+                "Set `allow_shared_encoder_for_ablation=True` only for explicit ablations."
+            )
+        if (not self.use_stochastic_path) and (not self.allow_disable_stochastic_for_ablation):
+            raise ValueError(
+                "Disabling stochastic latent path is blocked by default. "
+                "Set `allow_disable_stochastic_for_ablation=True` only for explicit ablations."
+            )
 
         # Explicitly independent encoders per variable type (no weight sharing).
-        self.control_encoder = ControlEncoder(
-            input_dim=self.control_dim,
-            hidden_dim=self.hidden_dim,
-            embed_dim=self.encoder_dim,
-        )
-        self.exogenous_encoder = ExogenousEncoder(
-            input_dim=self.exogenous_dim,
-            hidden_dim=self.hidden_dim,
-            embed_dim=self.encoder_dim,
-        )
-        self.observation_encoder = ObservationEncoder(
-            input_dim=self.output_dim,
-            hidden_dim=self.hidden_dim,
-            embed_dim=self.encoder_dim,
-        )
-        self._assert_encoder_independence()
+        self._shared_encoder = None
+        if self.share_encoder_weights:
+            shared = UniversalSharedEncoder(
+                hidden_dim=self.hidden_dim,
+                embed_dim=self.encoder_dim,
+            )
+            self.control_encoder = shared
+            self.exogenous_encoder = shared
+            self.observation_encoder = shared
+            self._shared_encoder = shared
+        else:
+            self.control_encoder = ControlEncoder(
+                input_dim=self.control_dim,
+                hidden_dim=self.hidden_dim,
+                embed_dim=self.encoder_dim,
+            )
+            self.exogenous_encoder = ExogenousEncoder(
+                input_dim=self.exogenous_dim,
+                hidden_dim=self.hidden_dim,
+                embed_dim=self.encoder_dim,
+            )
+            self.observation_encoder = ObservationEncoder(
+                input_dim=self.output_dim,
+                hidden_dim=self.hidden_dim,
+                embed_dim=self.encoder_dim,
+            )
+            self._assert_encoder_independence()
         self.rssm_cell = RSSMCell(
             dim_h=self.hidden_dim,
             dim_z=self.latent_dim,
@@ -111,6 +141,7 @@ class LatentSSMWorldModel(WorldModelBase):
             transition_hidden_dim=self.hidden_dim,
             min_std=self.min_latent_std,
             use_dual_path=self.use_dual_path,
+            use_stochastic_path=self.use_stochastic_path,
             leak_objective_to_transition=self.leak_objective_to_transition,
         )
 
@@ -133,6 +164,15 @@ class LatentSSMWorldModel(WorldModelBase):
             self.exogenous_encoder,
             self.observation_encoder,
         )
+
+    def _encode_control(self, x: torch.Tensor) -> torch.Tensor:
+        return self.control_encoder(x)
+
+    def _encode_exogenous(self, x: torch.Tensor) -> torch.Tensor:
+        return self.exogenous_encoder(x)
+
+    def _encode_observation(self, x: torch.Tensor) -> torch.Tensor:
+        return self.observation_encoder(x)
 
     @staticmethod
     def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -222,8 +262,8 @@ class LatentSSMWorldModel(WorldModelBase):
         exo_t: torch.Tensor,
         objective_encoded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        c_enc = self.control_encoder(control_t)
-        x_enc = self.exogenous_encoder(exo_t)
+        c_enc = self._encode_control(control_t)
+        x_enc = self._encode_exogenous(exo_t)
         h_t = self.rssm_cell.transition(
             prev_state=state,
             control_embed=c_enc,
@@ -300,8 +340,8 @@ class LatentSSMWorldModel(WorldModelBase):
         prev_output_t: Optional[torch.Tensor] = None,
     ) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
         prev = RSSMState(h=state["h"], z=state["z"])
-        c_enc = self.control_encoder(control_t)
-        x_enc = self.exogenous_encoder(exo_t)
+        c_enc = self._encode_control(control_t)
+        x_enc = self._encode_exogenous(exo_t)
         step_out = self.rssm_cell.imagine(
             prev_state=prev,
             control_embed=c_enc,
@@ -355,9 +395,9 @@ class LatentSSMWorldModel(WorldModelBase):
             x_t = exogenous[:, t, :]
             y_t_raw = observations[:, t, :]
             y_t = self.symlog(y_t_raw) if self.use_symlog else y_t_raw
-            y_enc = self.observation_encoder(y_t)
-            c_enc = self.control_encoder(c_t)
-            x_enc = self.exogenous_encoder(x_t)
+            y_enc = self._encode_observation(y_t)
+            c_enc = self._encode_control(c_t)
+            x_enc = self._encode_exogenous(x_t)
             step_out = self.rssm_cell.observe(
                 prev_state=state,
                 control_embed=c_enc,
@@ -468,8 +508,8 @@ class LatentSSMWorldModel(WorldModelBase):
         for t in range(horizon):
             c_t = controls[:, t, :]
             x_t = exogenous[:, t, :]
-            c_enc = self.control_encoder(c_t)
-            x_enc = self.exogenous_encoder(x_t)
+            c_enc = self._encode_control(c_t)
+            x_enc = self._encode_exogenous(x_t)
             step_out = self.rssm_cell.imagine(
                 prev_state=state,
                 control_embed=c_enc,
@@ -865,9 +905,9 @@ class LatentSSMWorldModel(WorldModelBase):
             y_t_raw = targets[:, t, :]
             y_t = self.symlog(y_t_raw) if self.use_symlog else y_t_raw
 
-            y_enc = self.observation_encoder(y_t)
-            c_enc = self.control_encoder(c_t)
-            x_enc = self.exogenous_encoder(x_t)
+            y_enc = self._encode_observation(y_t)
+            c_enc = self._encode_control(c_t)
+            x_enc = self._encode_exogenous(x_t)
             step_out = self.rssm_cell.observe(
                 prev_state=state,
                 control_embed=c_enc,

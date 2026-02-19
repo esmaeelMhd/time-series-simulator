@@ -10,6 +10,7 @@ from timesim.evaluation import (
     interventional_suite_evaluate,
 )
 from timesim.models.latent_ssm import LatentSSMWorldModel
+from scripts.eval_rssm_suite import _uncertainty_growth_summary
 
 
 def _make_dataset(n: int = 240) -> GroupedTimeSeriesDataset:
@@ -147,3 +148,13 @@ def test_interventional_suite_outputs():
 
     ec = out["extreme_control"]
     assert len(ec["window_rows"]) == 2
+
+
+def test_uncertainty_growth_summary_flags():
+    constant = _uncertainty_growth_summary(np.ones((10,), dtype=np.float32))
+    assert constant["is_constant_like"]
+    assert not constant["is_exploding"]
+
+    linear = _uncertainty_growth_summary(np.linspace(0.2, 0.6, num=10, dtype=np.float32))
+    assert not linear["is_constant_like"]
+    assert not linear["is_exploding"]

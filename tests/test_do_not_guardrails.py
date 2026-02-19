@@ -74,3 +74,35 @@ def test_guardrails_block_reconstruction_only_checkpointing():
             data_cfg=_base_data_cfg(),
             context="unit_test",
         )
+
+
+def test_guardrails_block_shared_encoder_without_ablation_flag():
+    with pytest.raises(ValueError, match="shared encoder weights"):
+        validate_latent_ssm_do_not(
+            model_name="latent_ssm",
+            model_params={
+                "use_aux_decoder": True,
+                "leak_objective_to_transition": False,
+                "share_encoder_weights": True,
+                "allow_shared_encoder_for_ablation": False,
+            },
+            prob_cfg=_base_prob_cfg(),
+            data_cfg=_base_data_cfg(),
+            context="unit_test",
+        )
+
+
+def test_guardrails_block_no_stochastic_without_ablation_flag():
+    with pytest.raises(ValueError, match="stochastic latent path"):
+        validate_latent_ssm_do_not(
+            model_name="latent_ssm",
+            model_params={
+                "use_aux_decoder": True,
+                "leak_objective_to_transition": False,
+                "use_stochastic_path": False,
+                "allow_disable_stochastic_for_ablation": False,
+            },
+            prob_cfg=_base_prob_cfg(),
+            data_cfg=_base_data_cfg(),
+            context="unit_test",
+        )

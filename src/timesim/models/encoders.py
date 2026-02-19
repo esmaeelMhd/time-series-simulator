@@ -73,6 +73,32 @@ class ObservationEncoder(TypedEncoder):
         super().__init__(input_dim=input_dim, hidden_dim=hidden_dim, embed_dim=embed_dim)
 
 
+class UniversalSharedEncoder(nn.Module):
+    """Single encoder shared across variable roles for ablation runs.
+
+    This encoder applies the same per-feature network to every scalar input value,
+    then pools across feature dimension. It can handle variable input widths with
+    one shared parameter set.
+    """
+
+    def __init__(self, hidden_dim: int, embed_dim: int):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.net = nn.Sequential(
+            nn.Linear(1, int(hidden_dim)),
+            nn.ELU(),
+            nn.Linear(int(hidden_dim), self.embed_dim),
+            nn.ELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] == 0:
+            return torch.zeros(x.shape[0], self.embed_dim, dtype=x.dtype, device=x.device)
+        # (B, D) -> (B, D, 1) -> (B, D, E) -> (B, E)
+        per_feature = self.net(x.unsqueeze(-1))
+        return per_feature.mean(dim=1)
+
+
 def assert_no_shared_encoder_params(
     control_encoder: nn.Module,
     exogenous_encoder: nn.Module,
@@ -95,5 +121,6 @@ __all__ = [
     "ControlEncoder",
     "ExogenousEncoder",
     "ObservationEncoder",
+    "UniversalSharedEncoder",
     "assert_no_shared_encoder_params",
 ]
