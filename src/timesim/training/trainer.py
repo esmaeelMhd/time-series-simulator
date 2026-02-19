@@ -35,7 +35,7 @@ from .losses import (
     ProbabilisticRolloutLoss,
     soft_dtw_distance,
 )
-from .rollout import batch_rollout_padded
+from .rollout import batch_rollout_padded, get_rollout_schedule
 
 
 class WorldModelTrainer:
@@ -301,7 +301,7 @@ class WorldModelTrainer:
             if not self.metrics_path.exists():
                 with open(self.metrics_path, "w", encoding="utf-8") as f:
                     f.write(
-                        "epoch,train_loss,val_loss,recon_nll,kl,kl_raw,aux_nll,"
+                        "epoch,train_loss,val_loss,loss_std,loss_total,recon_nll,kl,kl_raw,aux_nll,"
                         "rollout_nll,rollout_dtw,rollout_total,rollout_weight_eff,"
                         "rollout_ramp,horizon_schedule,context_len,grad_norm,lr\n"
                     )
@@ -315,31 +315,14 @@ class WorldModelTrainer:
 
     def _rollout_schedule(self) -> tuple[int, int, float]:
         """Return (horizon, context_len, ramp_factor) for rollout losses."""
-        seq_len = max(1, int(self.warmup_len))
-        max_h_ctx = max(0, seq_len - self.min_context)
-        max_h = min(int(self.rollout_max_horizon), max_h_ctx)
-        if max_h <= 0:
-            return 0, seq_len, 0.0
-
-        frac = max(0.0, min(1.0, float(self.rollout_warmup_fraction)))
-        total_epochs = max(1, int(self._fit_epochs))
-        warmup_epochs = int(math.ceil(total_epochs * frac))
-        warmup_epochs = min(total_epochs, max(0, warmup_epochs))
-        ep = int(self._current_epoch)
-
-        if ep <= warmup_epochs:
-            return 0, seq_len, 0.0
-
-        denom = max(1, total_epochs - warmup_epochs)
-        progress = float(ep - warmup_epochs) / float(denom)
-        ramp = max(0.0, min(1.0, progress))
-        horizon = int(round(max_h * ramp))
-        if horizon == 0 and ramp > 0.0:
-            horizon = 1
-        horizon = min(max_h, max(0, horizon))
-        context_len = max(self.min_context, seq_len - horizon)
-        horizon = max(0, seq_len - context_len)
-        return horizon, context_len, ramp
+        cfg = {
+            "epochs": int(self._fit_epochs),
+            "seq_len": int(self.warmup_len),
+            "rollout_warmup_fraction": float(self.rollout_warmup_fraction),
+            "rollout_max_horizon": int(self.rollout_max_horizon),
+            "min_context": int(self.min_context),
+        }
+        return get_rollout_schedule(epoch=int(self._current_epoch), cfg=cfg)
 
     def _current_kl_beta(self) -> float:
         """Current KL beta with optional linear warmup."""
@@ -496,7 +479,7 @@ class WorldModelTrainer:
                     )
 
                 kl_beta = self._current_kl_beta()
-                loss, info = self.probabilistic_loss_fn(
+                std_loss, info = self.probabilistic_loss_fn(
                     targets=targets,
                     dist_loc_latent=dist_loc_latent,
                     dist_scale=dist_scale,
@@ -520,9 +503,11 @@ class WorldModelTrainer:
                     raw_kl_elem.sum(dim=-1), mask
                 )
 
-                rollout_nll = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                rollout_nll = torch.zeros((), dtype=std_loss.dtype, device=std_loss.device)
                 rollout_dtw = torch.zeros_like(rollout_nll)
                 rollout_total = torch.zeros_like(rollout_nll)
+                combined_loss = std_loss
+                rollout_computed = False
                 rollout_horizon = int(max(0, sched_horizon))
                 if rollout_horizon > 0 and effective_rollout_weight > 0.0:
                     rollout_horizons = np.minimum(
@@ -574,20 +559,24 @@ class WorldModelTrainer:
                         if dtw_vals:
                             rollout_dtw = torch.stack(dtw_vals).mean()
                     rollout_total = rollout_nll + self.rollout_dtw_weight * rollout_dtw
-                    loss = loss + effective_rollout_weight * rollout_total
+                    combined_loss = std_loss + effective_rollout_weight * rollout_total
+                    rollout_computed = True
+                loss = combined_loss
 
                 self._last_prob_info = {
                     **info,
+                    "loss_std": float(std_loss.detach().item()),
+                    "loss_total": float(combined_loss.detach().item()),
                     "kl_raw": float(raw_kl.detach().item()),
                     "rollout_horizon": float(rollout_horizon),
                     "context_len": float(context_len),
                     "rollout_ramp": float(rollout_ramp),
                     "rollout_weight_eff": float(effective_rollout_weight),
+                    "rollout_nll": float(rollout_nll.detach().item()),
+                    "rollout_dtw": float(rollout_dtw.detach().item()),
+                    "rollout_total": float(rollout_total.detach().item()),
+                    "rollout_computed": 1.0 if rollout_computed else 0.0,
                 }
-                if rollout_horizon > 0 and effective_rollout_weight > 0.0:
-                    self._last_prob_info["rollout_nll"] = float(rollout_nll.detach().item())
-                    self._last_prob_info["rollout_dtw"] = float(rollout_dtw.detach().item())
-                    self._last_prob_info["rollout_total"] = float(rollout_total.detach().item())
             elif self.training_mode == "combined":
                 # Need both teacher-forced and model-feedback rollouts
                 result_teacher = batch_rollout_padded(
@@ -669,11 +658,15 @@ class WorldModelTrainer:
             if self.writer is not None:
                 gs = int(self._global_step)
                 for key in [
+                    "loss_std",
                     "loss_total",
                     "recon_nll",
                     "kl",
                     "kl_raw",
                     "aux_nll",
+                    "rollout_nll",
+                    "rollout_dtw",
+                    "rollout_total",
                     "rollout_weight_eff",
                     "rollout_ramp",
                     "horizon_schedule",
@@ -683,12 +676,6 @@ class WorldModelTrainer:
                 ]:
                     if key in self._last_prob_info:
                         self.writer.add_scalar(f"Train/{key}", self._last_prob_info[key], gs)
-                if "rollout_nll" in self._last_prob_info:
-                    self.writer.add_scalar("Train/rollout_nll", self._last_prob_info["rollout_nll"], gs)
-                if "rollout_dtw" in self._last_prob_info:
-                    self.writer.add_scalar("Train/rollout_dtw", self._last_prob_info["rollout_dtw"], gs)
-                if "rollout_total" in self._last_prob_info:
-                    self.writer.add_scalar("Train/rollout_total", self._last_prob_info["rollout_total"], gs)
         self._global_step += 1
         
         return loss.item()
@@ -940,6 +927,8 @@ class WorldModelTrainer:
             epoch_losses = []
             epoch_kl_values = []
             epoch_prob_stats: Dict[str, list[float]] = {
+                "loss_std": [],
+                "loss_total": [],
                 "recon_nll": [],
                 "kl": [],
                 "kl_raw": [],
@@ -1153,6 +1142,7 @@ class WorldModelTrainer:
                 with open(self.metrics_path, "a", encoding="utf-8") as f:
                     f.write(
                         f"{epoch},{train_loss},{val_loss if val_loss is not None else ''},"
+                        f"{_m('loss_std')},{_m('loss_total')},"
                         f"{_m('recon_nll')},{_m('kl')},{_m('kl_raw')},{_m('aux_nll')},"
                         f"{_m('rollout_nll')},{_m('rollout_dtw')},{_m('rollout_total')},"
                         f"{_m('rollout_weight_eff')},{_m('rollout_ramp')},"

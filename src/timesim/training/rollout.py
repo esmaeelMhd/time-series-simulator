@@ -10,7 +10,7 @@ Key optimizations applied:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Any, Mapping
 
 import numpy as np
 import torch
@@ -18,6 +18,73 @@ import torch
 from ..data.dataset import GroupedTimeSeriesDataset
 from ..data.sampling import SamplingStrategy
 from ..models.base import WorldModelBase
+
+
+def _read_cfg(cfg: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Read a rollout key from flat cfg or nested training.probabilistic cfg."""
+    if key in cfg:
+        return cfg[key]
+    training = cfg.get("training")
+    if isinstance(training, Mapping):
+        if key in training:
+            return training[key]
+        probabilistic = training.get("probabilistic")
+        if isinstance(probabilistic, Mapping) and key in probabilistic:
+            return probabilistic[key]
+    probabilistic = cfg.get("probabilistic")
+    if isinstance(probabilistic, Mapping) and key in probabilistic:
+        return probabilistic[key]
+    return default
+
+
+def get_rollout_schedule(epoch: int, cfg: Mapping[str, Any]) -> tuple[int, int, float]:
+    """Return (horizon, context_len, ramp_factor) for rollout training schedule.
+
+    The schedule enforces:
+    - horizon=0 during warmup fraction
+    - linear ramp from 1..max_horizon afterwards
+    - context_len >= min_context (caps horizon if needed)
+    """
+    ep = max(1, int(epoch))
+    total_epochs = max(1, int(_read_cfg(cfg, "epochs", _read_cfg(cfg, "fit_epochs", 1))))
+    seq_len = max(1, int(_read_cfg(cfg, "seq_len", _read_cfg(cfg, "warmup_len", 1))))
+    min_context = max(1, int(_read_cfg(cfg, "min_context", 16)))
+    max_horizon_cfg = max(0, int(_read_cfg(cfg, "rollout_max_horizon", seq_len)))
+    max_horizon = min(max_horizon_cfg, max(0, seq_len - min_context))
+    if max_horizon <= 0:
+        return 0, seq_len, 0.0
+
+    warmup_fraction = float(_read_cfg(cfg, "rollout_warmup_fraction", 0.30))
+    warmup_fraction = max(0.0, min(1.0, warmup_fraction))
+    warmup_epochs = int(np.ceil(total_epochs * warmup_fraction))
+    warmup_epochs = min(total_epochs, max(0, warmup_epochs))
+    if ep <= warmup_epochs:
+        return 0, seq_len, 0.0
+
+    denom = max(1, total_epochs - warmup_epochs)
+    ramp = float(ep - warmup_epochs) / float(denom)
+    ramp = max(0.0, min(1.0, ramp))
+
+    horizon = int(round(max_horizon * ramp))
+    if horizon == 0 and ramp > 0.0:
+        horizon = 1
+    horizon = min(max_horizon, max(0, horizon))
+
+    context_len = max(min_context, seq_len - horizon)
+    horizon = max(0, seq_len - context_len)
+    return horizon, context_len, ramp
+
+
+def get_horizon(epoch: int, cfg: Mapping[str, Any]) -> int:
+    """Phase 3B scheduler API: get current rollout horizon from epoch and cfg."""
+    horizon, _, _ = get_rollout_schedule(epoch=epoch, cfg=cfg)
+    return int(horizon)
+
+
+def get_rollout_ramp(epoch: int, cfg: Mapping[str, Any]) -> float:
+    """Return rollout ramp factor in [0,1] aligned with get_horizon()."""
+    _, _, ramp = get_rollout_schedule(epoch=epoch, cfg=cfg)
+    return float(ramp)
 
 
 def _prepare_batch_data(
