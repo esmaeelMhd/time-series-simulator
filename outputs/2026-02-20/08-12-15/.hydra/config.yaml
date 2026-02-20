@@ -1,0 +1,65 @@
+model:
+  name: rssm_base
+  type: latent_ssm
+  dim_h: null
+  dim_z: null
+  hidden_dim: 128
+  latent_dim: 32
+  encoder_dim: 64
+  decoder_layers: 2
+  num_layers: 1
+  dropout: 0.1
+  min_scale: 0.1
+training:
+  epochs: 50
+  steps_per_epoch: null
+  learning_rate: 0.0003
+  optimizer: adamw
+  weight_decay: 1.0e-06
+  grad_clip_norm: 100.0
+  lr_warmup_steps: 1000
+  lr_min_ratio: 0.01
+data:
+  csv_engine: pandas
+  train_split: 0.7
+  splits:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+  default_train_ratio: 0.7
+  default_val_ratio: 0.15
+  default_test_ratio: 0.15
+  shuffle_train: true
+  drop_last: true
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+  window_stride: 1
+  shuffle_within_window: false
+  index_col: date
+  require_full_role_mapping: true
+  validation:
+    enabled: true
+    strict: false
+    require_datetime_index: true
+    require_monotonic_index: true
+    require_numeric_dtypes: true
+    allow_nan: false
+    coerce_numeric: false
+  symlog:
+    enabled: false
+    columns: null
+serving:
+  host: 0.0.0.0
+  port: 8000
+  session_ttl_seconds: 3600
+  sigma_scale: 1.0
+base_config: configs/experiments/wastewater/base.yaml
+overrides: {}
+models:
+- latent_ssm
+epochs: 1
+steps_per_epoch: 1
+device: cpu
+seed: null
+deterministic: null

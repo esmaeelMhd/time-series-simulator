@@ -92,7 +92,7 @@ The repository now supports this stack end-to-end (optionally enabled):
 
 - Deep learning: PyTorch 2.x
 - Training orchestration: native trainer + optional PyTorch Lightning (`scripts/train_lightning.py`)
-- Configuration: YAML `_base` chain + optional Hydra wrapper (`scripts/train_hydra.py`)
+- Configuration: Hydra defaults composition (`configs/experiment/*` + group profiles).
 - Experiment tracking: TensorBoard + optional W&B / MLflow (`tracking.backend`)
 - Hyperparameter optimization: Optuna (`timesim.cli.optimize`, `scripts/optimize.py`)
 - Serving: FastAPI + Uvicorn (`scripts/serve.py`)
@@ -105,8 +105,14 @@ The repository now supports this stack end-to-end (optionally enabled):
 Examples:
 
 ```bash
-# Hydra wrapper (composes base config + overrides)
-python scripts/train_hydra.py base_config=configs/wastewater.yaml overrides.training.epochs=5
+# Hydra-first training (main path)
+python scripts/train.py experiment=wastewater epochs=5 steps_per_epoch=100 model.dim_h=128
+
+# Explicit Hydra launcher
+python scripts/train_hydra.py experiment=wastewater_small epochs=2 steps_per_epoch=20
+
+# Legacy config consumers (eval/serve/compare) still accept wrappers
+python scripts/eval.py --config configs/wastewater.small.yaml --model latent_ssm
 
 # Lightning entrypoint (experimental)
 python scripts/train_lightning.py --config configs/wastewater.yaml --model latent_ssm
@@ -464,3 +470,4 @@ This library was developed as part of PhD research on model-based control for wa
 ## Contact
 
 For questions or issues, please open a GitHub issue or contact [your email].
+

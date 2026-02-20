@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - /dataset: wastewater
+  - /model: rssm_wastewater
+  - /training: wastewater_rssm
+  - /serving: wastewater
+  - _self_
+
+output:
+  run_name: checklist_verify_base
+
+model:
+  hidden_dim: 96
+  latent_dim: 24
+  num_layers: 1
+  dropout: 0.05
+  learning_rate: 0.0005
+  min_df: 2.2
+  use_aux_decoder: true
+  use_dual_path: true
+  leak_objective_to_transition: false
+
+training_rounds:
+  - name: train
+    epochs: 5
+    models: [latent_ssm]
+
+training:
+  use_optuna_best_params: false
+  steps_per_epoch: 300
+  checkpoint_simulation:
+    enabled: false
+    n_rounds: 4
+    horizon: null
+    start_idx: 0
+
+evaluation:
+  test_split: 0.1
+
+misc:
+  device: cuda
+

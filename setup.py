@@ -62,6 +62,11 @@ setup(
             "wandb>=0.17",
             "mlflow>=2.14",
         ],
+        "serving": [
+            "fastapi>=0.110",
+            "uvicorn>=0.29",
+            "streamlit>=1.30",
+        ],
         "lightning": [
             "pytorch-lightning>=2.0",
         ],
@@ -72,7 +77,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "timesim-train=timesim.cli.train:main",
+            "timesim-train=timesim.cli.train_hydra:main",
             "timesim-retrain=timesim.cli.retrain:main",
             "timesim-optimize=timesim.cli.optimize:main",
         ],

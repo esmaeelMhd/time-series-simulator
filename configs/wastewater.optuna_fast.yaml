@@ -1,31 +1,4 @@
-_base: wastewater.yaml
+defaults:
+  - experiment: wastewater_optuna_fast
+  - _self_
 
-# Fast Optuna-only config.
-# Use this for optimization, then train with configs/wastewater.yaml.
-output:
-  run_name: full_with_time
-
-optimization:
-  fast_mode: true
-  n_trials: 30
-  epochs: 3                      # kept for non-fast fallback compatibility
-  steps_per_epoch: 40            # kept for non-fast fallback compatibility
-  fast_epochs: 3                 # used when fast_mode=true
-  fast_steps_per_epoch: 40       # used when fast_mode=true
-  timeout: null
-  search_space_profile: fast_gpu
-  fast_sampling_horizon: 32
-  enable_pruning: true
-  pruner_warmup_steps: 2
-  pruner_min_epochs: 3
-
-training:
-  # Keep optimization representative, but much cheaper than horizon=360.
-  # loss_type: shape
-  mode: multi_step
-  use_amp: true
-  use_compile: false                # false for very short trials (epochs=1); compile overhead may outweigh benefits
-  compile_mode: reduce-overhead
-  sampling:
-    strategy: random_fixed
-    horizon: 32

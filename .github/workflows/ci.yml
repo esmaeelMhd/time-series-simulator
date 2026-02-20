@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
+    branches:
+      - main
 
 jobs:
   lint-test-train:
@@ -43,4 +45,3 @@ jobs:
       - name: Fast Training Smoke Test (5 epochs)
         run: |
           python scripts/ci_fast_train.py
-

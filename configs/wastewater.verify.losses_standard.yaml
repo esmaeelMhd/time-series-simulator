@@ -1,13 +1,4 @@
-_base: wastewater.verify.losses_rollout.yaml
+defaults:
+  - experiment: wastewater_verify_losses_standard
+  - _self_
 
-output:
-  runs_dir: runs
-  run_name: checklist_loss_eval_standard
-
-training:
-  checkpoint_simulation:
-    enabled: false
-    n_rounds: 0
-  probabilistic:
-    rollout_weight: 0.0
-    rollout_dtw_weight: 0.0

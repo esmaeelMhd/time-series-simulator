@@ -106,7 +106,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config", type=str, required=True,
-                        help="Path to YAML config (supports _base chain)")
+                        help="Path to YAML/Hydra config")
     parser.add_argument("--models", nargs="*",
                         help="Override: compare only these model types")
     parser.add_argument("--device", type=str,
@@ -507,3 +507,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

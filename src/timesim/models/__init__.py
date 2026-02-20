@@ -2,9 +2,12 @@
 
 Model Families
 --------------
+Primary:
+   - LatentSSMWorldModel (RSSM): intervention-aware probabilistic world model
+
+Legacy/backup:
 1. Recurrent (RNN-based):
    - LSTMWorldModel: LSTM-based world model with hidden state
-
 2. Attention-based:
    - SimpleTransformer: Transformer encoder for sequence modeling
    - TemporalFusionTransformer: Interpretable attention with variable selection
@@ -31,7 +34,13 @@ XGBoost (sklearn-style):
 """
 
 from .base import WorldModelBase
-from .factory import build_model, count_parameters, NEURAL_MODELS
+from .factory import (
+    build_model,
+    count_parameters,
+    NEURAL_MODELS,
+    PRIMARY_MODEL_TYPES,
+    LEGACY_MODEL_TYPES,
+)
 from .lstm import LSTMWorldModel, SimpleLSTM
 from .transformer import SimpleTransformer, TransformerWorldModel
 from .dlinear import DLinear, DLinearWorldModel
@@ -48,6 +57,9 @@ from .encoders import (
 )
 from .decoders import ObjectiveDecoder, AuxiliaryDecoder
 from .world_model import WorldModel
+from .rssm_main import RSSMWorldModel
+from . import rssm_stack
+from . import legacy
 
 # Optional XGBoost (may not be installed)
 try:
@@ -61,18 +73,18 @@ except ImportError:
 
 # Registry for neural models that support the WorldModelBase interface
 MODEL_REGISTRY = {
-    # Recurrent
+    # Legacy recurrent
     "lstm": LSTMWorldModel,
     
-    # Attention
+    # Legacy attention
     "transformer": TransformerWorldModel,
     "tft": TFTWorldModel,
     
-    # Linear
+    # Legacy linear
     "dlinear": DLinearWorldModel,
     "nlinear": NLinearWorldModel,
 
-    # Probabilistic
+    # Primary probabilistic architecture
     "latent_ssm": LatentSSMWorldModel,
 }
 
@@ -169,6 +181,7 @@ __all__ = [
 
     # Probabilistic
     "LatentSSMWorldModel",
+    "RSSMWorldModel",
     "RSSMState",
     "RSSMOutput",
     "RSSMCell",
@@ -189,6 +202,10 @@ __all__ = [
     "build_model",
     "count_parameters",
     "NEURAL_MODELS",
+    "PRIMARY_MODEL_TYPES",
+    "LEGACY_MODEL_TYPES",
+    "rssm_stack",
+    "legacy",
     
     # Utilities
     "get_model",

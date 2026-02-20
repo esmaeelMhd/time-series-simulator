@@ -13,6 +13,7 @@ The factory merges three sources of parameters (highest priority last):
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+import warnings
 
 # Lazy imports to avoid circular dependency with __init__.py
 # (factory is imported by __init__ which is still loading MODEL_REGISTRY)
@@ -31,6 +32,9 @@ def _check_xgboost() -> bool:
 
 # Which model types are neural (PyTorch) vs tree-based
 NEURAL_MODELS = {"lstm", "dlinear", "nlinear", "tft", "transformer", "latent_ssm"}
+PRIMARY_MODEL_TYPES = {"latent_ssm"}
+LEGACY_MODEL_TYPES = {"lstm", "dlinear", "nlinear", "tft", "transformer", "xgboost"}
+_WARNED_LEGACY_TYPES: set[str] = set()
 
 # Hard-coded fallbacks used when *neither* config nor caller supplies a value.
 # These mirror the constructor defaults of each model class.
@@ -138,6 +142,18 @@ def build_model(
     """
     per_model_cfg = per_model_cfg or {}
     model_defaults_cfg = model_defaults_cfg or {}
+    model_type = str(model_type).lower().strip()
+
+    if model_type in LEGACY_MODEL_TYPES and model_type not in _WARNED_LEGACY_TYPES:
+        warnings.warn(
+            (
+                f"Model '{model_type}' is in legacy/backup mode. "
+                "RSSM ('latent_ssm') is the primary architecture."
+            ),
+            UserWarning,
+            stacklevel=2,
+        )
+        _WARNED_LEGACY_TYPES.add(model_type)
 
     p = _merge_params(model_type, model_defaults_cfg, per_model_cfg, overrides)
 

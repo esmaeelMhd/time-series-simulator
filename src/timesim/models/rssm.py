@@ -105,8 +105,14 @@ class RSSMCell(nn.Module):
     def _diag_gaussian(
         self, params: torch.Tensor
     ) -> tuple[torch.distributions.Distribution, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Mixed-precision training can occasionally produce NaN/Inf logits.
+        # Clamp/sanitize before constructing Normal distributions.
+        params = torch.nan_to_num(params, nan=0.0, posinf=1e4, neginf=-1e4)
         mean, raw_std = torch.chunk(params, 2, dim=-1)
+        mean = torch.clamp(mean, min=-1e4, max=1e4)
+        raw_std = torch.clamp(raw_std, min=-20.0, max=20.0)
         std = F.softplus(raw_std) + self.min_std
+        std = torch.clamp(std, min=self.min_std, max=1e4)
         dist = torch.distributions.Independent(
             torch.distributions.Normal(loc=mean, scale=std),
             1,

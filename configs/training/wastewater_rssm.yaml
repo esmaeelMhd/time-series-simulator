@@ -1,0 +1,78 @@
+# @package _global_
+
+training:
+  epochs: 50
+  steps_per_epoch: 1000
+  learning_rate: 0.0005
+  optimizer: adamw
+  weight_decay: 0.000001
+  grad_clip_norm: 100.0
+  lr_warmup_steps: 1000
+  lr_min_ratio: 0.01
+  patience: 30
+  warmup_len: 24
+  use_optuna_best_params: true
+  sampling_strategy: random_fixed
+  sampling:
+    strategy: random_fixed
+    horizon: 120
+    h_min: 1
+    h_max: 120
+    stride: 12
+    start_hour: 0
+    samples_per_hour: 1
+  checkpoint_simulation:
+    enabled: true
+    n_rounds: 4
+    horizon: null
+    start_idx: 0
+  sequence_curriculum:
+    enabled: false
+    start_horizon: 16
+    target_horizon: 120
+  probabilistic:
+    enabled: true
+    objective: rssm
+    recon_weight: 1.0
+    kl_weight: 0.5
+    aux_weight: 2.0
+    rollout_weight: 0.0
+    rollout_dtw_weight: 0.0
+    rollout_dtw_gamma: 0.1
+    rollout_warmup_fraction: 0.30
+    rollout_max_horizon: 24
+    min_context: 16
+    kl_free_bits: 1.0
+    kl_balance: 0.8
+    use_kl_balancing: true
+    use_free_bits: true
+    kl_warmup_enabled: true
+    kl_beta_start: 0.0
+    kl_beta_end: 1.0
+    kl_warmup_epochs: 20
+    mc_train_samples: 8
+    checkpoint_metric: open_loop_crps
+    checkpoint_open_loop_horizon: 120
+    checkpoint_open_loop_windows: 4
+    checkpoint_open_loop_samples: 64
+    checkpoint_top_k: 3
+  use_amp: true
+  use_compile: false
+  compile_mode: default
+
+training_rounds:
+  - name: train
+    epochs: 50
+    learning_rate: 0.001
+    models: [latent_ssm]
+
+evaluation:
+  probabilistic:
+    mc_samples: 128
+    sigma_scale: 1.0
+    interval_level: 0.90
+
+simulation:
+  horizon: 360
+  start_idx: 0
+

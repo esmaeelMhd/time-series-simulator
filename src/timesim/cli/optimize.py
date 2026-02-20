@@ -59,7 +59,7 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--config", type=str, required=True,
-                   help="Path to YAML config (supports _base chain)")
+                   help="Path to YAML/Hydra config")
     p.add_argument("--models", nargs="*", default=None,
                    help="Optional subset of model types to optimize")
     p.add_argument("--n-trials", type=int, default=None,
@@ -825,3 +825,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

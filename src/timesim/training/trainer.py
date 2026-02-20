@@ -152,10 +152,18 @@ class WorldModelTrainer:
             self.device = torch.device(device)
         self.model.to(self.device)
         self.amp_enabled = bool(self.use_amp and self.device.type == "cuda")
+        self.amp_dtype = torch.float16
+        if self.amp_enabled:
+            try:
+                if torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+            except Exception:
+                self.amp_dtype = torch.float16
+        self.use_grad_scaler = bool(self.amp_enabled and self.amp_dtype == torch.float16)
         try:
-            self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_grad_scaler)
         except Exception:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_grad_scaler)
 
         
         # Sampling strategy
@@ -436,7 +444,7 @@ class WorldModelTrainer:
         # Perform batched rollouts
         with torch.autocast(
             device_type=self.device.type,
-            dtype=torch.float16,
+            dtype=self.amp_dtype,
             enabled=self.amp_enabled,
         ):
             if self.is_probabilistic_model:
@@ -630,7 +638,7 @@ class WorldModelTrainer:
         # Backward pass
         grad_norm_value = float("nan")
         grad_norm_preclip = float("nan")
-        if self.amp_enabled:
+        if self.amp_enabled and self.use_grad_scaler:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             if self.grad_clip_norm > 0:
@@ -720,7 +728,7 @@ class WorldModelTrainer:
             
             with torch.autocast(
                 device_type=self.device.type,
-                dtype=torch.float16,
+                dtype=self.amp_dtype,
                 enabled=self.amp_enabled,
             ):
                 if self.is_probabilistic_model:

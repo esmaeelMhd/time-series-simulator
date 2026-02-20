@@ -1,18 +1,4 @@
-_base: wastewater.verify.base.yaml
+defaults:
+  - experiment: wastewater_verify_y_leak
+  - _self_
 
-output:
-  runs_dir: runs
-  run_name: checklist_verify_y_leak
-
-models:
-  - type: latent_ssm
-    hidden_dim: 96
-    latent_dim: 24
-    num_layers: 1
-    dropout: 0.05
-    learning_rate: 0.0005
-    min_df: 2.2
-    use_aux_decoder: true
-    use_dual_path: true
-    leak_objective_to_transition: true
-    allow_objective_leak_for_ablation: true

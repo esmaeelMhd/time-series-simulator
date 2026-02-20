@@ -1,102 +1,106 @@
-"""Hierarchical YAML config loader with ``_base`` chain support.
-
-Usage::
-
-    from timesim.utils.config import load_config
-
-    # Loads default.yaml → wastewater.yaml → wastewater.small.yaml
-    config = load_config("configs/wastewater.small.yaml")
-"""
+"""Hydra-based config loader used by scripts outside hydra.main."""
 
 from __future__ import annotations
 
-import copy
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict
 
 import yaml
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
+
+__all__ = ["load_config"]
 
 
-__all__ = ["load_config", "deep_merge"]
+def _find_configs_root(cfg_path: Path) -> Path:
+    for parent in [cfg_path.parent, *cfg_path.parents]:
+        if parent.name == "configs":
+            return parent
+    return cfg_path.parent
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Deep merge
-# ─────────────────────────────────────────────────────────────────────
+def _compose_hydra_config(cfg_path: Path) -> Dict[str, Any]:
+    root = _find_configs_root(cfg_path)
+    config_name = cfg_path.relative_to(root).with_suffix("").as_posix()
 
-def deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into *base*.
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
 
-    - Dicts are merged recursively (keys in override win).
-    - Lists and scalars in *override* **replace** those in *base*.
-    - *base* is not mutated; a new dict is returned.
-    """
-    merged = copy.deepcopy(base)
-    for key, value in override.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
-            merged[key] = deep_merge(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
+    with initialize_config_dir(version_base=None, config_dir=str(root)):
+        cfg = compose(config_name=config_name)
+
+    return OmegaConf.to_container(cfg, resolve=True)  # type: ignore[return-value]
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Config loader
-# ─────────────────────────────────────────────────────────────────────
-
-def load_config(
-    cfg_path: str | Path,
-    cli_args: Namespace | None = None,
-) -> Dict[str, Any]:
-    """Load a YAML config with optional ``_base`` chain resolution.
-
-    Each config file may contain a ``_base`` key pointing to a parent
-    config (path relative to the file's own directory).  The loader
-    walks up the chain, deep-merging each layer on top of its parent::
-
-        default.yaml                 # base defaults
-          ← wastewater.yaml          # _base: default.yaml
-            ← wastewater.small.yaml  # _base: wastewater.yaml
-
-    After the chain is resolved, *cli_args* (if given) are applied as
-    top-level overrides (non-None values only).
-
-    Parameters
-    ----------
-    cfg_path : str or Path
-        Path to a YAML config file.
-    cli_args : argparse.Namespace, optional
-        CLI overrides.  Non-None attributes replace top-level keys.
-
-    Returns
-    -------
-    dict
-        Fully resolved configuration as a plain Python dict.
-    """
-    cfg_path = Path(cfg_path)
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config file not found: {cfg_path}")
-
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-
-    # ── Resolve _base chain ──────────────────────────────────────────
-    base_ref = cfg.pop("_base", None)
-    if base_ref is not None:
-        base_path = cfg_path.parent / base_ref
-        base_cfg = load_config(base_path)   # recursive
-        cfg = deep_merge(base_cfg, cfg)
-
-    # ── Apply CLI overrides ──────────────────────────────────────────
-    if cli_args is not None:
-        for key, value in vars(cli_args).items():
-            if value is None:
-                continue
+def _apply_cli_overrides(cfg: Dict[str, Any], cli_args: Namespace | None) -> Dict[str, Any]:
+    if cli_args is None:
+        return cfg
+    for key, value in vars(cli_args).items():
+        if value is not None:
             cfg[key] = value
-
     return cfg
+
+
+def _materialize_legacy_shape(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    model_cfg = cfg.get("model")
+    if isinstance(model_cfg, dict):
+        legacy_model = dict(model_cfg)
+        if legacy_model.get("dim_h") is not None:
+            legacy_model["hidden_dim"] = legacy_model["dim_h"]
+        if legacy_model.get("dim_z") is not None:
+            legacy_model["latent_dim"] = legacy_model["dim_z"]
+        legacy_model.pop("name", None)
+        legacy_model.pop("dim_h", None)
+        legacy_model.pop("dim_z", None)
+        legacy_model.setdefault("type", str(model_cfg.get("type", "latent_ssm")))
+
+        if "models" not in cfg or not cfg.get("models"):
+            cfg["models"] = [legacy_model]
+
+    cfg.setdefault(
+        "model_io",
+        {"input_groups": ["control", "exogenous", "objective"], "output_groups": ["objective"]},
+    )
+    cfg.setdefault("data", {})
+    cfg.setdefault("training_rounds", [])
+    cfg.setdefault("evaluation", {})
+    cfg.setdefault("simulation", {})
+    cfg.setdefault("output", {})
+    cfg.setdefault("tracking", {})
+    cfg.setdefault("plotting", {})
+    cfg.setdefault("optimization", {})
+    cfg.setdefault("model_defaults", {})
+    cfg.setdefault("misc", {})
+    cfg.setdefault("architecture", {})
+    return cfg
+
+
+def load_config(cfg_path: str | Path, cli_args: Namespace | None = None) -> Dict[str, Any]:
+    """Load config via Hydra defaults composition.
+
+    Notes:
+    - ``_base`` inheritance is no longer supported.
+    - Plain YAML files without ``defaults`` are still loaded directly.
+    """
+    path = Path(cfg_path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    if "_base" in raw:
+        raise ValueError(
+            f"Config uses deprecated _base inheritance: {path}. "
+            "Migrate to Hydra defaults lists under configs/experiment/."
+        )
+
+    if "defaults" in raw:
+        cfg = _compose_hydra_config(path)
+    else:
+        cfg = raw
+
+    cfg = _materialize_legacy_shape(cfg)
+    return _apply_cli_overrides(cfg, cli_args)

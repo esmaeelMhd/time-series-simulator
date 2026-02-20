@@ -1,0 +1,35 @@
+# @package _global_
+
+defaults:
+  - /dataset: wastewater
+  - /model: rssm_wastewater
+  - /training: wastewater_rssm
+  - /serving: wastewater
+  - _self_
+
+output:
+  run_name: full_with_time
+
+optimization:
+  fast_mode: true
+  n_trials: 30
+  epochs: 3
+  steps_per_epoch: 40
+  fast_epochs: 3
+  fast_steps_per_epoch: 40
+  timeout: null
+  search_space_profile: fast_gpu
+  fast_sampling_horizon: 32
+  enable_pruning: true
+  pruner_warmup_steps: 2
+  pruner_min_epochs: 3
+
+training:
+  mode: multi_step
+  use_amp: true
+  use_compile: false
+  compile_mode: reduce-overhead
+  sampling:
+    strategy: random_fixed
+    horizon: 32
+

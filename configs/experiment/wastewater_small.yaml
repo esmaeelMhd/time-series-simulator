@@ -1,0 +1,62 @@
+# @package _global_
+
+defaults:
+  - /dataset: wastewater
+  - /model: rssm_wastewater
+  - /training: wastewater_rssm
+  - /serving: wastewater
+  - _self_
+
+output:
+  run_name: small
+
+dataset:
+  batch_size: 16
+  pred_len: 1
+  slice:
+    first_n: 1000
+
+training:
+  steps_per_epoch: null
+  sampling:
+    strategy: random_fixed
+    horizon: 12
+  probabilistic:
+    objective: rssm
+    recon_weight: 1.0
+    kl_weight: 0.5
+    aux_weight: 2.0
+    kl_warmup_enabled: true
+    kl_beta_start: 0.0
+    kl_beta_end: 1.0
+    kl_warmup_epochs: 2
+    mc_train_samples: 4
+
+training_rounds:
+  - name: train
+    epochs: 3
+    learning_rate: 0.001
+    models: [latent_ssm]
+  - name: retrain
+    epochs: 2
+    learning_rate: 0.0005
+    models: [latent_ssm]
+
+evaluation:
+  horizon: 12
+  n_windows: 4
+  probabilistic:
+    mc_samples: 64
+    interval_level: 0.90
+
+simulation:
+  horizon: 100
+  start_idx: 0
+
+model_io:
+  input_groups: ["control"]
+  output_groups: ["objective"]
+
+misc:
+  device: auto
+
