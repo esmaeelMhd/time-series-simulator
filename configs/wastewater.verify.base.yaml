@@ -1,0 +1,4 @@
+defaults:
+  - experiment: wastewater_verify_base
+  - _self_
+

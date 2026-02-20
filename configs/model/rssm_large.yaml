@@ -1,0 +1,12 @@
+name: rssm_large
+type: latent_ssm
+# Alias knobs for CLI convenience (Hydra): model.dim_h=...
+dim_h: null
+dim_z: null
+hidden_dim: 256
+latent_dim: 64
+encoder_dim: 128
+decoder_layers: 3
+num_layers: 2
+dropout: 0.1
+min_scale: 0.1

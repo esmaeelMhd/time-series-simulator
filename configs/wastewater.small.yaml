@@ -1,0 +1,4 @@
+defaults:
+  - experiment: wastewater_small
+  - _self_
+

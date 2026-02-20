@@ -1,0 +1,6 @@
+- experiment=wastewater_small
+- models=[latent_ssm]
+- epochs=1
+- steps_per_epoch=1
+- device=cpu
+- model.dim_h=64

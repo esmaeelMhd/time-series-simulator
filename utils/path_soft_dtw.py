@@ -1,12 +1,21 @@
+"""Path-based Soft-DTW for temporal loss computation.
+
+HOT PATH: This module is called during DILATE loss computation.
+Optimizations:
+- Batched CPU/GPU transfers (single transfer per batch)
+- Numba JIT for inner loops (unavoidable due to DTW structure)
+- Preallocated numpy arrays for results
+"""
+
 import numpy as np
 import torch
 from torch.autograd import Function
 from numba import jit
 
 
-@jit(nopython = True)
+@jit(nopython=True)
 def my_max(x, gamma):
-    # use the log-sum-exp trick
+    """Log-sum-exp trick for soft maximum."""
     max_x = np.max(x)
     exp_x = np.exp((x - max_x) / gamma)
     Z = np.sum(exp_x)
@@ -94,39 +103,62 @@ def dtw_hessian_prod(theta, Z, Q, E, gamma):
 
 
 class PathDTWBatch(Function):
+    """Batched Path-DTW for temporal loss computation.
+    
+    HOT PATH: Called during DILATE loss computation.
+    Optimizations:
+    - Single CPU transfer per batch (not per item)
+    - Preallocated numpy arrays for results
+    - Single GPU transfer after all computations
+    """
+    
     @staticmethod
-    def forward(ctx, D, gamma): # D.shape: [batch_size, N , N]
-        batch_size,N,N = D.shape
+    def forward(ctx, D, gamma):  # D.shape: [batch_size, N, N]
+        batch_size, N, _ = D.shape
         device = D.device
+        
+        # HOT PATH: Single CPU transfer for entire batch (Rule 7)
         D_cpu = D.detach().cpu().numpy()
-        gamma_gpu = torch.FloatTensor([gamma]).to(device)
+        gamma_tensor = torch.tensor([gamma], dtype=torch.float32, device=device)
         
-        grad_gpu = torch.zeros((batch_size, N ,N)).to(device)
-        Q_gpu = torch.zeros((batch_size, N+2 ,N+2,3)).to(device)
-        E_gpu = torch.zeros((batch_size, N+2 ,N+2)).to(device)  
+        # Preallocate numpy arrays for results (Rule 5: no allocations in loop)
+        grad_np = np.zeros((batch_size, N, N), dtype=np.float32)
+        Q_np = np.zeros((batch_size, N + 2, N + 2, 3), dtype=np.float32)
+        E_np = np.zeros((batch_size, N + 2, N + 2), dtype=np.float32)
         
-        for k in range(0,batch_size): # loop over all D in the batch    
-            _, grad_cpu_k, Q_cpu_k, E_cpu_k = dtw_grad(D_cpu[k,:,:], gamma)     
-            grad_gpu[k,:,:] = torch.FloatTensor(grad_cpu_k).to(device)
-            Q_gpu[k,:,:,:] = torch.FloatTensor(Q_cpu_k).to(device)
-            E_gpu[k,:,:] = torch.FloatTensor(E_cpu_k).to(device)
-        ctx.save_for_backward(grad_gpu,D, Q_gpu ,E_gpu, gamma_gpu) 
-        return torch.mean(grad_gpu, dim=0) 
+        # Numba JIT loop (unavoidable due to DTW recurrence structure)
+        for k in range(batch_size):
+            _, grad_np[k], Q_np[k], E_np[k] = dtw_grad(D_cpu[k], gamma)
+        
+        # HOT PATH: Single GPU transfer after all computations (Rule 7)
+        grad_gpu = torch.from_numpy(grad_np).to(device)
+        Q_gpu = torch.from_numpy(Q_np).to(device)
+        E_gpu = torch.from_numpy(E_np).to(device)
+        
+        ctx.save_for_backward(grad_gpu, D, Q_gpu, E_gpu, gamma_tensor)
+        return torch.mean(grad_gpu, dim=0)
     
     @staticmethod
     def backward(ctx, grad_output):
         device = grad_output.device
         grad_gpu, D_gpu, Q_gpu, E_gpu, gamma = ctx.saved_tensors
+        batch_size, N, _ = D_gpu.shape
+        
+        # HOT PATH: Single CPU transfer for entire batch
         D_cpu = D_gpu.detach().cpu().numpy()
         Q_cpu = Q_gpu.detach().cpu().numpy()
         E_cpu = E_gpu.detach().cpu().numpy()
-        gamma = gamma.detach().cpu().numpy()[0]
+        gamma_val = gamma.item()
         Z = grad_output.detach().cpu().numpy()
         
-        batch_size,N,N = D_cpu.shape
-        Hessian = torch.zeros((batch_size, N ,N)).to(device)
-        for k in range(0,batch_size):
-            _, hess_k = dtw_hessian_prod(D_cpu[k,:,:], Z, Q_cpu[k,:,:,:], E_cpu[k,:,:], gamma)
-            Hessian[k:k+1,:,:] = torch.FloatTensor(hess_k).to(device)
-
-        return  Hessian, None
+        # Preallocate numpy array for Hessian (Rule 5)
+        Hessian_np = np.zeros((batch_size, N, N), dtype=np.float32)
+        
+        # Numba JIT loop (unavoidable)
+        for k in range(batch_size):
+            _, Hessian_np[k] = dtw_hessian_prod(D_cpu[k], Z, Q_cpu[k], E_cpu[k], gamma_val)
+        
+        # HOT PATH: Single GPU transfer after all computations
+        Hessian = torch.from_numpy(Hessian_np).to(device)
+        
+        return Hessian, None

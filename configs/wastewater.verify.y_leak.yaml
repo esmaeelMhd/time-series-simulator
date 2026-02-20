@@ -1,0 +1,4 @@
+defaults:
+  - experiment: wastewater_verify_y_leak
+  - _self_
+

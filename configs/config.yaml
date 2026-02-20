@@ -1,0 +1,11 @@
+defaults:
+  - experiment: wastewater
+  - _self_
+
+# Runtime overrides (Hydra CLI), mapped to legacy-compatible trainer args.
+models: null
+epochs: null
+steps_per_epoch: null
+device: null
+use_optuna_best_params: null
+optuna_summary: null

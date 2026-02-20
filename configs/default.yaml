@@ -1,0 +1,4 @@
+# Legacy alias. Canonical entrypoint is configs/config.yaml.
+defaults:
+  - experiment: wastewater
+  - _self_
