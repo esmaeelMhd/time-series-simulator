@@ -13,10 +13,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 import yaml
 from joblib import load as joblib_load
 
-from timesim.utils.config import load_config
+from timesim.utils.config import compose_config
 from timesim.data.loader import (
     load_csv_dataset,
     resolve_split_ratios,
@@ -38,9 +40,10 @@ from timesim.models.factory import build_model
 from timesim.training.losses import soft_dtw_distance
 
 
-def parse_args():
+def _build_cli_parser():
     p = argparse.ArgumentParser(description="Run RSSM training/eval checklist suite")
-    p.add_argument("--config", type=str, required=True)
+    p.add_argument("--config", "--config-name", type=str, required=True,
+                   help="Hydra config name or path to YAML config")
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--compare-checkpoint", type=str, default=None)
     p.add_argument("--compare-config", type=str, default=None)
@@ -52,7 +55,7 @@ def parse_args():
     p.add_argument("--mc-samples", type=int, default=None)
     p.add_argument("--sigma-scale", type=float, default=None)
     p.add_argument("--output-dir", type=str, default=None)
-    return p.parse_args()
+    return p
 
 
 def _resolve_checkpoint(config: Dict[str, Any], explicit: str | None) -> Path:
@@ -117,12 +120,8 @@ def _build_test_dataset(config: Dict[str, Any], scaler) -> GroupedTimeSeriesData
     if test_split is None:
         ratios = resolve_split_ratios(
             split_cfg=data_cfg.get("splits", None),
-            train_split=dcfg.get("train_split", data_cfg.get("train_split", None)),
-            default=(
-                float(data_cfg.get("default_train_ratio", 0.70)),
-                float(data_cfg.get("default_val_ratio", 0.15)),
-                float(data_cfg.get("default_test_ratio", 0.15)),
-            ),
+            train_split=None,
+            default=(0.70, 0.15, 0.15),
         )
         _, _, test_df = chronological_split_dataframe(df, split_ratios=ratios)
         test_start = len(df) - len(test_df)
@@ -690,15 +689,39 @@ def _rollout_dtw_and_sigma_curve(
             history_c, history_x = _split_controls_exogenous(dataset, warmup_inputs)
             future_c, future_x = _split_controls_exogenous(dataset, future_inputs)
 
-            out = model.condition_then_simulate(
-                history_controls=torch.from_numpy(history_c).unsqueeze(0).to(device),
-                history_exogenous=torch.from_numpy(history_x).unsqueeze(0).to(device),
-                history_objectives=torch.from_numpy(history_y).unsqueeze(0).to(device),
-                future_controls=torch.from_numpy(future_c).unsqueeze(0).to(device),
-                future_exogenous=torch.from_numpy(future_x).unsqueeze(0).to(device),
-                n_steps=horizon,
-                n_samples=n_samples,
+            history_controls_t = torch.from_numpy(history_c).unsqueeze(0).to(device)
+            history_exogenous_t = torch.from_numpy(history_x).unsqueeze(0).to(device)
+            history_objectives_t = torch.from_numpy(history_y).unsqueeze(0).to(device)
+            future_controls_t = torch.from_numpy(future_c).unsqueeze(0).to(device)
+            future_exogenous_t = torch.from_numpy(future_x).unsqueeze(0).to(device)
+            warmup_seq = {
+                "controls": history_controls_t,
+                "exogenous": history_exogenous_t,
+                "outputs": history_objectives_t,
+                "inputs": torch.cat(
+                    [history_controls_t, history_exogenous_t, history_objectives_t],
+                    dim=-1,
+                ),
+            }
+            rollout_inputs = {
+                "controls": future_controls_t,
+                "exogenous": future_exogenous_t,
+            }
+            out = model.rollout(
+                warmup_seq=warmup_seq,
+                rollout_inputs=rollout_inputs,
+                horizon=horizon,
             )
+            if n_samples > 1 and hasattr(model, "rollout_mc"):
+                mc_out = model.rollout_mc(
+                    warmup_seq=warmup_seq,
+                    rollout_inputs=rollout_inputs,
+                    horizon=horizon,
+                    n_samples=n_samples,
+                )
+                out = dict(out)
+                out["samples"] = mc_out["samples"]
+                out["predictions"] = mc_out.get("mean", out["predictions"])
 
             pred_mean: np.ndarray
             pred_std: np.ndarray
@@ -877,8 +900,9 @@ def _compute_latent_kl_windows(
 
 
 def main():
-    args = parse_args()
-    config = load_config(args.config)
+    parser = _build_cli_parser()
+    args, hydra_overrides = parser.parse_known_args()
+    config = compose_config(args.config, overrides=hydra_overrides)
     if args.device:
         config.setdefault("misc", {})
         config["misc"]["device"] = args.device
@@ -1156,7 +1180,7 @@ def main():
     compare_rollout_specific: Optional[Dict[str, Any]] = None
     uncertainty_compare: Optional[Dict[str, Any]] = None
     if args.compare_checkpoint:
-        compare_cfg = load_config(args.compare_config) if args.compare_config else config
+        compare_cfg = compose_config(args.compare_config) if args.compare_config else config
         compare_cfg.setdefault("misc", {})
         compare_cfg["misc"]["device"] = device
         compare_checkpoint = _resolve_checkpoint(compare_cfg, args.compare_checkpoint)

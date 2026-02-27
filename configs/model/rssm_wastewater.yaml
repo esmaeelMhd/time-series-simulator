@@ -1,22 +1,31 @@
 name: rssm_wastewater
 type: latent_ssm
 
-# Alias knobs for CLI convenience (Hydra): model.dim_h=...
-dim_h: null
-dim_z: null
-
-hidden_dim: 96
-latent_dim: 24
-encoder_dim: 64
+hidden_dim: 512
+latent_dim: 64
+latent_distribution: categorical
+stochastic_groups: 32
+stochastic_classes: 32
+encoder_dim: 512
 decoder_layers: 2
 num_layers: 1
 dropout: 0.05
-min_scale: 0.02
+prior_min_std: 0.1
+prior_max_std: 1.5
+posterior_min_std: 0.1
+posterior_max_std: 1.5
+prior_constant_std: 0.1
+posterior_constant_std: 0.1
+decoder_min_std: 0.5
+decoder_max_std: 2.0
 min_df: 2.2
 use_symlog: false
 use_aux_decoder: true
+predict_exogenous: false
 use_dual_path: true
 use_stochastic_path: true
 share_encoder_weights: false
 leak_objective_to_transition: false
-
+min_std: 0.5
+h_dropout: 0.2
+decoder_hidden: 512

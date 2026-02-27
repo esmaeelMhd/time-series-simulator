@@ -1,0 +1,5 @@
+name: lstm
+type: lstm
+hidden_dim: 64
+num_layers: 2
+dropout: 0.0

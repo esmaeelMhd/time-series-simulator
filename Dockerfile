@@ -8,14 +8,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+ARG REQUIREMENTS_FILE="requirements.txt"
 ARG PIP_EXTRA_INDEX_URL=""
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements*.txt /app/
 RUN pip install --upgrade pip && \
     if [ -n "$PIP_EXTRA_INDEX_URL" ]; then \
-      PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" pip install -r /app/requirements.txt; \
+      PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" pip install -r "/app/${REQUIREMENTS_FILE}"; \
     else \
-      pip install -r /app/requirements.txt; \
+      pip install -r "/app/${REQUIREMENTS_FILE}"; \
     fi
 
 COPY . /app

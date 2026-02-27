@@ -248,6 +248,50 @@ def build_grouped_dataloaders(
     return train_loader, val_loader, scaler
 
 
+def build_dataloaders_from_config(
+    config: Dict[str, Any],
+    df: pd.DataFrame,
+    seed: Optional[int],
+    scaler=None,
+) -> Tuple[DataLoader, DataLoader, object]:
+    """Build grouped train/val dataloaders from a composed runtime config."""
+    data_cfg = config.get("data", {}) or {}
+    dataset_cfg = config["dataset"]
+    model_io_cfg = config["model_io"]
+
+    add_time = bool(data_cfg.get("add_time_features", False))
+    time_features_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time = bool(time_features_cfg.get("enabled")) or add_time
+
+    split_cfg = data_cfg.get("splits", None)
+    train_split = float((split_cfg or {}).get("train", 0.7))
+
+    return build_grouped_dataloaders(
+        df=df,
+        groups=dataset_cfg["variables"],
+        input_groups=model_io_cfg["input_groups"],
+        output_groups=model_io_cfg["output_groups"],
+        seq_len=int(dataset_cfg["seq_len"]),
+        pred_len=int(dataset_cfg["pred_len"]),
+        batch_size=int(dataset_cfg["batch_size"]),
+        train_split=train_split,
+        split_cfg=split_cfg,
+        add_time=add_time,
+        time_features_cfg=time_features_cfg,
+        existing_scaler=scaler,
+        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
+        seed=seed,
+        shuffle_train=bool(data_cfg.get("shuffle_train", True)),
+        drop_last=bool(data_cfg.get("drop_last", True)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", False)),
+        stride=int(data_cfg.get("window_stride", 1)),
+        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
+        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
+    )
+
+
 def build_grouped_triplet_dataloaders(
     df: pd.DataFrame,
     groups: Dict[str, List[str]],

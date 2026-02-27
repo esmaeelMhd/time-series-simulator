@@ -85,21 +85,24 @@ dmypy.json
 # Model checkpoints and training outputs
 runs/*/
 !runs/.gitkeep
+outputs/
 *.pth
 *.pkl
 *.npy
+lightning_logs/
 
 # TensorBoard logs
 events.out.tfevents.*
 
-# Large data files (tracked with LFS)
-# datasets/*.csv already in LFS
+# Datasets
+datasets/
 
 # Temporary files
 *.log
 *.tmp
 *.bak
 *.orig
+.dccache
 
 # OS generated files
 .DS_Store

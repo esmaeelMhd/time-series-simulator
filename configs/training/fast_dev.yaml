@@ -1,8 +1,11 @@
-epochs: 3
-steps_per_epoch: 20
-learning_rate: 0.0003
-optimizer: adamw
-weight_decay: 0.000001
-grad_clip_norm: 100.0
-lr_warmup_steps: 100
-lr_min_ratio: 0.1
+# @package _global_
+
+training:
+  epochs: 3
+  steps_per_epoch: 20
+  learning_rate: 0.0003
+  optimizer: adamw
+  weight_decay: 0.000001
+  grad_clip_norm: 100.0
+  lr_warmup_steps: 100
+  lr_min_ratio: 0.1

@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from timesim.utils.config import load_config
+from timesim.utils.config import compose_config
 
 
 @dataclass(frozen=True)
@@ -108,9 +108,9 @@ ABLATIONS: List[AblationSpec] = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
     p = argparse.ArgumentParser(description="Run RSSM Phase-8 ablation study suite.")
-    p.add_argument("--base-config", type=str, required=True)
+    p.add_argument("--base-config", "--config-name", dest="base_config", type=str, required=True)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--ablations", nargs="*", default=None, help="Subset by slug, e.g. no_aux_decoder no_rollout_training")
     p.add_argument("--epochs", type=int, default=None, help="Override training epochs for all runs.")
@@ -127,7 +127,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--skip-existing", action="store_true", help="Reuse existing checkpoints/eval outputs when present.")
     p.add_argument("--dry-run", action="store_true")
-    return p.parse_args()
+    args, hydra_overrides = p.parse_known_args()
+    return args, hydra_overrides
 
 
 def _repo_root() -> Path:
@@ -315,14 +316,14 @@ def _write_yaml(path: Path, obj: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    args = parse_args()
+    args, hydra_overrides = parse_args()
     root = _repo_root()
     train_script = root / "scripts" / "train.py"
     eval_script = root / "scripts" / "eval_rssm_suite.py"
     if not train_script.exists() or not eval_script.exists():
         raise FileNotFoundError("Expected scripts/train.py and scripts/eval_rssm_suite.py in repository.")
 
-    base_cfg = load_config(args.base_config)
+    base_cfg = compose_config(args.base_config, overrides=hydra_overrides)
     base_run_name = str(base_cfg.get("output", {}).get("run_name", "ablation_full")).strip() or "ablation_full"
     selected = {s.lower() for s in (args.ablations or [])}
     specs = [s for s in ABLATIONS if not selected or s.slug.lower() in selected]

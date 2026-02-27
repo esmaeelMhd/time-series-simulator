@@ -1,0 +1,5 @@
+# CPU-only dependency set
+--index-url https://pypi.org/simple
+
+-r requirements.base.txt
+torch==2.10.0

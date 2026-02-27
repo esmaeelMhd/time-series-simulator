@@ -3,6 +3,7 @@
 defaults:
   - /dataset: wastewater
   - /model: rssm_wastewater
+  - /model_defaults: default
   - /training: wastewater_rssm
   - /serving: wastewater
   - _self_
@@ -29,17 +30,13 @@ training:
     kl_warmup_enabled: true
     kl_beta_start: 0.0
     kl_beta_end: 1.0
-    kl_warmup_epochs: 2
+    kl_warmup_epochs: 15
     mc_train_samples: 4
 
 training_rounds:
   - name: train
     epochs: 3
     learning_rate: 0.001
-    models: [latent_ssm]
-  - name: retrain
-    epochs: 2
-    learning_rate: 0.0005
     models: [latent_ssm]
 
 evaluation:

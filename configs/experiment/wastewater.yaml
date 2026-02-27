@@ -3,18 +3,14 @@
 defaults:
   - /dataset: wastewater
   - /model: rssm_wastewater
+  - /model_defaults: default
   - /training: wastewater_rssm
   - /serving: wastewater
   - _self_
 
-architecture:
-  primary_model: latent_ssm
-  legacy_model_types: [lstm, dlinear, nlinear, tft, transformer, xgboost]
-  migration_phase: rssm_primary
-
 output:
   runs_dir: runs
-  run_name: full_with_time
+  run_name: full_categorical
 
 misc:
   device: cuda
@@ -27,4 +23,3 @@ tracking:
   run_name: null
   tags: [rssm, wastewater]
   log_config: true
-

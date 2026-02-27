@@ -1,4 +1,7 @@
-host: 0.0.0.0
-port: 8000
-session_ttl_seconds: 3600
-sigma_scale: 1.0
+# @package _global_
+
+serving:
+  host: 0.0.0.0
+  port: 8000
+  session_ttl_seconds: 3600
+  sigma_scale: 1.0

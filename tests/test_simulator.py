@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 
 from timesim.data.dataset import GroupedTimeSeriesDataset
-from timesim.serving.simulator import RSSMSimulator
+from timesim.simulator import RSSMSimulator
 
 
 class _DummyState:

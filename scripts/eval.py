@@ -44,15 +44,22 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 import yaml
 
-from timesim.utils.config import load_config
-from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.utils.config import compose_config
+from timesim.data.loader import load_csv_dataset, build_dataloaders_from_config
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
 from timesim.utils.plotting import save_forecast_plot
 from timesim.utils.misc import seed_everything, resolve_device
-from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
+from timesim.models.factory import (
+    build_model,
+    count_parameters,
+    get_model_param_names,
+    NEURAL_MODELS,
+)
 
 try:
     from timesim.models.xgboost_model import XGBoostForecaster
@@ -93,23 +100,6 @@ def discover_checkpoints(model_dir: Path, model_type: str):
     return found
 
 
-MODEL_PARAM_KEYS_BY_TYPE = {
-    "lstm": {"hidden_dim", "num_layers", "dropout"},
-    "dlinear": {"kernel_size", "individual"},
-    "nlinear": {"individual"},
-    "tft": {"hidden_dim", "n_heads", "num_lstm_layers", "dropout"},
-    "transformer": {"d_model", "nhead", "num_layers", "dim_feedforward", "dropout"},
-    "latent_ssm": {
-        "hidden_dim", "latent_dim", "num_layers", "dropout",
-        "min_scale", "min_df", "encoder_dim", "decoder_layers", "use_symlog",
-        "use_aux_decoder", "use_dual_path", "use_stochastic_path",
-        "share_encoder_weights", "leak_objective_to_transition",
-        "allow_objective_leak_for_ablation", "allow_disable_aux_decoder_for_ablation",
-        "allow_shared_encoder_for_ablation", "allow_disable_stochastic_for_ablation",
-    },
-    "xgboost": {"strategy", "n_estimators", "max_depth", "learning_rate"},
-}
-
 
 def _resolve_optuna_summary_path(config, run_dir: Path, cli_path: str | None = None) -> Path:
     if cli_path:
@@ -139,7 +129,7 @@ def _load_optuna_best_params(summary_path: Path):
 
 
 def _split_optuna_params(model_type: str, best_params):
-    model_keys = MODEL_PARAM_KEYS_BY_TYPE.get(model_type, set())
+    model_keys = get_model_param_names(model_type)
     model_overrides = {k: v for k, v in best_params.items() if k in model_keys}
     training_overrides = {
         k: v
@@ -194,14 +184,14 @@ def _split_optuna_params(model_type: str, best_params):
 # CLI
 # ─────────────────────────────────────────────────────────────────────
 
-def parse_args():
+def _build_cli_parser():
     parser = argparse.ArgumentParser(
         description="Evaluate a trained model (no training)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to YAML/Hydra config")
+    parser.add_argument("--config", "--config-name", type=str, required=True,
+                        help="Hydra config name or path to YAML config")
     parser.add_argument("--model", type=str, required=True,
                         help="Model type to evaluate (e.g. lstm, transformer, xgboost)")
     parser.add_argument("--round", type=str, default=None,
@@ -229,7 +219,6 @@ def parse_args():
         help="Path to Optuna summary.yaml (default: <run_dir>/optuna/summary.yaml)",
     )
 
-    # ── Evaluation overrides ──────────────────────────────────────────
     eval_grp = parser.add_argument_group("evaluation overrides")
     eval_grp.add_argument("--eval-horizon", type=int, default=None,
                           help="Override evaluation rollout horizon")
@@ -238,7 +227,6 @@ def parse_args():
     eval_grp.add_argument("--no-eval", action="store_true",
                           help="Skip evaluation (multi-window rollout)")
 
-    # ── Simulation overrides ──────────────────────────────────────────
     sim_grp = parser.add_argument_group("simulation overrides")
     sim_grp.add_argument("--sim-horizon", type=int, default=None,
                          help="Override simulation horizon (number of recursive steps)")
@@ -247,12 +235,11 @@ def parse_args():
     sim_grp.add_argument("--no-sim", action="store_true",
                          help="Skip recursive simulation")
 
-    # ── Output ────────────────────────────────────────────────────────
     out_grp = parser.add_argument_group("output")
     out_grp.add_argument("--prefix", type=str, default="eval",
                          help="Prefix for output file names (default: 'eval')")
 
-    return parser.parse_args()
+    return parser
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -260,10 +247,10 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
+    parser = _build_cli_parser()
+    args, hydra_overrides = parser.parse_known_args()
 
-    # ── Load config ───────────────────────────────────────────────────
-    config = load_config(args.config)
+    config = compose_config(args.config, overrides=hydra_overrides)
     if args.device:
         config["misc"]["device"] = args.device
     if args.use_optuna_best_params is not None:
@@ -301,8 +288,14 @@ def main():
     input_cols = schema.columns_for_group_names(input_groups)
     output_cols = schema.columns_for_group_names(output_groups)
 
-    seq_len = config["dataset"]["seq_len"]
+    dataset_seq_len = int(config["dataset"]["seq_len"])
     pred_len = config["dataset"]["pred_len"]
+    seq_len = int(
+        config.get("training", {}).get(
+            "window_len",
+            config.get("training", {}).get("warmup_len", dataset_seq_len),
+        )
+    ) if model_type == "latent_ssm" else dataset_seq_len
     # Use union to avoid double-counting when output_cols are in input_groups
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
@@ -324,7 +317,10 @@ def main():
     control_dim = len([c for c in input_cols if c in control_cols])
     exo_dim = len([c for c in input_cols if c in exo_cols_list])
 
-    warmup_len = config["training"].get("warmup_len", seq_len)
+    warmup_len = config["training"].get(
+        "window_len",
+        config["training"].get("warmup_len", seq_len),
+    )
 
     # ── Resolve eval/sim parameters (CLI overrides > config) ──────────
     eval_horizon = (args.eval_horizon
@@ -423,8 +419,6 @@ def main():
     # ── Load dataset ──────────────────────────────────────────────────
     index_col = config["dataset"].get("index_col",
                                        data_cfg.get("index_col", "date"))
-    train_split = config["dataset"].get("train_split",
-                                         data_cfg.get("train_split", 0.7))
 
     scaler_path = run_dir / "scaler.pkl"
     if not scaler_path.exists():
@@ -444,24 +438,11 @@ def main():
         validation_cfg=data_cfg.get("validation", None),
     )
 
-    _, val_loader, _ = build_grouped_dataloaders(
-        df, groups, input_groups, output_groups,
-        seq_len=seq_len, pred_len=pred_len,
-        batch_size=config["dataset"]["batch_size"],
-        train_split=train_split,
-        split_cfg=data_cfg.get("splits", None),
-        add_time=add_time_features,
-        time_features_cfg=time_features_cfg,
+    _, val_loader, _ = build_dataloaders_from_config(
+        config=config,
+        df=df,
         seed=seed,
-        shuffle_train=bool(data_cfg.get("shuffle_train", True)),
-        drop_last=bool(data_cfg.get("drop_last", True)),
-        num_workers=int(data_cfg.get("num_workers", 0)),
-        pin_memory=bool(data_cfg.get("pin_memory", False)),
-        stride=int(data_cfg.get("window_stride", 1)),
-        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
-        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
-        existing_scaler=scaler,
-        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
+        scaler=scaler,
     )
     val_dataset = val_loader.dataset
 
@@ -614,4 +595,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

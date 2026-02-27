@@ -1,4 +1,5 @@
 defaults:
+  - /model_defaults: default
   - experiment: wastewater
   - _self_
 

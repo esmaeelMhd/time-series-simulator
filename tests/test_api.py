@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.serving.api import create_app
-from timesim.serving.simulator import RSSMSimulator
+from timesim.simulator import RSSMSimulator
 
 
 class _DummyState:

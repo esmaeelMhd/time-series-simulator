@@ -1,0 +1,6 @@
+defaults:
+  - experiment: wastewater_optuna_fast
+  - _self_
+
+misc:
+  device: auto

@@ -3,12 +3,13 @@
 defaults:
   - /dataset: wastewater
   - /model: rssm_wastewater
+  - /model_defaults: default
   - /training: wastewater_rssm
   - /serving: wastewater
   - _self_
 
 output:
-  run_name: full_with_time
+  run_name: full_categorical
 
 optimization:
   fast_mode: true
@@ -23,12 +24,15 @@ optimization:
   enable_pruning: true
   pruner_warmup_steps: 2
   pruner_min_epochs: 3
+  fast_training_mode: multi_step
 
 training:
   mode: multi_step
   use_amp: true
-  use_compile: false
-  compile_mode: reduce-overhead
+  use_compile: true
+  compile_mode: default
+  compile_backend: inductor
+  lightning_progress_bar: true
   sampling:
     strategy: random_fixed
     horizon: 32

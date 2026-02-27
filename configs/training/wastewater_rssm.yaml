@@ -1,70 +1,111 @@
 # @package _global_
 
 training:
-  epochs: 50
-  steps_per_epoch: 1000
+  engine: lightning
+  allow_engine_fallback: false
+  epochs: 100
+  steps_per_epoch: null
   learning_rate: 0.0005
   optimizer: adamw
   weight_decay: 0.000001
-  grad_clip_norm: 100.0
+  grad_clip_norm: 10.0
   lr_warmup_steps: 1000
   lr_min_ratio: 0.01
-  patience: 30
-  warmup_len: 24
-  use_optuna_best_params: true
-  sampling_strategy: random_fixed
+  early_stopping: true
+  patience: 40
+  early_stopping_min_epoch: 25
+  early_stopping_start_epoch: 25
+
+  # Lookback window: number of past time steps fed into observe() to
+  # initialize the RSSM hidden state before the training horizon begins.
+  # No loss is computed here — it only primes the model's memory.
+  warmup_len: 128
+  # Migration key for RSSM windowing. Keep aligned with warmup_len.
+  window_len: 128
+
+  use_optuna_best_params: false
   sampling:
     strategy: random_fixed
-    horizon: 120
+    # Training horizon: total sequence length for the teacher-forcing
+    # observe() pass. The model sees ground truth at every step and learns
+    # reconstruction + KL loss over this window.
+    # Directly affects training speed — each step is one sequential RSSM cell call.
+    horizon: 30
     h_min: 1
-    h_max: 120
+    h_max: 30
     stride: 12
     start_hour: 0
     samples_per_hour: 1
+
   checkpoint_simulation:
     enabled: true
     n_rounds: 4
-    horizon: null
+    horizon: 30
     start_idx: 0
-  sequence_curriculum:
-    enabled: false
-    start_horizon: 16
-    target_horizon: 120
+  
+
   probabilistic:
     enabled: true
     objective: rssm
     recon_weight: 1.0
-    kl_weight: 0.5
-    aux_weight: 2.0
+    # kl_weight=1.0 with discrete (categorical) latents otherwise 0.01-0.1 with continuous (Gaussian) latents usually works well
+    kl_weight: 1.0
+    aux_weight: 0.0
     rollout_weight: 0.0
     rollout_dtw_weight: 0.0
     rollout_dtw_gamma: 0.1
-    rollout_warmup_fraction: 0.30
-    rollout_max_horizon: 24
+    rollout_warmup_fraction: 0.15
+    # Rollout horizon: max steps for the model-feedback imagine() pass
+    # that runs AFTER teacher-forcing. The model predicts WITHOUT seeing
+    # ground truth (pure prior rollout) and is penalized via rollout loss.
+    # Teaches the model to stay accurate over multi-step predictions.
+    # rollout_max_horizon is used for open loop CRPS even in validation even if rouulout_weight is 0 in training
+    rollout_max_horizon: 30
+    rollout_start_epoch: 4
+    rollout_full_epoch: 25
     min_context: 16
-    kl_free_bits: 1.0
-    kl_balance: 0.8
-    use_kl_balancing: true
     use_free_bits: true
+    # Helps prevent early collapse (1.0 with discrete latents) otherwise 0.1-0.3 with continuous latents
+    kl_free_bits: 1.0
+    # Crucially, balance KL loss between latent groups to prevent posterior collapse in some groups
+    kl_balance: 0.9
+    use_kl_balancing: true
     kl_warmup_enabled: true
     kl_beta_start: 0.0
     kl_beta_end: 1.0
-    kl_warmup_epochs: 20
+    kl_anneal_epochs: 15
+    kl_warmup_epochs: 15
     mc_train_samples: 8
     checkpoint_metric: open_loop_crps
     checkpoint_open_loop_horizon: 120
     checkpoint_open_loop_windows: 4
     checkpoint_open_loop_samples: 64
     checkpoint_top_k: 3
+
   use_amp: true
-  use_compile: false
+  use_compile: true
   compile_mode: default
+  compile_backend: inductor
+  lightning_progress_bar: true
+
+  # Sequence curriculum: ramp horizon steadily (reach full horizon by epoch 25)
+  sequence_curriculum:
+    enabled: true
+    start_horizon: 4
+    target_horizon: 30
+    # Ramp settings: start ramp at epoch 2 and reach target by epoch 25
+    start_epoch: 2
+    max_epoch: 25
 
 training_rounds:
   - name: train
-    epochs: 50
+    epochs: 100
     learning_rate: 0.001
     models: [latent_ssm]
+
+optimization:
+  epochs: 15
+  steps_per_epoch: 500
 
 evaluation:
   probabilistic:
@@ -75,4 +116,3 @@ evaluation:
 simulation:
   horizon: 360
   start_idx: 0
-

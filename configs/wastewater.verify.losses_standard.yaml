@@ -1,4 +1,0 @@
-defaults:
-  - experiment: wastewater_verify_losses_standard
-  - _self_
-

@@ -51,6 +51,30 @@ def get_rollout_schedule(epoch: int, cfg: Mapping[str, Any]) -> tuple[int, int, 
     min_context = max(1, int(_read_cfg(cfg, "min_context", 16)))
     max_horizon_cfg = max(0, int(_read_cfg(cfg, "rollout_max_horizon", seq_len)))
     max_horizon = min(max_horizon_cfg, max(0, seq_len - min_context))
+    # Allow explicit sequence curriculum overrides (start/max epoch + target horizon)
+    sc = None
+    if isinstance(cfg, Mapping) and "sequence_curriculum" in cfg:
+        sc = cfg.get("sequence_curriculum")
+    if isinstance(sc, Mapping):
+        if "start_epoch" in sc and "max_epoch" in sc and "target_horizon" in sc:
+            start_ep = int(sc.get("start_epoch", 1))
+            max_ep = int(sc.get("max_epoch", start_ep))
+            start_h = int(sc.get("start_horizon", 1))
+            target_h = int(sc.get("target_horizon", max_horizon))
+            if ep <= start_ep:
+                ramp = 0.0
+                horizon = start_h
+            elif ep >= max_ep:
+                ramp = 1.0
+                horizon = target_h
+            else:
+                denom = max(1, max_ep - start_ep)
+                ramp = float(ep - start_ep) / float(denom)
+                ramp = max(0.0, min(1.0, ramp))
+                horizon = int(round(start_h + ramp * (target_h - start_h)))
+            horizon = max(0, min(int(seq_len - min_context), int(horizon)))
+            context_len = max(min_context, seq_len - horizon)
+            return int(horizon), int(context_len), float(ramp)
     if max_horizon <= 0:
         return 0, seq_len, 0.0
 
@@ -165,13 +189,21 @@ def _prepare_batch_data(
     # [controls, known_exogenous(+time), previous_outputs].
     warmup_full = np.concatenate([warmup_controls, warmup_exogenous, warmup_outputs], axis=-1)
     
+    use_cuda = device.type == "cuda"
+
+    def _to_device(arr: np.ndarray) -> torch.Tensor:
+        t = torch.from_numpy(arr)
+        if use_cuda:
+            return t.pin_memory().to(device, non_blocking=True)
+        return t.to(device)
+
     return {
-        "warmup_controls": torch.from_numpy(warmup_controls).to(device),
-        "warmup_exogenous": torch.from_numpy(warmup_exogenous).to(device),
-        "warmup_outputs": torch.from_numpy(warmup_outputs).to(device),
-        "warmup_full": torch.from_numpy(warmup_full).to(device),
-        "rollout_inputs": torch.from_numpy(rollout_inputs).to(device),
-        "rollout_targets": torch.from_numpy(rollout_targets).to(device),
+        "warmup_controls": _to_device(warmup_controls),
+        "warmup_exogenous": _to_device(warmup_exogenous),
+        "warmup_outputs": _to_device(warmup_outputs),
+        "warmup_full": _to_device(warmup_full),
+        "rollout_inputs": _to_device(rollout_inputs),
+        "rollout_targets": _to_device(rollout_targets),
     }
 
 

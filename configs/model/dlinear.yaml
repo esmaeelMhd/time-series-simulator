@@ -1,0 +1,4 @@
+name: dlinear
+type: dlinear
+kernel_size: 25
+individual: false

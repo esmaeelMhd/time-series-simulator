@@ -37,9 +37,11 @@ from .base import WorldModelBase
 from .factory import (
     build_model,
     count_parameters,
+    get_model_param_names,
     NEURAL_MODELS,
     PRIMARY_MODEL_TYPES,
     LEGACY_MODEL_TYPES,
+    MODEL_TYPE_CONSTANTS,
 )
 from .lstm import LSTMWorldModel, SimpleLSTM
 from .transformer import SimpleTransformer, TransformerWorldModel
@@ -56,10 +58,6 @@ from .encoders import (
     assert_no_shared_encoder_params,
 )
 from .decoders import ObjectiveDecoder, AuxiliaryDecoder
-from .world_model import WorldModel
-from .rssm_main import RSSMWorldModel
-from . import rssm_stack
-from . import legacy
 
 # Optional XGBoost (may not be installed)
 try:
@@ -181,11 +179,9 @@ __all__ = [
 
     # Probabilistic
     "LatentSSMWorldModel",
-    "RSSMWorldModel",
     "RSSMState",
     "RSSMOutput",
     "RSSMCell",
-    "WorldModel",
     "ControlEncoder",
     "ExogenousEncoder",
     "ObservationEncoder",
@@ -201,11 +197,11 @@ __all__ = [
     # Factory
     "build_model",
     "count_parameters",
+    "get_model_param_names",
     "NEURAL_MODELS",
     "PRIMARY_MODEL_TYPES",
     "LEGACY_MODEL_TYPES",
-    "rssm_stack",
-    "legacy",
+    "MODEL_TYPE_CONSTANTS",
     
     # Utilities
     "get_model",

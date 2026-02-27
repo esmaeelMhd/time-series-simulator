@@ -10,13 +10,14 @@ Design constraints enforced (default configuration):
 from __future__ import annotations
 
 from typing import Dict, Literal, Optional, Tuple
+import logging
 
 import torch
 import torch.nn as nn
 
 from .base import WorldModelBase
 from .decoders import AuxiliaryDecoder, ObjectiveDecoder
-from .distributions import diagonal_independent_normal
+from .distributions import diagonal_independent_normal, fast_sample
 from .encoders import (
     ControlEncoder,
     ExogenousEncoder,
@@ -25,6 +26,8 @@ from .encoders import (
     assert_no_shared_encoder_params,
 )
 from .rssm import RSSMCell, RSSMState
+
+logger = logging.getLogger(__name__)
 
 
 class LatentSSMWorldModel(WorldModelBase):
@@ -41,7 +44,17 @@ class LatentSSMWorldModel(WorldModelBase):
         num_layers: int = 1,
         dropout: float = 0.1,
         pred_len: int = 1,
-        min_scale: float = 1e-4,
+        min_scale: float = 0.5,
+        min_std: Optional[float] = None,
+        max_std: float = 2.0,
+        decoder_min_std: Optional[float] = None,
+        decoder_max_std: Optional[float] = None,
+        prior_min_std: float = 0.1,
+        prior_max_std: float = 1.5,
+        posterior_min_std: float = 0.1,
+        posterior_max_std: float = 1.5,
+        prior_constant_std: Optional[float] = None,
+        posterior_constant_std: Optional[float] = None,
         min_df: float = 2.1,
         control_dim: Optional[int] = None,
         exogenous_dim: Optional[int] = None,
@@ -49,23 +62,61 @@ class LatentSSMWorldModel(WorldModelBase):
         decoder_layers: int = 2,
         use_symlog: bool = False,
         use_aux_decoder: bool = True,
+        predict_exogenous: bool = True,
         use_dual_path: bool = True,
         use_stochastic_path: bool = True,
         share_encoder_weights: bool = False,
         leak_objective_to_transition: bool = False,
+        h_dropout: float = 0.0,
+        decoder_hidden: Optional[int] = None,
         allow_objective_leak_for_ablation: bool = False,
         allow_disable_aux_decoder_for_ablation: bool = False,
         allow_shared_encoder_for_ablation: bool = False,
         allow_disable_stochastic_for_ablation: bool = False,
+        latent_distribution: str = "gaussian",
+        stochastic_groups: int = 32,
+        stochastic_classes: int = 32,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
         self.hidden_dim = int(hidden_dim)
-        self.latent_dim = int(latent_dim)
+        self.latent_distribution = str(latent_distribution).lower().strip()
+        self.stochastic_groups = int(stochastic_groups)
+        self.stochastic_classes = int(stochastic_classes)
+        if self.latent_distribution == "categorical":
+            self.latent_dim = self.stochastic_groups * self.stochastic_classes
+        else:
+            self.latent_dim = int(latent_dim)
         self.num_layers = int(num_layers)
         self.pred_len = int(pred_len)
         self.min_scale = float(min_scale)
+        if decoder_min_std is None:
+            raw_min_std = self.min_scale if min_std is None else float(min_std)
+        else:
+            raw_min_std = float(decoder_min_std)
+        dec_max_std_cfg = float(max_std if decoder_max_std is None else decoder_max_std)
+        # Decoder std bounds.
+        self.min_std = float(max(0.5, raw_min_std))
+        self.max_std = float(max(self.min_std, dec_max_std_cfg))
+        # Latent prior/posterior std bounds.
+        self.prior_min_std = float(max(0.0, float(prior_min_std)))
+        self.prior_max_std = float(max(self.prior_min_std, float(prior_max_std)))
+        self.posterior_min_std = float(max(0.0, float(posterior_min_std)))
+        self.posterior_max_std = float(max(self.posterior_min_std, float(posterior_max_std)))
+        self.prior_constant_std = (
+            None if prior_constant_std is None else float(max(1e-6, float(prior_constant_std)))
+        )
+        self.posterior_constant_std = (
+            None if posterior_constant_std is None else float(max(1e-6, float(posterior_constant_std)))
+        )
+        if self.prior_min_std != self.posterior_min_std or self.prior_max_std != self.posterior_max_std:
+            raise ValueError(
+                "RSSMCell currently shares prior/posterior std bounds. "
+                "Use matching prior_* and posterior_* values."
+            )
+        self.min_latent_std = self.prior_min_std
+        self.max_latent_std = self.prior_max_std
         self.min_df = float(min_df)
         self.control_dim = None if control_dim is None else int(control_dim)
         self.exogenous_dim = None if exogenous_dim is None else int(exogenous_dim)
@@ -73,11 +124,14 @@ class LatentSSMWorldModel(WorldModelBase):
         self.decoder_layers = max(1, int(decoder_layers))
         self.use_symlog = bool(use_symlog)
         self.use_aux_decoder = bool(use_aux_decoder)
+        self.predict_exogenous = bool(predict_exogenous)
+        self.decode_exogenous = bool(self.use_aux_decoder and self.predict_exogenous)
         self.use_dual_path = bool(use_dual_path)
         self.use_stochastic_path = bool(use_stochastic_path)
         self.share_encoder_weights = bool(share_encoder_weights)
         self.leak_objective_to_transition = bool(leak_objective_to_transition)
-        self.min_latent_std = float(max(0.01, float(min_scale)))
+        self.h_dropout = nn.Dropout(float(max(0.0, min(1.0, h_dropout))))
+        self.decoder_hidden = int(decoder_hidden) if decoder_hidden is not None else self.hidden_dim
         self.allow_objective_leak_for_ablation = bool(allow_objective_leak_for_ablation)
         self.allow_disable_aux_decoder_for_ablation = bool(allow_disable_aux_decoder_for_ablation)
         self.allow_shared_encoder_for_ablation = bool(allow_shared_encoder_for_ablation)
@@ -140,22 +194,35 @@ class LatentSSMWorldModel(WorldModelBase):
             dim_obs_embed=self.encoder_dim,
             transition_hidden_dim=self.hidden_dim,
             min_std=self.min_latent_std,
+            max_std=self.max_latent_std,
+            prior_constant_std=self.prior_constant_std,
+            posterior_constant_std=self.posterior_constant_std,
             use_dual_path=self.use_dual_path,
             use_stochastic_path=self.use_stochastic_path,
             leak_objective_to_transition=self.leak_objective_to_transition,
+            latent_distribution=self.latent_distribution,
+            stochastic_groups=self.stochastic_groups,
+            stochastic_classes=self.stochastic_classes,
         )
+        logger.info("Decoder min_std: %s", self.min_std)
 
-        # Decoders from full latent state [h_t, z_t].
+        # Decoders from full latent state [h_t, z_t]. Dropout on h before decoder to weaken deterministic path.
         self.obs_decoder = ObjectiveDecoder(
             in_dim=self.hidden_dim + self.latent_dim,
             out_dim=self.output_dim,
-            hidden_dim=self.hidden_dim,
+            hidden_dim=self.decoder_hidden,
             num_layers=self.decoder_layers,
+            min_std=self.min_std,
+            max_std=self.max_std,
         )
-        self._aux_decoder_hidden = nn.Sequential(
-            nn.Linear(self.hidden_dim + self.latent_dim, self.hidden_dim),
-            nn.ELU(),
-        )
+        self._aux_decoder_hidden: Optional[nn.Sequential]
+        if self.decode_exogenous:
+            self._aux_decoder_hidden = nn.Sequential(
+                nn.Linear(self.hidden_dim + self.latent_dim, self.decoder_hidden),
+                nn.ELU(),
+            )
+        else:
+            self._aux_decoder_hidden = None
         self._aux_decoder_heads = nn.ModuleDict()
 
     def _assert_encoder_independence(self) -> None:
@@ -195,15 +262,17 @@ class LatentSSMWorldModel(WorldModelBase):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> Optional[AuxiliaryDecoder]:
-        if exogenous_dim <= 0:
+        if exogenous_dim <= 0 or not self.decode_exogenous:
             return None
         key = str(int(exogenous_dim))
         if key not in self._aux_decoder_heads:
             head = AuxiliaryDecoder(
-                in_dim=self.hidden_dim,
+                in_dim=self.decoder_hidden,
                 out_dim=int(exogenous_dim),
-                hidden_dim=self.hidden_dim,
+                hidden_dim=self.decoder_hidden,
                 num_layers=max(1, self.decoder_layers),
+                min_std=self.min_std,
+                max_std=self.max_std,
             )
             if device is not None or dtype is not None:
                 head = head.to(device=device, dtype=dtype)
@@ -217,13 +286,20 @@ class LatentSSMWorldModel(WorldModelBase):
             self._aux_decoder_heads[key] = head
         return head
 
+    def _decoder_latent(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
+        """Build decoder latent with dropout on h only, then concatenate with z."""
+        # Information bottleneck: apply dropout only to deterministic state h.
+        # Stochastic state z is never dropped here.
+        return torch.cat([self.h_dropout(deter), stoch], dim=-1)
+
     def _decode_obs(
         self, h_t: torch.Tensor, z_t: torch.Tensor
     ) -> Tuple[torch.distributions.Distribution, torch.distributions.Distribution, torch.Tensor, torch.Tensor, torch.Tensor]:
-        latent = torch.cat([h_t, z_t], dim=-1)
+        latent = self._decoder_latent(h_t, z_t)
         dist_latent, loc_latent, scale = self.obs_decoder(
             latent,
-            min_scale=max(0.01, self.min_scale),
+            min_scale=self.min_std,
+            max_scale=self.max_std,
         )
         loc = self.symexp(loc_latent) if self.use_symlog else loc_latent
         dist = diagonal_independent_normal(loc=loc, scale=scale)
@@ -239,20 +315,20 @@ class LatentSSMWorldModel(WorldModelBase):
             bsz = h_t.shape[0]
             empty = torch.zeros(bsz, 0, device=h_t.device, dtype=h_t.dtype)
             return None, empty, empty
-        if not self.use_aux_decoder:
+        if not self.decode_exogenous:
             bsz = h_t.shape[0]
-            loc = torch.zeros(bsz, exogenous_dim, device=h_t.device, dtype=h_t.dtype)
-            scale = torch.full_like(loc, fill_value=max(0.01, self.min_scale))
-            dist = diagonal_independent_normal(loc=loc, scale=scale)
-            return dist, loc, scale
-        hidden = self._aux_decoder_hidden(torch.cat([h_t, z_t], dim=-1))
+            empty = torch.zeros(bsz, 0, device=h_t.device, dtype=h_t.dtype)
+            return None, empty, empty
+        if self._aux_decoder_hidden is None:
+            raise RuntimeError("Aux decoder hidden stack is missing while exogenous decoding is enabled.")
+        hidden = self._aux_decoder_hidden(self._decoder_latent(h_t, z_t))
         head = self._get_aux_head(
             exogenous_dim,
             device=h_t.device,
             dtype=h_t.dtype,
         )
         assert head is not None
-        dist, loc, scale = head(hidden, min_scale=max(0.01, self.min_scale))
+        dist, loc, scale = head(hidden, min_scale=self.min_std, max_scale=self.max_std)
         return dist, loc, scale
 
     def _transition_step(
@@ -260,7 +336,6 @@ class LatentSSMWorldModel(WorldModelBase):
         state: RSSMState,
         control_t: torch.Tensor,
         exo_t: torch.Tensor,
-        objective_encoded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         c_enc = self._encode_control(control_t)
         x_enc = self._encode_exogenous(exo_t)
@@ -268,7 +343,6 @@ class LatentSSMWorldModel(WorldModelBase):
             prev_state=state,
             control_embed=c_enc,
             exogenous_embed=x_enc,
-            observation_embed=objective_encoded,
         )
         return h_t
 
@@ -358,6 +432,81 @@ class LatentSSMWorldModel(WorldModelBase):
             "prior_logvar": step_out.prior_logvar,
         }, pred_t
 
+    @staticmethod
+    def _kl_diagonal_normal(
+        post_mu: torch.Tensor,
+        post_logvar: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        """KL(q || p) for diagonal Normal, computed directly from parameters.
+
+        Avoids constructing torch.distributions objects in the inner loop,
+        which eliminates significant Python/CUDA overhead per time step.
+        """
+        var_ratio = (post_logvar - prior_logvar).exp()
+        delta = prior_mu - post_mu
+        return 0.5 * (prior_logvar - post_logvar + var_ratio + delta.pow(2) / prior_logvar.exp() - 1.0)
+
+    @staticmethod
+    def _kl_categorical_logits(
+        post_logits: torch.Tensor,
+        prior_logits: torch.Tensor,
+        groups: int,
+        classes: int,
+    ) -> torch.Tensor:
+        post_l = post_logits.view(*post_logits.shape[:-1], int(groups), int(classes))
+        prior_l = prior_logits.view(*prior_logits.shape[:-1], int(groups), int(classes))
+        post_log_probs = torch.log_softmax(post_l, dim=-1)
+        prior_log_probs = torch.log_softmax(prior_l, dim=-1)
+        post_probs = torch.exp(post_log_probs)
+        return torch.sum(post_probs * (post_log_probs - prior_log_probs), dim=-1)
+
+    def _batch_decode_obs(
+        self, deter: torch.Tensor, stoch: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch-decode observation outputs from pre-computed (B,T,H) and (B,T,Z).
+
+        Returns (loc, loc_latent, scale) each with shape (B,T,output_dim).
+        Processes all time steps in a single forward pass through the decoder MLP.
+        """
+        B, T, _ = deter.shape
+        latent_flat = self._decoder_latent(deter, stoch).reshape(B * T, -1)
+        _, loc_latent_flat, scale_flat = self.obs_decoder(
+            latent_flat, min_scale=self.min_std, max_scale=self.max_std,
+        )
+        loc_latent = loc_latent_flat.reshape(B, T, self.output_dim)
+        scale = scale_flat.reshape(B, T, self.output_dim)
+        loc = self.symexp(loc_latent) if self.use_symlog else loc_latent
+        return loc, loc_latent, scale
+
+    def _batch_decode_exogenous(
+        self, deter: torch.Tensor, stoch: torch.Tensor, exo_dim: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batch-decode exogenous outputs. Returns (loc, scale) each (B,T,exo_dim)."""
+        B, T, _ = deter.shape
+        device, dtype = deter.device, deter.dtype
+        if exo_dim <= 0 or not self.decode_exogenous:
+            loc = torch.zeros(B, T, 0, device=device, dtype=dtype)
+            scale = torch.zeros_like(loc)
+            return loc, scale
+        latent_flat = self._decoder_latent(deter, stoch).reshape(B * T, -1)
+        if self._aux_decoder_hidden is None:
+            raise RuntimeError("Aux decoder hidden stack is missing while exogenous decoding is enabled.")
+        hidden_flat = self._aux_decoder_hidden(latent_flat)
+        head = self._get_aux_head(exo_dim, device=device, dtype=dtype)
+        assert head is not None
+        _, loc_flat, scale_flat = head(hidden_flat, min_scale=self.min_std, max_scale=self.max_std)
+        return loc_flat.reshape(B, T, exo_dim), scale_flat.reshape(B, T, exo_dim)
+
+    @staticmethod
+    def _build_dist_list(
+        loc: torch.Tensor, scale: torch.Tensor
+    ) -> list:
+        """Build per-step distribution list from batched (B,T,D) loc/scale."""
+        T = loc.shape[1]
+        return [diagonal_independent_normal(loc=loc[:, t], scale=scale[:, t]) for t in range(T)]
+
     def observe(
         self,
         controls: torch.Tensor,
@@ -366,94 +515,115 @@ class LatentSSMWorldModel(WorldModelBase):
         initial_state: Optional[RSSMState] = None,
         sample_posterior: bool = False,
     ) -> Dict[str, object]:
-        """Run posterior filtering over a sequence."""
+        """Run posterior filtering over a sequence.
+
+        Encoding and decoding are batched over the full time dimension to
+        minimize CUDA kernel launches.  Only the sequential RSSM cell
+        (GRU transition + prior/posterior heads) remains in the per-step loop.
+        """
         if controls.shape[:2] != exogenous.shape[:2] or controls.shape[:2] != observations.shape[:2]:
             raise ValueError("controls/exogenous/observations must have matching (batch,time) dimensions")
 
         batch_size, horizon, _ = controls.shape
         device, dtype = controls.device, controls.dtype
         state = initial_state if initial_state is not None else self._zero_state(batch_size, device, dtype)
+        exo_dim = exogenous.shape[-1]
+        BT = batch_size * horizon
 
-        deter_states = []
-        stoch_states = []
-        prior_mus = []
-        prior_logvars = []
-        post_mus = []
-        post_logvars = []
-        kl_terms = []
-        recon_means = []
-        recon_scales = []
-        recon_means_latent = []
-        recon_dists = []
-        recon_dists_latent = []
-        aux_means = []
-        aux_scales = []
-        aux_dists = []
+        # --- PRE-ENCODE: 3 batched forward passes instead of 3*T per-step calls ---
+        obs_for_enc = self.symlog(observations) if self.use_symlog else observations
+        c_enc_all = self._encode_control(controls.reshape(BT, -1)).reshape(batch_size, horizon, -1)
+        x_enc_all = self._encode_exogenous(exogenous.reshape(BT, -1)).reshape(batch_size, horizon, -1)
+        y_enc_all = self._encode_observation(obs_for_enc.reshape(BT, -1)).reshape(batch_size, horizon, -1)
 
+        # Pre-allocate outputs for the sequential core
+        out_deter = torch.empty(batch_size, horizon, self.hidden_dim, device=device, dtype=dtype)
+        out_stoch = torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_prior_mu = torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_prior_lv = torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_post_mu = torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_post_lv = torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_prior_logits = (
+            torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+            if self.latent_distribution == "categorical"
+            else None
+        )
+        out_post_logits = (
+            torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+            if self.latent_distribution == "categorical"
+            else None
+        )
+
+        # --- SEQUENTIAL CORE: only RSSM cell (transition + prior + posterior + sample) ---
         for t in range(horizon):
-            c_t = controls[:, t, :]
-            x_t = exogenous[:, t, :]
-            y_t_raw = observations[:, t, :]
-            y_t = self.symlog(y_t_raw) if self.use_symlog else y_t_raw
-            y_enc = self._encode_observation(y_t)
-            c_enc = self._encode_control(c_t)
-            x_enc = self._encode_exogenous(x_t)
             step_out = self.rssm_cell.observe(
                 prev_state=state,
-                control_embed=c_enc,
-                exogenous_embed=x_enc,
-                observation_embed=y_enc,
+                control_embed=c_enc_all[:, t],
+                exogenous_embed=x_enc_all[:, t],
+                observation_embed=y_enc_all[:, t],
                 sample=sample_posterior,
             )
-            h_t = step_out.state.h
-            z_t = step_out.state.z
-            prior_mu = step_out.prior_mean
-            prior_logvar = step_out.prior_logvar
             post_mu = step_out.posterior_mean
             post_logvar = step_out.posterior_logvar
             if post_mu is None or post_logvar is None or step_out.posterior is None:
                 raise RuntimeError("Posterior outputs are required in observe().")
 
-            y_dist, y_dist_latent, y_loc, y_scale, y_loc_latent = self._decode_obs(h_t, z_t)
-            x_dist, x_loc, x_scale = self._decode_exogenous(h_t, z_t, exogenous.shape[-1])
-            kl_t = torch.distributions.kl_divergence(step_out.posterior, step_out.prior)
-
-            deter_states.append(h_t)
-            stoch_states.append(z_t)
-            prior_mus.append(prior_mu)
-            prior_logvars.append(prior_logvar)
-            post_mus.append(post_mu)
-            post_logvars.append(post_logvar)
-            kl_terms.append(kl_t)
-            recon_means.append(y_loc)
-            recon_scales.append(y_scale)
-            recon_means_latent.append(y_loc_latent)
-            recon_dists.append(y_dist)
-            recon_dists_latent.append(y_dist_latent)
-            aux_means.append(x_loc)
-            aux_scales.append(x_scale)
-            aux_dists.append(x_dist)
-
+            out_deter[:, t] = step_out.state.h
+            out_stoch[:, t] = step_out.state.z
+            out_prior_mu[:, t] = step_out.prior_mean
+            out_prior_lv[:, t] = step_out.prior_logvar
+            out_post_mu[:, t] = post_mu
+            out_post_lv[:, t] = post_logvar
+            if out_prior_logits is not None and out_post_logits is not None:
+                if step_out.prior_logits is None or step_out.posterior_logits is None:
+                    raise RuntimeError("Categorical latent mode requires prior/posterior logits.")
+                out_prior_logits[:, t] = step_out.prior_logits
+                out_post_logits[:, t] = step_out.posterior_logits
             state = step_out.state
 
+        # --- POST-DECODE: 2 batched forward passes instead of 2*T per-step calls ---
+        out_recon_loc, out_recon_loc_lat, out_recon_scale = self._batch_decode_obs(out_deter, out_stoch)
+        out_aux_loc, out_aux_scale = self._batch_decode_exogenous(out_deter, out_stoch, exo_dim)
+
+        # Vectorized KL over all time steps at once
+        if out_prior_logits is not None and out_post_logits is not None:
+            out_kl = self._kl_categorical_logits(
+                out_post_logits,
+                out_prior_logits,
+                self.stochastic_groups,
+                self.stochastic_classes,
+            ).sum(dim=-1)
+        else:
+            out_kl = self._kl_diagonal_normal(out_post_mu, out_post_lv, out_prior_mu, out_prior_lv).sum(dim=-1)
+
+        # Build per-step distribution lists from batched tensors (cheap Python objects)
+        recon_dists = self._build_dist_list(out_recon_loc, out_recon_scale)
+        recon_dists_latent = self._build_dist_list(out_recon_loc_lat, out_recon_scale)
+        if exo_dim > 0 and self.decode_exogenous:
+            aux_dists = self._build_dist_list(out_aux_loc, out_aux_scale)
+        else:
+            aux_dists: list = []
+
         return {
-            "deter": torch.stack(deter_states, dim=1),
-            "stoch": torch.stack(stoch_states, dim=1),
-            "prior_mu": torch.stack(prior_mus, dim=1),
-            "prior_logvar": torch.stack(prior_logvars, dim=1),
-            "posterior_mu": torch.stack(post_mus, dim=1),
-            "posterior_logvar": torch.stack(post_logvars, dim=1),
-            "kl_terms": torch.stack(kl_terms, dim=1),
-            "dist_loc": torch.stack(recon_means, dim=1),
-            "dist_loc_latent": torch.stack(recon_means_latent, dim=1),
-            "dist_scale": torch.stack(recon_scales, dim=1),
-            "aux_loc": torch.stack(aux_means, dim=1),
-            "aux_scale": torch.stack(aux_scales, dim=1),
+            "deter": out_deter,
+            "stoch": out_stoch,
+            "prior_mu": out_prior_mu,
+            "prior_logvar": out_prior_lv,
+            "posterior_mu": out_post_mu,
+            "posterior_logvar": out_post_lv,
+            "prior_logits": out_prior_logits,
+            "posterior_logits": out_post_logits,
+            "kl_terms": out_kl,
+            "dist_loc": out_recon_loc,
+            "dist_loc_latent": out_recon_loc_lat,
+            "dist_scale": out_recon_scale,
+            "aux_loc": out_aux_loc,
+            "aux_scale": out_aux_scale,
             "objective_dists": recon_dists,
             "objective_dists_latent": recon_dists_latent,
             "aux_dists": aux_dists,
             "state": state,
-            "predictions": torch.stack(recon_means, dim=1),
+            "predictions": out_recon_loc,
         }
 
     def imagine(
@@ -465,7 +635,10 @@ class LatentSSMWorldModel(WorldModelBase):
         n_samples: int = 1,
         sample_latent: bool = True,
     ) -> Dict[str, object]:
-        """Roll forward using prior dynamics only (no target leakage)."""
+        """Roll forward using prior dynamics only (no target leakage).
+
+        Encoding and decoding are batched over the full time dimension.
+        """
         if future_controls.shape[:2] != future_exogenous.shape[:2]:
             raise ValueError("future_controls and future_exogenous must have matching (batch,time)")
 
@@ -478,83 +651,82 @@ class LatentSSMWorldModel(WorldModelBase):
 
         controls = future_controls[:, :horizon, :]
         exogenous = future_exogenous[:, :horizon, :]
+        exo_dim = exogenous.shape[-1]
 
-        # Vectorized ensemble by expanding batch axis.
         if n_samples > 1:
-            controls = controls.unsqueeze(0).repeat(n_samples, 1, 1, 1)
-            exogenous = exogenous.unsqueeze(0).repeat(n_samples, 1, 1, 1)
-            controls = controls.reshape(n_samples * batch_size, horizon, controls.shape[-1])
-            exogenous = exogenous.reshape(n_samples * batch_size, horizon, exogenous.shape[-1])
+            controls = controls.unsqueeze(0).expand(n_samples, -1, -1, -1).reshape(n_samples * batch_size, horizon, -1)
+            exogenous = exogenous.unsqueeze(0).expand(n_samples, -1, -1, -1).reshape(n_samples * batch_size, horizon, -1)
             state = RSSMState(
-                h=initial_state.h.unsqueeze(0).repeat(n_samples, 1, 1).reshape(n_samples * batch_size, self.hidden_dim),
-                z=initial_state.z.unsqueeze(0).repeat(n_samples, 1, 1).reshape(n_samples * batch_size, self.latent_dim),
+                h=initial_state.h.unsqueeze(0).expand(n_samples, -1, -1).reshape(n_samples * batch_size, self.hidden_dim),
+                z=initial_state.z.unsqueeze(0).expand(n_samples, -1, -1).reshape(n_samples * batch_size, self.latent_dim),
             )
+            eff_batch = n_samples * batch_size
         else:
             state = RSSMState(h=initial_state.h, z=initial_state.z)
+            eff_batch = batch_size
 
-        deter_states = []
-        stoch_states = []
-        prior_mus = []
-        prior_logvars = []
-        pred_means = []
-        pred_means_latent = []
-        pred_scales = []
-        pred_dists = []
-        pred_dists_latent = []
-        aux_means = []
-        aux_scales = []
-        aux_dists = []
+        device, dtype = controls.device, controls.dtype
+        BT = eff_batch * horizon
 
+        # --- PRE-ENCODE: 2 batched forward passes instead of 2*T ---
+        c_enc_all = self._encode_control(controls.reshape(BT, -1)).reshape(eff_batch, horizon, -1)
+        x_enc_all = self._encode_exogenous(exogenous.reshape(BT, -1)).reshape(eff_batch, horizon, -1)
+
+        out_deter = torch.empty(eff_batch, horizon, self.hidden_dim, device=device, dtype=dtype)
+        out_stoch = torch.empty(eff_batch, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_prior_mu = torch.empty(eff_batch, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_prior_lv = torch.empty(eff_batch, horizon, self.latent_dim, device=device, dtype=dtype)
+        out_prior_logits = (
+            torch.empty(eff_batch, horizon, self.latent_dim, device=device, dtype=dtype)
+            if self.latent_distribution == "categorical"
+            else None
+        )
+
+        # --- SEQUENTIAL CORE: only RSSM cell ---
         for t in range(horizon):
-            c_t = controls[:, t, :]
-            x_t = exogenous[:, t, :]
-            c_enc = self._encode_control(c_t)
-            x_enc = self._encode_exogenous(x_t)
             step_out = self.rssm_cell.imagine(
                 prev_state=state,
-                control_embed=c_enc,
-                exogenous_embed=x_enc,
+                control_embed=c_enc_all[:, t],
+                exogenous_embed=x_enc_all[:, t],
                 sample=sample_latent,
             )
-            h_t = step_out.state.h
-            z_t = step_out.state.z
-            prior_mu = step_out.prior_mean
-            prior_logvar = step_out.prior_logvar
-
-            y_dist, y_dist_latent, y_loc, y_scale, y_loc_latent = self._decode_obs(h_t, z_t)
-            x_dist, x_loc, x_scale = self._decode_exogenous(h_t, z_t, exogenous.shape[-1])
-
-            deter_states.append(h_t)
-            stoch_states.append(z_t)
-            prior_mus.append(prior_mu)
-            prior_logvars.append(prior_logvar)
-            pred_means.append(y_loc)
-            pred_means_latent.append(y_loc_latent)
-            pred_scales.append(y_scale)
-            pred_dists.append(y_dist)
-            pred_dists_latent.append(y_dist_latent)
-            aux_means.append(x_loc)
-            aux_scales.append(x_scale)
-            aux_dists.append(x_dist)
-
+            out_deter[:, t] = step_out.state.h
+            out_stoch[:, t] = step_out.state.z
+            out_prior_mu[:, t] = step_out.prior_mean
+            out_prior_lv[:, t] = step_out.prior_logvar
+            if out_prior_logits is not None:
+                if step_out.prior_logits is None:
+                    raise RuntimeError("Categorical latent mode requires prior logits.")
+                out_prior_logits[:, t] = step_out.prior_logits
             state = step_out.state
 
-        pred = torch.stack(pred_means, dim=1)
-        pred_scale = torch.stack(pred_scales, dim=1)
-        pred_latent = torch.stack(pred_means_latent, dim=1)
-        aux_loc = torch.stack(aux_means, dim=1)
-        aux_scale = torch.stack(aux_scales, dim=1)
+        # --- POST-DECODE: 2 batched forward passes instead of 2*T ---
+        out_pred_loc, out_pred_loc_lat, out_pred_scale = self._batch_decode_obs(out_deter, out_stoch)
+        out_aux_loc, out_aux_scale = self._batch_decode_exogenous(out_deter, out_stoch, exo_dim)
+
+        pred_dists = self._build_dist_list(out_pred_loc, out_pred_scale)
+        pred_dists_latent = self._build_dist_list(out_pred_loc_lat, out_pred_scale)
+        if exo_dim > 0 and self.decode_exogenous:
+            aux_dists = self._build_dist_list(out_aux_loc, out_aux_scale)
+        else:
+            aux_dists: list = []
 
         if n_samples > 1:
-            pred_samples = pred.reshape(n_samples, batch_size, horizon, self.output_dim)
-            pred_scale_samples = pred_scale.reshape(n_samples, batch_size, horizon, self.output_dim)
-            pred_latent_samples = pred_latent.reshape(n_samples, batch_size, horizon, self.output_dim)
-            aux_loc_samples = aux_loc.reshape(n_samples, batch_size, horizon, aux_loc.shape[-1])
-            aux_scale_samples = aux_scale.reshape(n_samples, batch_size, horizon, aux_scale.shape[-1])
-            prior_mu_samples = torch.stack(prior_mus, dim=1).reshape(n_samples, batch_size, horizon, self.latent_dim)
-            prior_logvar_samples = torch.stack(prior_logvars, dim=1).reshape(n_samples, batch_size, horizon, self.latent_dim)
-            deter_samples = torch.stack(deter_states, dim=1).reshape(n_samples, batch_size, horizon, self.hidden_dim)
-            stoch_samples = torch.stack(stoch_states, dim=1).reshape(n_samples, batch_size, horizon, self.latent_dim)
+            pred_samples = out_pred_loc.reshape(n_samples, batch_size, horizon, self.output_dim)
+            pred_scale_samples = out_pred_scale.reshape(n_samples, batch_size, horizon, self.output_dim)
+            pred_latent_samples = out_pred_loc_lat.reshape(n_samples, batch_size, horizon, self.output_dim)
+            aux_out_dim = out_aux_loc.shape[-1]
+            aux_loc_samples = out_aux_loc.reshape(n_samples, batch_size, horizon, aux_out_dim)
+            aux_scale_samples = out_aux_scale.reshape(n_samples, batch_size, horizon, aux_out_dim)
+            prior_mu_samples = out_prior_mu.reshape(n_samples, batch_size, horizon, self.latent_dim)
+            prior_logvar_samples = out_prior_lv.reshape(n_samples, batch_size, horizon, self.latent_dim)
+            prior_logits_samples = (
+                out_prior_logits.reshape(n_samples, batch_size, horizon, self.latent_dim)
+                if out_prior_logits is not None
+                else None
+            )
+            deter_samples = out_deter.reshape(n_samples, batch_size, horizon, self.hidden_dim)
+            stoch_samples = out_stoch.reshape(n_samples, batch_size, horizon, self.latent_dim)
 
             return {
                 "samples": pred_samples,
@@ -570,6 +742,7 @@ class LatentSSMWorldModel(WorldModelBase):
                 "aux_scale": aux_scale_samples.mean(dim=0),
                 "prior_mu": prior_mu_samples.mean(dim=0),
                 "prior_logvar": prior_logvar_samples.mean(dim=0),
+                "prior_logits": (prior_logits_samples.mean(dim=0) if prior_logits_samples is not None else None),
                 "deter": deter_samples.mean(dim=0),
                 "stoch": stoch_samples.mean(dim=0),
                 "objective_dists": pred_dists,
@@ -582,48 +755,21 @@ class LatentSSMWorldModel(WorldModelBase):
             }
 
         return {
-            "predictions": pred,
-            "dist_scale": pred_scale,
-            "dist_loc_latent": pred_latent,
-            "aux_loc": aux_loc,
-            "aux_scale": aux_scale,
-            "prior_mu": torch.stack(prior_mus, dim=1),
-            "prior_logvar": torch.stack(prior_logvars, dim=1),
-            "deter": torch.stack(deter_states, dim=1),
-            "stoch": torch.stack(stoch_states, dim=1),
+            "predictions": out_pred_loc,
+            "dist_scale": out_pred_scale,
+            "dist_loc_latent": out_pred_loc_lat,
+            "aux_loc": out_aux_loc,
+            "aux_scale": out_aux_scale,
+            "prior_mu": out_prior_mu,
+            "prior_logvar": out_prior_lv,
+            "prior_logits": out_prior_logits,
+            "deter": out_deter,
+            "stoch": out_stoch,
             "objective_dists": pred_dists,
             "objective_dists_latent": pred_dists_latent,
             "aux_dists": aux_dists,
             "state": state,
         }
-
-    def condition_then_simulate(
-        self,
-        history_controls: torch.Tensor,
-        history_exogenous: torch.Tensor,
-        history_objectives: torch.Tensor,
-        future_controls: torch.Tensor,
-        future_exogenous: torch.Tensor,
-        n_steps: Optional[int] = None,
-        n_samples: int = 50,
-    ) -> Dict[str, object]:
-        observed = self.observe(
-            controls=history_controls,
-            exogenous=history_exogenous,
-            observations=history_objectives,
-            initial_state=None,
-            sample_posterior=False,
-        )
-        initial_state = observed["state"]
-        assert isinstance(initial_state, RSSMState)
-        return self.imagine(
-            initial_state=initial_state,
-            future_controls=future_controls,
-            future_exogenous=future_exogenous,
-            n_steps=n_steps,
-            n_samples=n_samples,
-            sample_latent=True,
-        )
 
     def imagine_forward(
         self,
@@ -658,6 +804,10 @@ class LatentSSMWorldModel(WorldModelBase):
         sample_prior: bool = True,
         compute_rollout_dtw: bool = False,
         rollout_dtw_gamma: float = 0.1,
+        use_free_bits: bool = False,
+        kl_free_bits: float = 0.0,
+        kl_balance: float = 0.8,
+        use_kl_balancing: bool = False,
     ) -> Dict[str, object]:
         """Hybrid mode: observe context then imagine horizon with loss terms."""
         controls = batch["control"]
@@ -698,6 +848,14 @@ class LatentSSMWorldModel(WorldModelBase):
             post_mu=observed["posterior_mu"],  # type: ignore[index]
             post_logvar=observed["posterior_logvar"],  # type: ignore[index]
             min_std=self.min_latent_std,
+            prior_logits=observed.get("prior_logits"),  # type: ignore[arg-type]
+            posterior_logits=observed.get("posterior_logits"),  # type: ignore[arg-type]
+            groups=self.stochastic_groups,
+            classes=self.stochastic_classes,
+            use_free_bits=use_free_bits,
+            kl_free_bits=kl_free_bits,
+            kl_balance=kl_balance,
+            use_kl_balancing=use_kl_balancing,
         )
         obs_aux_nll = self._sequence_nll_from_dist_list(
             observed.get("aux_dists", []),  # type: ignore[arg-type]
@@ -815,6 +973,8 @@ class LatentSSMWorldModel(WorldModelBase):
             raise ValueError(f"targets must be rank-3 (B,T,D), got {tuple(targets.shape)}")
         batch_size, horizon, _ = targets.shape
         if len(dist_list) != horizon:
+            if allow_none and len(dist_list) == 0:
+                return torch.zeros((), dtype=targets.dtype, device=targets.device)
             raise ValueError(
                 f"Distribution list length ({len(dist_list)}) does not match horizon ({horizon})"
             )
@@ -859,19 +1019,52 @@ class LatentSSMWorldModel(WorldModelBase):
         post_mu: torch.Tensor,
         post_logvar: torch.Tensor,
         min_std: float,
+        prior_logits: Optional[torch.Tensor] = None,
+        posterior_logits: Optional[torch.Tensor] = None,
+        groups: int = 32,
+        classes: int = 32,
+        use_free_bits: bool = False,
+        kl_free_bits: float = 0.0,
+        kl_balance: float = 0.8,
+        use_kl_balancing: bool = False,
     ) -> torch.Tensor:
-        prior_std = torch.exp(0.5 * prior_logvar).clamp_min(float(min_std))
-        post_std = torch.exp(0.5 * post_logvar).clamp_min(float(min_std))
-        prior = torch.distributions.Independent(
-            torch.distributions.Normal(prior_mu, prior_std),
-            1,
-        )
-        post = torch.distributions.Independent(
-            torch.distributions.Normal(post_mu, post_std),
-            1,
-        )
-        kl = torch.distributions.kl_divergence(post, prior)  # (B,T)
-        return kl.mean()
+        if prior_logits is not None and posterior_logits is not None:
+            # Local import avoids potential circular import at module load time.
+            from ..training.losses import fast_kl_balancing_loss
+
+            post_logits_4d = posterior_logits.view(
+                *posterior_logits.shape[:-1], int(groups), int(classes)
+            )
+            prior_logits_4d = prior_logits.view(
+                *prior_logits.shape[:-1], int(groups), int(classes)
+            )
+            if bool(use_kl_balancing) or (bool(use_free_bits) and float(kl_free_bits) > 0.0):
+                kl_groups = fast_kl_balancing_loss(
+                    post_logits_4d,
+                    prior_logits_4d,
+                    alpha=float(kl_balance),
+                    free_nats=float(kl_free_bits),
+                    use_kl_balancing=bool(use_kl_balancing),
+                    use_free_bits=bool(use_free_bits),
+                )
+            else:
+                kl_groups = LatentSSMWorldModel._kl_categorical_logits(
+                    posterior_logits,
+                    prior_logits,
+                    groups,
+                    classes,
+                )
+            return kl_groups.sum(dim=-1).mean()
+        min_logvar = 2.0 * torch.tensor(float(min_std), device=prior_mu.device, dtype=prior_mu.dtype).log()
+        p_lv = prior_logvar.clamp_min(min_logvar.item())
+        q_lv = post_logvar.clamp_min(min_logvar.item())
+        var_ratio = (q_lv - p_lv).exp()
+        delta = prior_mu - post_mu
+        kl_elem = 0.5 * (p_lv - q_lv + var_ratio + delta.pow(2) / p_lv.exp() - 1.0)
+        kl_steps = kl_elem.sum(dim=-1)
+        if bool(use_free_bits) and float(kl_free_bits) > 0.0:
+            kl_steps = torch.clamp(kl_steps, min=float(kl_free_bits))
+        return kl_steps.mean()
 
     def _rollout_mixed(
         self,
@@ -882,37 +1075,49 @@ class LatentSSMWorldModel(WorldModelBase):
         teacher_forcing_ratio: float,
     ) -> Dict[str, object]:
         batch_size, horizon, _ = controls.shape
+        device, dtype = controls.device, controls.dtype
         state = initial_state
+        exo_dim = exogenous.shape[-1]
+        BT = batch_size * horizon
 
-        predictions = torch.empty(batch_size, horizon, self.output_dim, device=controls.device, dtype=controls.dtype)
+        # --- PRE-ENCODE: batched over full time dimension ---
+        obs_for_enc = self.symlog(targets) if self.use_symlog else targets
+        c_enc_all = self._encode_control(controls.reshape(BT, -1)).reshape(batch_size, horizon, -1)
+        x_enc_all = self._encode_exogenous(exogenous.reshape(BT, -1)).reshape(batch_size, horizon, -1)
+        y_enc_all = self._encode_observation(obs_for_enc.reshape(BT, -1)).reshape(batch_size, horizon, -1)
+
+        predictions = torch.empty(batch_size, horizon, self.output_dim, device=device, dtype=dtype)
         dist_loc = torch.empty_like(predictions)
         dist_loc_latent = torch.empty_like(predictions)
         dist_scale = torch.empty_like(predictions)
-        kl_terms = torch.empty(batch_size, horizon, device=controls.device, dtype=controls.dtype)
-        prior_mu_all = torch.empty(batch_size, horizon, self.latent_dim, device=controls.device, dtype=controls.dtype)
+        kl_terms = torch.empty(batch_size, horizon, device=device, dtype=dtype)
+        prior_mu_all = torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
         prior_logvar_all = torch.empty_like(prior_mu_all)
         post_mu_all = torch.empty_like(prior_mu_all)
         post_logvar_all = torch.empty_like(prior_mu_all)
-        aux_loc = torch.empty(batch_size, horizon, exogenous.shape[-1], device=controls.device, dtype=controls.dtype)
+        prior_logits_all = (
+            torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+            if self.latent_distribution == "categorical"
+            else None
+        )
+        post_logits_all = (
+            torch.empty(batch_size, horizon, self.latent_dim, device=device, dtype=dtype)
+            if self.latent_distribution == "categorical"
+            else None
+        )
+        aux_out_dim = exo_dim if self.decode_exogenous else 0
+        aux_loc = torch.empty(batch_size, horizon, aux_out_dim, device=device, dtype=dtype)
         aux_scale = torch.empty_like(aux_loc)
         objective_dists = []
         objective_dists_latent = []
         aux_dists = []
 
         for t in range(horizon):
-            c_t = controls[:, t, :]
-            x_t = exogenous[:, t, :]
-            y_t_raw = targets[:, t, :]
-            y_t = self.symlog(y_t_raw) if self.use_symlog else y_t_raw
-
-            y_enc = self._encode_observation(y_t)
-            c_enc = self._encode_control(c_t)
-            x_enc = self._encode_exogenous(x_t)
             step_out = self.rssm_cell.observe(
                 prev_state=state,
-                control_embed=c_enc,
-                exogenous_embed=x_enc,
-                observation_embed=y_enc,
+                control_embed=c_enc_all[:, t],
+                exogenous_embed=x_enc_all[:, t],
+                observation_embed=y_enc_all[:, t],
                 sample=False,
             )
             h_t = step_out.h
@@ -924,29 +1129,60 @@ class LatentSSMWorldModel(WorldModelBase):
                 raise RuntimeError("Posterior outputs are required in mixed rollout.")
 
             teacher_mask = (
-                torch.rand(batch_size, 1, device=controls.device) < float(teacher_forcing_ratio)
-            ).to(dtype=controls.dtype)
-            z_prior = prior_mu
-            z_post = post_mu
-            z_t = teacher_mask * z_post + (1.0 - teacher_mask) * z_prior
+                torch.rand(batch_size, 1, device=device) < float(teacher_forcing_ratio)
+            ).to(dtype=dtype)
+            if self.latent_distribution == "categorical":
+                if step_out.prior_logits is None or step_out.posterior_logits is None:
+                    raise RuntimeError("Categorical latent mode requires prior/posterior logits.")
+                prior_s = fast_sample(
+                    step_out.prior_logits.view(
+                        batch_size,
+                        self.stochastic_groups,
+                        self.stochastic_classes,
+                    )
+                )
+                post_s = fast_sample(
+                    step_out.posterior_logits.view(
+                        batch_size,
+                        self.stochastic_groups,
+                        self.stochastic_classes,
+                    )
+                )
+                z_t = teacher_mask * post_s + (1.0 - teacher_mask) * prior_s
+            else:
+                z_t = teacher_mask * post_mu + (1.0 - teacher_mask) * prior_mu
 
             y_dist, y_dist_latent, y_loc, y_scale, y_loc_latent = self._decode_obs(h_t, z_t)
-            x_dist, x_loc, x_scale = self._decode_exogenous(h_t, z_t, exogenous.shape[-1])
-            kl_t = torch.distributions.kl_divergence(step_out.posterior, step_out.prior)
+            x_dist, x_loc, x_scale = self._decode_exogenous(h_t, z_t, exo_dim)
+            if self.latent_distribution == "categorical":
+                if step_out.prior_logits is None or step_out.posterior_logits is None:
+                    raise RuntimeError("Categorical latent mode requires prior/posterior logits.")
+                kl_t = self._kl_categorical_logits(
+                    step_out.posterior_logits,
+                    step_out.prior_logits,
+                    self.stochastic_groups,
+                    self.stochastic_classes,
+                )
+                if prior_logits_all is not None and post_logits_all is not None:
+                    prior_logits_all[:, t, :] = step_out.prior_logits
+                    post_logits_all[:, t, :] = step_out.posterior_logits
+            else:
+                kl_t = self._kl_diagonal_normal(post_mu, post_logvar, prior_mu, prior_logvar)
 
             predictions[:, t, :] = y_loc
             dist_loc[:, t, :] = y_loc
             dist_loc_latent[:, t, :] = y_loc_latent
             dist_scale[:, t, :] = y_scale
-            kl_terms[:, t] = kl_t
+            kl_terms[:, t] = kl_t.sum(dim=-1)
             prior_mu_all[:, t, :] = prior_mu
             prior_logvar_all[:, t, :] = prior_logvar
             post_mu_all[:, t, :] = post_mu
             post_logvar_all[:, t, :] = post_logvar
             objective_dists.append(y_dist)
             objective_dists_latent.append(y_dist_latent)
-            aux_dists.append(x_dist)
-            if x_loc.shape[-1] > 0:
+            if x_dist is not None:
+                aux_dists.append(x_dist)
+            if aux_out_dim > 0:
                 aux_loc[:, t, :] = x_loc
                 aux_scale[:, t, :] = x_scale
 
@@ -963,6 +1199,8 @@ class LatentSSMWorldModel(WorldModelBase):
             "prior_logvar": prior_logvar_all,
             "posterior_mu": post_mu_all,
             "posterior_logvar": post_logvar_all,
+            "prior_logits": prior_logits_all,
+            "posterior_logits": post_logits_all,
             "aux_loc": aux_loc,
             "aux_scale": aux_scale,
             "objective_dists": objective_dists,
@@ -1006,7 +1244,7 @@ class LatentSSMWorldModel(WorldModelBase):
                 exogenous=exogenous,
                 observations=targets[:, :horizon, :],
                 initial_state=state0,
-                sample_posterior=False,
+                sample_posterior=(self.latent_distribution == "categorical"),
             )
             return {
                 "predictions": posterior["predictions"],
@@ -1019,6 +1257,8 @@ class LatentSSMWorldModel(WorldModelBase):
                 "prior_logvar": posterior["prior_logvar"],
                 "posterior_mu": posterior["posterior_mu"],
                 "posterior_logvar": posterior["posterior_logvar"],
+                "prior_logits": posterior.get("prior_logits"),
+                "posterior_logits": posterior.get("posterior_logits"),
                 "aux_loc": posterior["aux_loc"],
                 "aux_scale": posterior["aux_scale"],
                 "objective_dists": posterior.get("objective_dists", []),
@@ -1051,6 +1291,7 @@ class LatentSSMWorldModel(WorldModelBase):
         dist_loc_latent = imagined["dist_loc_latent"]
         prior_mu = imagined["prior_mu"]
         prior_logvar = imagined["prior_logvar"]
+        prior_logits = imagined.get("prior_logits")
         aux_loc = imagined["aux_loc"]
         aux_scale = imagined["aux_scale"]
         return {
@@ -1064,6 +1305,8 @@ class LatentSSMWorldModel(WorldModelBase):
             "prior_logvar": prior_logvar,
             "posterior_mu": torch.zeros_like(prior_mu),
             "posterior_logvar": torch.zeros_like(prior_logvar),
+            "prior_logits": prior_logits,
+            "posterior_logits": (torch.zeros_like(prior_logits) if torch.is_tensor(prior_logits) else None),
             "aux_loc": aux_loc,
             "aux_scale": aux_scale,
             "objective_dists": imagined.get("objective_dists", []),

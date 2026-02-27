@@ -1,4 +1,0 @@
-defaults:
-  - experiment: wastewater_verify_aux_off
-  - _self_
-

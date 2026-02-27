@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 import yaml
 from joblib import load as joblib_load
 
@@ -25,7 +27,7 @@ from timesim.data.loader import (
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
 from timesim.models.factory import build_model
-from timesim.utils.config import load_config
+from timesim.utils.config import compose_config
 from timesim.utils.misc import resolve_device
 
 
@@ -261,12 +263,8 @@ def _build_test_dataset(cfg: Dict[str, Any], scaler) -> GroupedTimeSeriesDataset
     if test_split is None:
         ratios = resolve_split_ratios(
             split_cfg=data_cfg.get("splits", None),
-            train_split=dcfg.get("train_split", data_cfg.get("train_split", None)),
-            default=(
-                float(data_cfg.get("default_train_ratio", 0.70)),
-                float(data_cfg.get("default_val_ratio", 0.15)),
-                float(data_cfg.get("default_test_ratio", 0.15)),
-            ),
+            train_split=None,
+            default=(0.70, 0.15, 0.15),
         )
         _, _, test_df = chronological_split_dataframe(df, split_ratios=ratios)
     else:
@@ -304,7 +302,7 @@ def _compute_latent_diagnostics(
     device: str,
 ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
     try:
-        cfg = load_config(str(cfg_path))
+        cfg = compose_config(str(cfg_path))
         dcfg = cfg["dataset"]
         groups = dcfg["variables"]
         schema = VariableSchema.from_groups(groups)

@@ -17,9 +17,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 import yaml
 
-from timesim.utils.config import load_config
+from timesim.utils.config import compose_config
 from timesim.data.loader import load_csv_dataset
 from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.schema import VariableSchema
@@ -59,13 +61,13 @@ def discover_checkpoints(model_dir: Path, model_type: str):
     return found
 
 
-def parse_args():
+def _build_cli_parser():
     parser = argparse.ArgumentParser(
         description="Simulate a trained model on the full dataset",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to YAML/Hydra config")
+    parser.add_argument("--config", "--config-name", type=str, required=True,
+                        help="Hydra config name or path to YAML config")
     parser.add_argument("--model", type=str, required=True,
                         help="Model type to simulate (e.g. lstm, transformer, xgboost)")
     parser.add_argument("--round", type=str, default=None,
@@ -88,14 +90,14 @@ def parse_args():
     out_grp.add_argument("--prefix", type=str, default="simulate",
                          help="Output filename prefix (default: simulate)")
 
-    return parser.parse_args()
+    return parser
 
 
 def main():
-    args = parse_args()
+    parser = _build_cli_parser()
+    args, hydra_overrides = parser.parse_known_args()
 
-    # ── Load config ───────────────────────────────────────────────────
-    config = load_config(args.config)
+    config = compose_config(args.config, overrides=hydra_overrides)
     if args.device:
         config["misc"]["device"] = args.device
 

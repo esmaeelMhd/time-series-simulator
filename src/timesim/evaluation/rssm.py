@@ -106,9 +106,50 @@ def _nanmean_curves(curves: List[np.ndarray]) -> np.ndarray:
     valid = np.isfinite(stacked)
     num = np.where(valid, stacked, 0.0).sum(axis=0)
     den = valid.sum(axis=0)
-    out = np.divide(num, np.maximum(den, 1), where=den > 0)
+    out = np.full(num.shape, np.nan, dtype=np.float32)
+    np.divide(num, np.maximum(den, 1), where=den > 0, out=out)
     out = np.where(den > 0, out, np.nan)
     return out.astype(np.float32, copy=False)
+
+
+def _condition_then_rollout(
+    model,
+    *,
+    history_controls: torch.Tensor,
+    history_exogenous: torch.Tensor,
+    history_objectives: torch.Tensor,
+    future_controls: torch.Tensor,
+    future_exogenous: torch.Tensor,
+    n_steps: Optional[int] = None,
+    n_samples: int = 50,
+) -> Dict[str, Any]:
+    horizon = int(n_steps if n_steps is not None else future_controls.shape[1])
+    warmup_seq = {
+        "controls": history_controls,
+        "exogenous": history_exogenous,
+        "outputs": history_objectives,
+        "inputs": torch.cat([history_controls, history_exogenous, history_objectives], dim=-1),
+    }
+    rollout_inputs = {
+        "controls": future_controls[:, :horizon, :],
+        "exogenous": future_exogenous[:, :horizon, :],
+    }
+    base_out = model.rollout(
+        warmup_seq=warmup_seq,
+        rollout_inputs=rollout_inputs,
+        horizon=horizon,
+    )
+    out: Dict[str, Any] = dict(base_out)
+    if n_samples > 1 and hasattr(model, "rollout_mc"):
+        mc_out = model.rollout_mc(
+            warmup_seq=warmup_seq,
+            rollout_inputs=rollout_inputs,
+            horizon=horizon,
+            n_samples=n_samples,
+        )
+        out["samples"] = mc_out["samples"]
+        out["predictions"] = mc_out.get("mean", out.get("predictions"))
+    return out
 
 
 def open_loop_evaluate(
@@ -150,7 +191,8 @@ def open_loop_evaluate(
             history_c, history_x = _split_controls_exo(dataset, warmup_inputs)
             future_c, future_x = _split_controls_exo(dataset, future_inputs)
 
-            out = model.condition_then_simulate(
+            out = _condition_then_rollout(
+                model,
                 history_controls=torch.from_numpy(history_c).unsqueeze(0).to(device),
                 history_exogenous=torch.from_numpy(history_x).unsqueeze(0).to(device),
                 history_objectives=torch.from_numpy(history_y).unsqueeze(0).to(device),
@@ -285,7 +327,8 @@ def closed_loop_evaluate(
             for t in range(horizon):
                 hc, hx = _split_controls_exo(dataset, hist_inputs)
                 fc, fx = _split_controls_exo(dataset, future_inputs[t:t + 1])
-                step_out = model.condition_then_simulate(
+                step_out = _condition_then_rollout(
+                    model,
                     history_controls=torch.from_numpy(hc).unsqueeze(0).to(device),
                     history_exogenous=torch.from_numpy(hx).unsqueeze(0).to(device),
                     history_objectives=torch.from_numpy(hist_y).unsqueeze(0).to(device),
@@ -477,7 +520,8 @@ def interventional_evaluate(
             else:
                 raise ValueError(f"Unsupported intervention scenario: {scenario}")
 
-            base_out = model.condition_then_simulate(
+            base_out = _condition_then_rollout(
+                model,
                 history_controls=torch.from_numpy(history_c).unsqueeze(0).to(device),
                 history_exogenous=torch.from_numpy(history_x).unsqueeze(0).to(device),
                 history_objectives=torch.from_numpy(history_y).unsqueeze(0).to(device),
@@ -486,7 +530,8 @@ def interventional_evaluate(
                 n_steps=horizon,
                 n_samples=n_samples,
             )
-            pert_out = model.condition_then_simulate(
+            pert_out = _condition_then_rollout(
+                model,
                 history_controls=torch.from_numpy(history_c).unsqueeze(0).to(device),
                 history_exogenous=torch.from_numpy(history_x).unsqueeze(0).to(device),
                 history_objectives=torch.from_numpy(history_y).unsqueeze(0).to(device),
@@ -531,10 +576,12 @@ def interventional_evaluate(
             direction_valid = np.isfinite(direction)
             direction_num = np.where(direction_valid, direction, 0.0).sum(axis=-1)
             direction_den = direction_valid.sum(axis=-1)
-            direction_step = np.divide(
+            direction_step = np.full(direction_num.shape, np.nan, dtype=np.float32)
+            np.divide(
                 direction_num,
                 np.maximum(direction_den, 1),
                 where=direction_den > 0,
+                out=direction_step,
             )
             direction_step = np.where(
                 direction_den > 0,
@@ -550,10 +597,12 @@ def interventional_evaluate(
     direction_valid = np.isfinite(direction_arr)
     direction_num = np.where(direction_valid, direction_arr, 0.0).sum(axis=0)
     direction_den = direction_valid.sum(axis=0)
-    direction_curve = np.divide(
+    direction_curve = np.full(direction_num.shape, np.nan, dtype=np.float32)
+    np.divide(
         direction_num,
         np.maximum(direction_den, 1),
         where=direction_den > 0,
+        out=direction_curve,
     )
     direction_curve = np.where(direction_den > 0, direction_curve, np.nan).astype(
         np.float32,
@@ -600,7 +649,8 @@ def _simulate_condition_then_simulate(
     sigma_scale: float = 1.0,
 ) -> Dict[str, np.ndarray]:
     with torch.no_grad():
-        out = model.condition_then_simulate(
+        out = _condition_then_rollout(
+            model,
             history_controls=torch.from_numpy(history_c).unsqueeze(0).to(device),
             history_exogenous=torch.from_numpy(history_x).unsqueeze(0).to(device),
             history_objectives=torch.from_numpy(history_y).unsqueeze(0).to(device),

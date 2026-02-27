@@ -2,24 +2,24 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 
 from timesim.data.loader import generate_sine_dataset, build_dataloaders
 from timesim.data.schema import VariableSchema
 from timesim.models import get_model
-from timesim.engine.retrainer import Retrainer
-from timesim.utils.config import load_config
+from timesim.training.retrainer import Retrainer
+from timesim.utils.config import compose_config
 from timesim.utils.logger import create_run_dir, init_logging
 from timesim.utils.plotting import save_loss_plot, compare_simulation_plot, multi_compare_simulation_plot
 from timesim.utils.misc import seed_everything, resolve_device
 from joblib import load, dump
 
 
-def parse_args():
+def _build_cli_parser():
     p = argparse.ArgumentParser(description="Fine-tune a checkpoint on new data")
-    p.add_argument("--config", type=str, default="configs/base.yml",
-                   help="YAML config with defaults")
-
-    # Overrides
+    p.add_argument("--config", "--config-name", type=str, default="configs/base.yml",
+                   help="Hydra config name or path to YAML config")
     p.add_argument("--ckpt", type=str)
     p.add_argument("--epochs", type=int)
     p.add_argument("--seq-len", type=int)
@@ -27,18 +27,21 @@ def parse_args():
     p.add_argument("--batch-size", type=int)
     p.add_argument("--device", type=str)
     p.add_argument("--model", type=str)
-
-    # SEPP specific
     p.add_argument("--retrain-method", type=str, default=None, choices=["v1", "v2", "sepp"])
     p.add_argument("--sepp-h-max", type=int)
     p.add_argument("--sepp-stride", type=int)
-    return p.parse_args()
+    return p
 
 
 def main():
-    cli_args = parse_args()
+    parser = _build_cli_parser()
+    cli_args, hydra_overrides = parser.parse_known_args()
 
-    cfg = load_config(cli_args.config, cli_args)
+    cfg = compose_config(cli_args.config, overrides=hydra_overrides)
+    for key in ("ckpt", "epochs", "seq_len", "pred_len", "batch_size", "model", "device"):
+        val = getattr(cli_args, key, None)
+        if val is not None:
+            cfg[key] = val
     seed = int(cfg.get("seed") or cfg.get("misc", {}).get("seed", 42))
     deterministic = bool(cfg.get("misc", {}).get("deterministic", False))
     seed_everything(seed, deterministic=deterministic)
@@ -108,7 +111,7 @@ def main():
                                                                     seq_len=seq_len,
                                                                     pred_len=pred_len,
                                                                     batch_size=batch_size,
-                                                                    train_split=dataset_cfg.get("train_split", cfg.get("data", {}).get("train_split", 0.7)),
+                                                                    train_split=float(((cfg.get("data", {}).get("splits", None) or {}).get("train", 0.7))),
                                                                     split_cfg=cfg.get("data", {}).get("splits", None),
                                                                     device=device,
                                                                     seed=seed,
@@ -176,7 +179,7 @@ def main():
     # Choose retrain path
     retrain_method = cli_args.retrain_method or cfg.get('retrain', {}).get('method', 'v2')
     if retrain_method == "sepp":
-        from timesim.engine.sepp_trainer import SEPPTrainer
+        from timesim.training.sepp_trainer import SEPPTrainer
         model = build_model_func().to(device)
         state = torch.load(cfg['ckpt'], map_location=device)
         if isinstance(state, dict) and "model_state_dict" in state:
@@ -192,8 +195,10 @@ def main():
         # ----------------------------------------------------
         from timesim.data.sepp_dataset import SEPPWindowDataset
         n_total_rows = len(df_raw)
+        split_cfg = cfg.get("data", {}).get("splits", None) or {}
+        train_ratio = float(split_cfg.get("train", 0.7))
         n_train_rows = int(
-            n_total_rows * float(dataset_cfg.get("train_split", cfg.get("data", {}).get("train_split", 0.7)))
+            n_total_rows * train_ratio
         )
         # Ensure window fits: need at least seq_len + h_max rows
         val_start = max(n_train_rows - seq_len - h_max, 0)

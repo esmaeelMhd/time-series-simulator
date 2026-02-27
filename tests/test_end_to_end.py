@@ -8,8 +8,8 @@ import torch
 
 from timesim.data.loader import generate_sine_dataset, build_dataloaders
 from timesim.models import get_model
-from timesim.engine.trainer import Trainer
-from timesim.engine.retrainer import Retrainer
+from timesim.training.trainer import Trainer
+from timesim.training.retrainer import Retrainer
 
 
 def test_train_and_retrain(tmp_path: Path):

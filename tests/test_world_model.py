@@ -1,5 +1,5 @@
-from timesim.models.world_model import WorldModel
+from timesim.models import LatentSSMWorldModel
 
 
-def test_world_model_alias_points_to_latent_ssm():
-    assert WorldModel.__name__ == "LatentSSMWorldModel"
+def test_latent_ssm_world_model_exported():
+    assert LatentSSMWorldModel.__name__ == "LatentSSMWorldModel"

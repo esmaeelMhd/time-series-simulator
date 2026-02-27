@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional, Literal, Callable, Dict, Any
 import time
 import math
+import logging
 
 import numpy as np
 import torch
@@ -35,7 +36,9 @@ from .losses import (
     ProbabilisticRolloutLoss,
     soft_dtw_distance,
 )
-from .rollout import batch_rollout_padded, get_rollout_schedule
+from .rollout import batch_rollout_padded
+
+logger = logging.getLogger(__name__)
 
 
 class WorldModelTrainer:
@@ -86,6 +89,8 @@ class WorldModelTrainer:
         Takes precedence over device parameter.
     early_stopping : bool, default False
         Whether to use early stopping.
+    early_stopping_min_epoch : int, default 1
+        Do not run early-stopping checks before this epoch.
     patience : int, default 5
         Patience for early stopping.
     min_delta : float, default 0.0
@@ -117,6 +122,8 @@ class WorldModelTrainer:
         use_gpu: bool = False,
         use_amp: bool = False,
         early_stopping: bool = False,
+        early_stopping_min_epoch: int = 1,
+        early_stopping_start_epoch: int = 1,
         patience: int = 5,
         min_delta: float = 0.0,
         run_dir: Optional[str | Path] = None,
@@ -143,10 +150,10 @@ class WorldModelTrainer:
             # Automatically use GPU if available
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
-                print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+                logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
             else:
                 self.device = torch.device("cpu")
-                print("Warning: use_gpu=True but CUDA is not available. Using CPU instead.")
+                logger.warning("Warning: use_gpu=True but CUDA is not available. Using CPU instead.")
         else:
             # Use the specified device
             self.device = torch.device(device)
@@ -165,7 +172,13 @@ class WorldModelTrainer:
         except Exception:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_grad_scaler)
 
-        
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.memory.set_per_process_memory_fraction(0.95)
+            except Exception:
+                pass
+
         # Sampling strategy
         if sampling_strategy is None:
             # Default: random start with fixed horizon
@@ -206,28 +219,36 @@ class WorldModelTrainer:
         prob_cfg = probabilistic_cfg or {}
         self.probabilistic_loss_fn = ProbabilisticRolloutLoss(
             recon_weight=prob_cfg.get("recon_weight", prob_cfg.get("elbo_weight", 1.0)),
-            kl_weight=prob_cfg.get("kl_weight", 1.0),
+            kl_weight=prob_cfg.get("kl_weight", 0.5),
             aux_weight=prob_cfg.get("aux_weight", prob_cfg.get("rollout_mse_weight", 1.0)),
-            kl_free_bits=prob_cfg.get("kl_free_bits", 1.0),
+            kl_free_bits=prob_cfg.get("kl_free_bits", 0.0),
             kl_balance=prob_cfg.get("kl_balance", 0.8),
-            use_kl_balancing=prob_cfg.get("use_kl_balancing", True),
-            use_free_bits=prob_cfg.get("use_free_bits", True),
+            use_kl_balancing=prob_cfg.get("use_kl_balancing", False),
+            use_free_bits=prob_cfg.get("use_free_bits", False),
             use_symlog=prob_cfg.get("use_symlog", False),
         )
         self.prob_objective = str(prob_cfg.get("objective", "rssm"))
-        self.rollout_weight = float(prob_cfg.get("rollout_weight", 0.0))
+        self.rollout_weight = float(prob_cfg.get("rollout_weight", 1.0))
         self.rollout_dtw_weight = float(prob_cfg.get("rollout_dtw_weight", 0.0))
         self.rollout_dtw_gamma = float(prob_cfg.get("rollout_dtw_gamma", 0.1))
         self.rollout_warmup_fraction = float(prob_cfg.get("rollout_warmup_fraction", 0.30))
         self.rollout_max_horizon = max(
             0,
-            int(prob_cfg.get("rollout_max_horizon", max(1, getattr(self.dataset, "pred_len", 1)))),
+            int(prob_cfg.get("rollout_max_horizon", 30)),
+        )
+        self.rollout_start_epoch = max(1, int(prob_cfg.get("rollout_start_epoch", 4)))
+        self.rollout_full_epoch = max(
+            self.rollout_start_epoch,
+            int(prob_cfg.get("rollout_full_epoch", 20)),
         )
         self.min_context = max(1, int(prob_cfg.get("min_context", 16)))
         self.kl_warmup_enabled = bool(prob_cfg.get("kl_warmup_enabled", False))
         self.kl_beta_start = float(prob_cfg.get("kl_beta_start", 1.0))
         self.kl_beta_end = float(prob_cfg.get("kl_beta_end", 1.0))
-        self.kl_warmup_epochs = max(1, int(prob_cfg.get("kl_warmup_epochs", 1)))
+        self.kl_warmup_epochs = max(
+            1,
+            int(prob_cfg.get("kl_anneal_epochs", prob_cfg.get("kl_warmup_epochs", 15))),
+        )
         self.grad_clip_norm = float(prob_cfg.get("grad_clip_norm", 100.0))
         # Mandatory warmup for stable RSSM optimization.
         self.lr_warmup_steps = max(1, int(prob_cfg.get("lr_warmup_steps", 1000)))
@@ -277,7 +298,12 @@ class WorldModelTrainer:
                 )
             ),
         )
-        
+        self.curriculum_start_epoch = max(1, int(curriculum_cfg.get("start_epoch", 1)))
+        self.curriculum_max_epoch = max(
+            self.curriculum_start_epoch,
+            int(curriculum_cfg.get("max_epoch", curriculum_cfg.get("end_epoch", 50))),
+        )
+
         # Optimizer
         if optimizer is None:
             self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=3e-4, weight_decay=1e-6)
@@ -311,9 +337,10 @@ class WorldModelTrainer:
             if not self.metrics_path.exists():
                 with open(self.metrics_path, "w", encoding="utf-8") as f:
                     f.write(
-                        "epoch,train_loss,val_loss,loss_std,loss_total,recon_nll,kl,kl_raw,aux_nll,"
-                        "rollout_nll,rollout_dtw,rollout_total,rollout_weight_eff,"
-                        "rollout_ramp,horizon_schedule,context_len,grad_norm,grad_norm_pre,lr\n"
+                        "epoch,train_loss,val_loss,loss_std,loss_total,recon_nll,kl,kl_mean,kl_raw,"
+                        "kl_per_dim_active,decoder_std_mean,decoder_std_min,prior_std_mean,prior_std_max,posterior_std_mean,posterior_std_max,"
+                        "aux_nll,horizon,context_len,rollout_nll,rollout_dtw,rollout_total,rollout_weight_eff,"
+                        "rollout_ramp,horizon_schedule,grad_norm,grad_norm_pre,lr\n"
                     )
         else:
             self.writer = writer
@@ -323,29 +350,58 @@ class WorldModelTrainer:
         self.seed = None if seed is None else int(seed)
         self.rng = np.random.default_rng(self.seed)
         self.checkpoint_metadata: Dict[str, Any] = dict(checkpoint_metadata or {})
+        # Do not trigger early stopping before this epoch (helps avoid premature stops during curriculum warmup).
+        # Keep backward compatibility with older configs using early_stopping_start_epoch.
+        self.early_stopping_min_epoch = max(
+            1,
+            int(early_stopping_min_epoch if early_stopping_min_epoch is not None else early_stopping_start_epoch),
+        )
+        self.early_stopping_start_epoch = self.early_stopping_min_epoch
 
     def _rollout_schedule(self) -> tuple[int, int, float]:
         """Return (horizon, context_len, ramp_factor) for rollout losses."""
-        cfg = {
-            "epochs": int(self._fit_epochs),
-            "seq_len": int(self.warmup_len),
-            "rollout_warmup_fraction": float(self.rollout_warmup_fraction),
-            "rollout_max_horizon": int(self.rollout_max_horizon),
-            "min_context": int(self.min_context),
-        }
-        return get_rollout_schedule(epoch=int(self._current_epoch), cfg=cfg)
+        ep = int(self._current_epoch)
+        max_h = int(self.rollout_max_horizon)
+        if ep <= int(self.rollout_start_epoch):
+            sched_horizon = 0
+        elif ep <= int(self.rollout_full_epoch):
+            denom = max(1, int(self.rollout_full_epoch) - int(self.rollout_start_epoch))
+            progress = float(ep - int(self.rollout_start_epoch)) / float(denom)
+            sched_horizon = max(2, int(progress * float(max_h)))
+        else:
+            sched_horizon = max_h
+
+        seq_len = int(self.warmup_len)
+        sched_horizon = min(int(sched_horizon), max(0, seq_len - int(self.min_context)))
+        context_len = max(int(self.min_context), seq_len - int(sched_horizon))
+        sched_horizon = max(0, int(seq_len) - int(context_len))
+        ramp = self._current_rollout_ramp()
+        return sched_horizon, context_len, float(ramp)
+
+    def _current_rollout_ramp(self) -> float:
+        """Rollout loss ramp: 1-4 -> 0.0, 5-15 linear, 16+ -> 1.0."""
+        ep = int(self._current_epoch)
+        if ep <= 4:
+            return 0.0
+        if ep <= 15:
+            return min(1.0, float(ep - 4) / float(15 - 4))
+        return 1.0
 
     def _current_kl_beta(self) -> float:
-        """Current KL beta with optional linear warmup."""
+        """Current effective KL weight with optional linear warmup."""
+        kl_weight = float(self.probabilistic_loss_fn.kl_weight)
         if not self.kl_warmup_enabled:
-            return self.kl_beta_end
-        if self.kl_warmup_epochs <= 1:
-            return self.kl_beta_end
+            return kl_weight
         ep = int(self._current_epoch)
-        if ep >= self.kl_warmup_epochs:
-            return self.kl_beta_end
-        frac = float(ep - 1) / float(self.kl_warmup_epochs - 1)
-        return self.kl_beta_start + frac * (self.kl_beta_end - self.kl_beta_start)
+        warmup = max(1, int(self.kl_warmup_epochs))
+        return kl_weight * min(1.0, float(ep) / float(warmup))
+
+    def _current_kl_scale(self) -> float:
+        """Scale factor passed to loss so effective KL weight follows _current_kl_beta()."""
+        kl_weight = float(self.probabilistic_loss_fn.kl_weight)
+        if kl_weight <= 0.0:
+            return 0.0
+        return float(self._current_kl_beta() / kl_weight)
 
     def _update_learning_rate(self):
         """Linear warmup then cosine decay on optimizer LR."""
@@ -371,9 +427,13 @@ class WorldModelTrainer:
         """Current horizon cap for sequence-length curriculum."""
         if not self.sequence_curriculum_enabled:
             return self.curriculum_target_horizon
-        if self._fit_epochs <= 1:
+        if self._current_epoch < self.curriculum_start_epoch:
+            return self.curriculum_start_horizon
+        if self._current_epoch >= self.curriculum_max_epoch:
             return self.curriculum_target_horizon
-        frac = float(self._current_epoch - 1) / float(max(1, self._fit_epochs - 1))
+        frac = float(self._current_epoch - self.curriculum_start_epoch) / float(
+            max(1, self.curriculum_max_epoch - self.curriculum_start_epoch)
+        )
         frac = max(0.0, min(1.0, frac))
         curr = self.curriculum_start_horizon + frac * (
             self.curriculum_target_horizon - self.curriculum_start_horizon
@@ -463,6 +523,8 @@ class WorldModelTrainer:
                 prior_logvar = result_teacher.get("prior_logvar")
                 posterior_mu = result_teacher.get("posterior_mu")
                 posterior_logvar = result_teacher.get("posterior_logvar")
+                prior_logits = result_teacher.get("prior_logits")
+                posterior_logits = result_teacher.get("posterior_logits")
                 aux_loc = result_teacher.get("aux_loc")
                 aux_scale = result_teacher.get("aux_scale")
                 if self.disable_aux_loss:
@@ -477,17 +539,29 @@ class WorldModelTrainer:
                         dist_loc_latent = self.probabilistic_loss_fn._symlog(dist_loc)  # pylint: disable=protected-access
                     else:
                         dist_loc_latent = dist_loc
-                if (
-                    dist_scale is None
-                    or prior_mu is None
-                    or prior_logvar is None
-                    or posterior_mu is None
-                    or posterior_logvar is None
-                ):
+                has_gaussian_latent = (
+                    prior_mu is not None
+                    and prior_logvar is not None
+                    and posterior_mu is not None
+                    and posterior_logvar is not None
+                )
+                has_categorical_latent = (
+                    prior_logits is not None
+                    and posterior_logits is not None
+                    and hasattr(self.model, "stochastic_groups")
+                    and hasattr(self.model, "stochastic_classes")
+                )
+                if dist_scale is None or (not has_gaussian_latent and not has_categorical_latent):
                     raise ValueError(
                         "Probabilistic model rollout must return "
-                        "dist_scale/prior_mu/prior_logvar/posterior_mu/posterior_logvar"
+                        "dist_scale and latent posterior/prior params"
                     )
+                if not has_gaussian_latent:
+                    assert prior_logits is not None and posterior_logits is not None
+                    prior_mu = prior_logits
+                    prior_logvar = torch.zeros_like(prior_logits)
+                    posterior_mu = posterior_logits
+                    posterior_logvar = torch.zeros_like(posterior_logits)
 
                 kl_beta = self._current_kl_beta()
                 std_loss, info = self.probabilistic_loss_fn(
@@ -498,21 +572,62 @@ class WorldModelTrainer:
                     prior_logvar=prior_logvar,
                     posterior_mu=posterior_mu,
                     posterior_logvar=posterior_logvar,
+                    prior_logits=(prior_logits if has_categorical_latent else None),
+                    posterior_logits=(posterior_logits if has_categorical_latent else None),
+                    stochastic_groups=(
+                        int(getattr(self.model, "stochastic_groups"))
+                        if has_categorical_latent
+                        else None
+                    ),
+                    stochastic_classes=(
+                        int(getattr(self.model, "stochastic_classes"))
+                        if has_categorical_latent
+                        else None
+                    ),
                     exogenous_targets=exogenous_targets,
                     aux_loc=aux_loc,
                     aux_scale=aux_scale,
                     mask=mask,
-                    kl_beta=kl_beta,
+                    kl_beta=self._current_kl_scale(),
                 )
-                raw_kl_elem = self.probabilistic_loss_fn._balanced_kl(  # pylint: disable=protected-access
+                # Raw KL(q||p) before any balancing or free-bits manipulation.
+                raw_kl_elem = self.probabilistic_loss_fn._raw_kl(  # pylint: disable=protected-access
                     posterior_mu=posterior_mu,
                     posterior_logvar=posterior_logvar,
                     prior_mu=prior_mu,
                     prior_logvar=prior_logvar,
+                    posterior_logits=(posterior_logits if has_categorical_latent else None),
+                    prior_logits=(prior_logits if has_categorical_latent else None),
+                    stochastic_groups=(
+                        int(getattr(self.model, "stochastic_groups"))
+                        if has_categorical_latent
+                        else None
+                    ),
+                    stochastic_classes=(
+                        int(getattr(self.model, "stochastic_classes"))
+                        if has_categorical_latent
+                        else None
+                    ),
                 )
                 raw_kl = self.probabilistic_loss_fn._sum_time_mean_batch(  # pylint: disable=protected-access
                     raw_kl_elem.sum(dim=-1), mask
                 )
+                kl_per_dim = raw_kl_elem.mean(dim=(0, 1))
+                kl_per_dim_active = int((kl_per_dim > 0.1).sum().item())
+                decoder_std_mean = float(dist_scale.mean().detach().item())
+                decoder_std_min = float(dist_scale.min().detach().item())
+                if has_categorical_latent:
+                    prior_std_mean = float("nan")
+                    prior_std_max = float("nan")
+                    posterior_std_mean = float("nan")
+                    posterior_std_max = float("nan")
+                else:
+                    prior_std = torch.exp(0.5 * prior_logvar)
+                    post_std = torch.exp(0.5 * posterior_logvar)
+                    prior_std_mean = float(prior_std.mean().detach().item())
+                    prior_std_max = float(prior_std.max().detach().item())
+                    posterior_std_mean = float(post_std.mean().detach().item())
+                    posterior_std_max = float(post_std.max().detach().item())
 
                 rollout_nll = torch.zeros((), dtype=std_loss.dtype, device=std_loss.device)
                 rollout_dtw = torch.zeros_like(rollout_nll)
@@ -576,9 +691,19 @@ class WorldModelTrainer:
 
                 self._last_prob_info = {
                     **info,
+                    "kl_beta": float(kl_beta),
+                    "kl_mean": float(info.get("kl_mean", info.get("kl", float("nan")))),
                     "loss_std": float(std_loss.detach().item()),
                     "loss_total": float(combined_loss.detach().item()),
                     "kl_raw": float(raw_kl.detach().item()),
+                    "kl_per_dim_active": float(kl_per_dim_active),
+                    "decoder_std_mean": float(decoder_std_mean),
+                    "decoder_std_min": float(decoder_std_min),
+                    "prior_std_mean": float(prior_std_mean),
+                    "prior_std_max": float(prior_std_max),
+                    "posterior_std_mean": float(posterior_std_mean),
+                    "posterior_std_max": float(posterior_std_max),
+                    "horizon": float(rollout_horizon),
                     "rollout_horizon": float(rollout_horizon),
                     "context_len": float(context_len),
                     "rollout_ramp": float(rollout_ramp),
@@ -678,8 +803,17 @@ class WorldModelTrainer:
                     "loss_total",
                     "recon_nll",
                     "kl",
+                    "kl_mean",
                     "kl_raw",
+                    "kl_per_dim_active",
+                    "decoder_std_mean",
+                    "decoder_std_min",
+                    "prior_std_mean",
+                    "prior_std_max",
+                    "posterior_std_mean",
+                    "posterior_std_max",
                     "aux_nll",
+                    "horizon",
                     "rollout_nll",
                     "rollout_dtw",
                     "rollout_total",
@@ -746,6 +880,8 @@ class WorldModelTrainer:
                     prior_logvar = result_teacher.get("prior_logvar")
                     posterior_mu = result_teacher.get("posterior_mu")
                     posterior_logvar = result_teacher.get("posterior_logvar")
+                    prior_logits = result_teacher.get("prior_logits")
+                    posterior_logits = result_teacher.get("posterior_logits")
                     aux_loc = result_teacher.get("aux_loc")
                     aux_scale = result_teacher.get("aux_scale")
                     if self.disable_aux_loss:
@@ -759,17 +895,29 @@ class WorldModelTrainer:
                             dist_loc_latent = self.probabilistic_loss_fn._symlog(dist_loc)  # pylint: disable=protected-access
                         else:
                             dist_loc_latent = dist_loc
-                    if (
-                        dist_scale is None
-                        or prior_mu is None
-                        or prior_logvar is None
-                        or posterior_mu is None
-                        or posterior_logvar is None
-                    ):
+                    has_gaussian_latent = (
+                        prior_mu is not None
+                        and prior_logvar is not None
+                        and posterior_mu is not None
+                        and posterior_logvar is not None
+                    )
+                    has_categorical_latent = (
+                        prior_logits is not None
+                        and posterior_logits is not None
+                        and hasattr(self.model, "stochastic_groups")
+                        and hasattr(self.model, "stochastic_classes")
+                    )
+                    if dist_scale is None or (not has_gaussian_latent and not has_categorical_latent):
                         raise ValueError(
                             "Probabilistic model rollout must return "
-                            "dist_scale/prior_mu/prior_logvar/posterior_mu/posterior_logvar"
+                            "dist_scale and latent posterior/prior params"
                         )
+                    if not has_gaussian_latent:
+                        assert prior_logits is not None and posterior_logits is not None
+                        prior_mu = prior_logits
+                        prior_logvar = torch.zeros_like(prior_logits)
+                        posterior_mu = posterior_logits
+                        posterior_logvar = torch.zeros_like(posterior_logits)
                     kl_beta = self._current_kl_beta()
                     loss, _ = self.probabilistic_loss_fn(
                         targets=targets,
@@ -779,11 +927,23 @@ class WorldModelTrainer:
                         prior_logvar=prior_logvar,
                         posterior_mu=posterior_mu,
                         posterior_logvar=posterior_logvar,
+                        prior_logits=(prior_logits if has_categorical_latent else None),
+                        posterior_logits=(posterior_logits if has_categorical_latent else None),
+                        stochastic_groups=(
+                            int(getattr(self.model, "stochastic_groups"))
+                            if has_categorical_latent
+                            else None
+                        ),
+                        stochastic_classes=(
+                            int(getattr(self.model, "stochastic_classes"))
+                            if has_categorical_latent
+                            else None
+                        ),
                         exogenous_targets=exogenous_targets,
                         aux_loc=aux_loc,
                         aux_scale=aux_scale,
                         mask=mask,
-                        kl_beta=kl_beta,
+                        kl_beta=self._current_kl_scale(),
                     )
                     if sched_horizon > 0 and effective_rollout_weight > 0.0:
                         rollout_horizons = np.minimum(
@@ -901,10 +1061,10 @@ class WorldModelTrainer:
         self._global_step = 0
         
         if verbose:
-            print(f"\n{'='*70}")
-            print(f"Starting training: {epochs} epochs, {steps_per_epoch} steps/epoch")
-            print(f"Batch size: {self.batch_size}, Training mode: {self.training_mode}")
-            print(f"{'='*70}\n")
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Starting training: {epochs} epochs, {steps_per_epoch} steps/epoch")
+            logger.info(f"Batch size: {self.batch_size}, Training mode: {self.training_mode}")
+            logger.info(f"{'='*70}\n")
         
         train_losses = []
         val_losses = []
@@ -929,11 +1089,14 @@ class WorldModelTrainer:
         for epoch in range(1, epochs + 1):
             self._fit_epochs = epochs
             self._current_epoch = epoch
+            epoch_rollout_horizon, _, epoch_rollout_ramp = self._rollout_schedule()
             epoch_start_time = time.time()
+            logger.info(f"Rollout horizon: {epoch_rollout_horizon}")
+            logger.info(f"Rollout ramp: {epoch_rollout_ramp:.4f}")
             if verbose:
-                print(f"Epoch {epoch}/{epochs}...")
+                logger.info(f"Epoch {epoch}/{epochs}...")
                 if self.sequence_curriculum_enabled:
-                    print(
+                    logger.info(
                         "  Curriculum horizon cap: "
                         f"{self._current_curriculum_horizon()} "
                         f"(start={self.curriculum_start_horizon}, target={self.curriculum_target_horizon})"
@@ -948,8 +1111,17 @@ class WorldModelTrainer:
                 "loss_total": [],
                 "recon_nll": [],
                 "kl": [],
+                "kl_mean": [],
                 "kl_raw": [],
+                "kl_per_dim_active": [],
+                "decoder_std_mean": [],
+                "decoder_std_min": [],
+                "prior_std_mean": [],
+                "prior_std_max": [],
+                "posterior_std_mean": [],
+                "posterior_std_max": [],
                 "aux_nll": [],
+                "horizon": [],
                 "rollout_nll": [],
                 "rollout_dtw": [],
                 "rollout_total": [],
@@ -1000,7 +1172,7 @@ class WorldModelTrainer:
                 else:
                     self._collapse_counter = 0
                 if self._collapse_counter >= self.collapse_patience_epochs and verbose:
-                    print(
+                    logger.info(
                         "  Warning: possible posterior collapse detected "
                         f"(mean KL {mean_epoch_kl:.4f} < {self.collapse_kl_threshold:.4f} "
                         f"for {self._collapse_counter} epoch(s))."
@@ -1008,13 +1180,13 @@ class WorldModelTrainer:
             
             # Validation
             if verbose:
-                print("  Validating...", flush=True)
+                logger.info("  Validating...")
             val_start_time = time.time()
             val_loss = self._validate()
             val_losses.append(val_loss)
             val_time = time.time() - val_start_time
             if verbose:
-                print(f"  Validation done ({val_time:.2f}s)")
+                logger.info(f"  Validation done ({val_time:.2f}s)")
             if val_loss is not None and np.isfinite(val_loss):
                 if best_val_loss is None or float(val_loss) < best_val_loss:
                     best_val_loss = float(val_loss)
@@ -1049,12 +1221,12 @@ class WorldModelTrainer:
                         torch.save(best_bundle, checkpoint_target)
                         if verbose:
                             if prev_best is None:
-                                print(
+                                logger.info(
                                     f"  Saved checkpoint: {checkpoint_target} "
                                     f"({checkpoint_label}={checkpoint_score:.6f})"
                                 )
                             else:
-                                print(
+                                logger.info(
                                     f"  Saved checkpoint: {checkpoint_target} "
                                     f"({checkpoint_label} improved "
                                     f"{prev_best:.6f} -> {checkpoint_score:.6f})"
@@ -1064,7 +1236,7 @@ class WorldModelTrainer:
                                 on_checkpoint_saved(epoch, float(checkpoint_score))
                             except Exception as cb_exc:
                                 if verbose:
-                                    print(f"  Warning: checkpoint callback failed: {cb_exc}")
+                                    logger.warning(f"  Warning: checkpoint callback failed: {cb_exc}")
                 if checkpoint_bundle_dir is not None:
                     should_save_topk = (
                         len(topk_checkpoints) < self.checkpoint_top_k
@@ -1117,18 +1289,42 @@ class WorldModelTrainer:
                 msg += f"train_loss={train_loss:.6f}"
                 if val_loss is not None:
                     msg += f" | val_loss={val_loss:.6f}"
-                if best_checkpoint_score is not None:
-                    msg += (
-                        f" | ckpt_{best_checkpoint_label}={best_checkpoint_score:.6f}"
-                    )
+                if np.isfinite(checkpoint_score):
+                    msg += f" | {checkpoint_label}={checkpoint_score:.6f}"
+                if best_checkpoint_score is not None and best_checkpoint_score != checkpoint_score:
+                    msg += f" (best={best_checkpoint_score:.6f})"
                 if self.is_probabilistic_model:
                     msg += f" | kl_beta={self._current_kl_beta():.4f}"
                     if np.isfinite(mean_epoch_kl):
                         msg += f" | kl_mean={mean_epoch_kl:.4f}"
+                    kl_raw_mean = np.mean(epoch_prob_stats["kl_raw"]) if epoch_prob_stats.get("kl_raw") else float("nan")
+                    if np.isfinite(kl_raw_mean):
+                        msg += f" | kl_raw={kl_raw_mean:.2f}"
+                    kl_active_mean = np.mean(epoch_prob_stats["kl_per_dim_active"]) if epoch_prob_stats["kl_per_dim_active"] else float("nan")
+                    if np.isfinite(kl_active_mean):
+                        msg += f" | kl_active={int(round(kl_active_mean))}"
+                    dec_std_mean = np.mean(epoch_prob_stats["decoder_std_mean"]) if epoch_prob_stats["decoder_std_mean"] else float("nan")
+                    dec_std_min = np.mean(epoch_prob_stats["decoder_std_min"]) if epoch_prob_stats["decoder_std_min"] else float("nan")
+                    prior_std_mean = np.mean(epoch_prob_stats["prior_std_mean"]) if epoch_prob_stats["prior_std_mean"] else float("nan")
+                    prior_std_max = np.mean(epoch_prob_stats["prior_std_max"]) if epoch_prob_stats["prior_std_max"] else float("nan")
+                    post_std_mean = np.mean(epoch_prob_stats["posterior_std_mean"]) if epoch_prob_stats["posterior_std_mean"] else float("nan")
+                    post_std_max = np.mean(epoch_prob_stats["posterior_std_max"]) if epoch_prob_stats["posterior_std_max"] else float("nan")
+                    if np.isfinite(dec_std_mean):
+                        msg += f" | dec_std_mean={dec_std_mean:.4f}"
+                    if np.isfinite(dec_std_min):
+                        msg += f" | dec_std_min={dec_std_min:.4f}"
+                    if np.isfinite(prior_std_mean):
+                        msg += f" | prior_std_mean={prior_std_mean:.4f}"
+                    if np.isfinite(prior_std_max):
+                        msg += f" | prior_std_max={prior_std_max:.4f}"
+                    if np.isfinite(post_std_mean):
+                        msg += f" | post_std_mean={post_std_mean:.4f}"
+                    if np.isfinite(post_std_max):
+                        msg += f" | post_std_max={post_std_max:.4f}"
                     recon_mean = np.mean(epoch_prob_stats["recon_nll"]) if epoch_prob_stats["recon_nll"] else float("nan")
                     aux_mean = np.mean(epoch_prob_stats["aux_nll"]) if epoch_prob_stats["aux_nll"] else float("nan")
                     roll_mean = np.mean(epoch_prob_stats["rollout_nll"]) if epoch_prob_stats["rollout_nll"] else float("nan")
-                    horizon_mean = np.mean(epoch_prob_stats["horizon_schedule"]) if epoch_prob_stats["horizon_schedule"] else float("nan")
+                    horizon_mean = np.mean(epoch_prob_stats["horizon"]) if epoch_prob_stats["horizon"] else float("nan")
                     ramp_mean = np.mean(epoch_prob_stats["rollout_ramp"]) if epoch_prob_stats["rollout_ramp"] else float("nan")
                     grad_mean = np.mean(epoch_prob_stats["grad_norm"]) if epoch_prob_stats["grad_norm"] else float("nan")
                     lr_mean = np.mean(epoch_prob_stats["lr"]) if epoch_prob_stats["lr"] else float("nan")
@@ -1149,12 +1345,14 @@ class WorldModelTrainer:
                 msg += f" | time={epoch_time:.2f}s"
                 if epoch > 1:
                     msg += f" | ETA={eta:.1f}s"
-                print(msg)
+                logger.info(msg)
             
             if self.writer is not None:
                 self.writer.add_scalar("Loss/train", train_loss, epoch)
                 if val_loss is not None:
                     self.writer.add_scalar("Loss/val", val_loss, epoch)
+                if self.is_probabilistic_model:
+                    self.writer.add_scalar("Epoch/kl_beta", float(self._current_kl_beta()), epoch)
                 if best_checkpoint_score is not None:
                     self.writer.add_scalar(
                         f"Checkpoint/{best_checkpoint_label}",
@@ -1178,48 +1376,53 @@ class WorldModelTrainer:
                     f.write(
                         f"{epoch},{train_loss},{val_loss if val_loss is not None else ''},"
                         f"{_m('loss_std')},{_m('loss_total')},"
-                        f"{_m('recon_nll')},{_m('kl')},{_m('kl_raw')},{_m('aux_nll')},"
+                        f"{_m('recon_nll')},{_m('kl')},{_m('kl_mean')},{_m('kl_raw')},{_m('kl_per_dim_active')},"
+                        f"{_m('decoder_std_mean')},{_m('decoder_std_min')},{_m('prior_std_mean')},{_m('prior_std_max')},{_m('posterior_std_mean')},{_m('posterior_std_max')},"
+                        f"{_m('aux_nll')},{_m('horizon')},{_m('context_len')},"
                         f"{_m('rollout_nll')},{_m('rollout_dtw')},{_m('rollout_total')},"
                         f"{_m('rollout_weight_eff')},{_m('rollout_ramp')},"
-                        f"{_m('horizon_schedule')},{_m('context_len')},{_m('grad_norm')},{_m('grad_norm_pre')},{_m('lr')}\n"
+                        f"{_m('horizon_schedule')},{_m('grad_norm')},{_m('grad_norm_pre')},{_m('lr')}\n"
                     )
             
-            # Early stopping
+            # Early stopping with min-epoch gate.
             if self.early_stopping:
-                monitor_value: Optional[float] = val_loss
-                monitor_label = "val_loss"
-                if (
-                    self.early_stopping_monitor in {"open_loop_crps", "checkpoint_metric"}
-                    and np.isfinite(checkpoint_score)
-                ):
-                    monitor_value = float(checkpoint_score)
-                    monitor_label = str(checkpoint_label)
-                self.early_stopping(monitor_value)
-                if self.early_stopping.early_stop:
-                    if verbose:
-                        print(f"\n{'='*70}")
-                        print("Early stopping triggered.")
-                        print(
-                            f"Reason: no validation improvement for "
-                            f"{self.early_stopping.counter} epoch(s) "
-                            f"(patience={self.early_stopping.patience})."
-                        )
-                        if monitor_value is not None and np.isfinite(monitor_value):
-                            print(
-                                f"Current monitored {monitor_label}: "
-                                f"{float(monitor_value):.6f}"
-                            )
-                        if self.early_stopping.best_loss is not None:
-                            print(
-                                f"Best monitored {monitor_label}: "
-                                f"{self.early_stopping.best_loss:.6f}"
+                if int(self._current_epoch) < int(self.early_stopping_min_epoch):
+                    pass
+                else:
+                    monitor_value: Optional[float] = val_loss
+                    monitor_label = "val_loss"
+                    if (
+                        self.early_stopping_monitor in {"open_loop_crps", "checkpoint_metric"}
+                        and np.isfinite(checkpoint_score)
+                    ):
+                        monitor_value = float(checkpoint_score)
+                        monitor_label = str(checkpoint_label)
+                    self.early_stopping(monitor_value)
+                    if self.early_stopping.early_stop:
+                        if verbose:
+                            logger.info(f"\n{'='*70}")
+                            logger.info("Early stopping triggered.")
+                            logger.info(
+                                f"Reason: no validation improvement for "
+                                f"{self.early_stopping.counter} epoch(s) "
+                                f"(patience={self.early_stopping.patience})."
                             )
                             if monitor_value is not None and np.isfinite(monitor_value):
-                                diff = float(monitor_value) - float(self.early_stopping.best_loss)
-                                print(f"Monitored gap vs best: {diff:+.6f}")
-                        print(f"Stopped at epoch {epoch}/{epochs}")
-                        print(f"{'='*70}\n")
-                    break
+                                logger.info(
+                                    f"Current monitored {monitor_label}: "
+                                    f"{float(monitor_value):.6f}"
+                                )
+                            if self.early_stopping.best_loss is not None:
+                                logger.info(
+                                    f"Best monitored {monitor_label}: "
+                                    f"{self.early_stopping.best_loss:.6f}"
+                                )
+                                if monitor_value is not None and np.isfinite(monitor_value):
+                                    diff = float(monitor_value) - float(self.early_stopping.best_loss)
+                                    logger.info(f"Monitored gap vs best: {diff:+.6f}")
+                            logger.info(f"Stopped at epoch {epoch}/{epochs}")
+                            logger.info(f"{'='*70}\n")
+                        break
 
         # Ensure caller gets the best validation model, not the final epoch model.
         if best_state_dict is not None:
@@ -1228,27 +1431,27 @@ class WorldModelTrainer:
         total_time = time.time() - start_time
         
         if verbose:
-            print(f"\n{'='*70}")
-            print(f"Training completed!")
-            print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
-            print(f"Average epoch time: {np.mean(epoch_times):.2f}s")
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Training completed!")
+            logger.info(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
+            logger.info(f"Average epoch time: {np.mean(epoch_times):.2f}s")
             if len(train_losses) > 0:
-                print(f"Final train loss: {train_losses[-1]:.6f}")
+                logger.info(f"Final train loss: {train_losses[-1]:.6f}")
                 if val_losses[-1] is not None:
-                    print(f"Final val loss: {val_losses[-1]:.6f}")
+                    logger.info(f"Final val loss: {val_losses[-1]:.6f}")
                 if best_val_loss is not None:
-                    print(f"Best val loss: {best_val_loss:.6f}")
+                    logger.info(f"Best val loss: {best_val_loss:.6f}")
                 if best_checkpoint_score is not None:
-                    print(
+                    logger.info(
                         f"Best checkpoint {best_checkpoint_label}: "
                         f"{best_checkpoint_score:.6f}"
                     )
                 if checkpoint_bundle_dir is not None and topk_checkpoints:
-                    print(
+                    logger.info(
                         f"Saved top-{len(topk_checkpoints)} checkpoints to: "
                         f"{checkpoint_bundle_dir}"
                     )
-            print(f"{'='*70}\n")
+            logger.info(f"{'='*70}\n")
         
         return train_losses, val_losses
     
@@ -1395,22 +1598,22 @@ class Trainer(nn.Module):
                 msg = f"[Epoch {epoch}/{epochs}] train={train_loss:.4f}"
                 if val_loss is not None:
                     msg += f" | val={val_loss:.4f}"
-                print(msg)
+                logger.info(msg)
             
             if self.early_stopping:
                 self.early_stopping(val_loss)
                 if self.early_stopping.early_stop:
                     if verbose:
-                        print("Early stopping triggered.")
-                        print(
+                        logger.info("Early stopping triggered.")
+                        logger.info(
                             f"Reason: no validation improvement for "
                             f"{self.early_stopping.counter} epoch(s) "
                             f"(patience={self.early_stopping.patience})."
                         )
                         if val_loss is not None:
-                            print(f"Current validation loss: {val_loss:.6f}")
+                            logger.info(f"Current validation loss: {val_loss:.6f}")
                         if self.early_stopping.best_loss is not None:
-                            print(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
+                            logger.info(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
                     break
             
             if self.writer is not None:

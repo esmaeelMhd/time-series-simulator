@@ -1,0 +1,2 @@
+# Alias for explicit CUDA installs
+-r requirements.txt

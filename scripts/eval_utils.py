@@ -11,12 +11,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from timesim.models.factory import NEURAL_MODELS  # canonical source
+from timesim.data.schema import VariableRole
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -65,16 +68,26 @@ def _build_controls_exogenous(
     horizon_len: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Split input features into control and exogenous blocks."""
-    control_positions = list(getattr(dataset, "control_positions", []))
-    known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
+    schema = getattr(dataset, "variable_schema", None)
+    input_cols = list(getattr(dataset, "input_cols", []))
+    if schema is not None and input_cols:
+        control_cols = list(schema.columns_for_role(VariableRole.CONTROL))
+        exo_cols = list(schema.columns_for_role(VariableRole.EXOGENOUS))
+        control_positions = [i for i, col in enumerate(input_cols) if col in control_cols]
+        exo_positions = [i for i, col in enumerate(input_cols) if col in exo_cols]
+    else:
+        # Fallback for older datasets without schema/input_cols metadata
+        control_positions = list(getattr(dataset, "control_positions", []))
+        exo_positions = list(getattr(dataset, "known_exo_positions", []))
+
     controls_np = (
         horizon_inputs[:, control_positions]
         if control_positions
         else np.zeros((horizon_len, 0), dtype=np.float32)
     )
     exo_np = (
-        horizon_inputs[:, known_exo_positions]
-        if known_exo_positions
+        horizon_inputs[:, exo_positions]
+        if exo_positions
         else np.zeros((horizon_len, 0), dtype=np.float32)
     )
     return controls_np, exo_np
@@ -85,11 +98,19 @@ def _build_warmup_full(dataset, warmup_data: np.ndarray) -> np.ndarray:
 
     Order matches model.step assembly: [controls, known_exogenous(+time), outputs].
     """
-    control_positions = list(getattr(dataset, "control_positions", []))
-    known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
+    schema = getattr(dataset, "variable_schema", None)
+    input_cols = list(getattr(dataset, "input_cols", []))
+    if schema is not None and input_cols:
+        control_cols = list(schema.columns_for_role(VariableRole.CONTROL))
+        exo_cols = list(schema.columns_for_role(VariableRole.EXOGENOUS))
+        control_positions = [i for i, col in enumerate(input_cols) if col in control_cols]
+        exo_positions = [i for i, col in enumerate(input_cols) if col in exo_cols]
+    else:
+        control_positions = list(getattr(dataset, "control_positions", []))
+        exo_positions = list(getattr(dataset, "known_exo_positions", []))
     input_idx = dataset.in_idx
     control_idx = [input_idx[i] for i in control_positions]
-    exo_idx = [input_idx[i] for i in known_exo_positions]
+    exo_idx = [input_idx[i] for i in exo_positions]
     output_idx = dataset.out_idx
 
     controls = (

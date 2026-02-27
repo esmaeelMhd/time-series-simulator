@@ -21,9 +21,11 @@ from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 import yaml
 
-from timesim.utils.config import load_config
+from timesim.utils.config import compose_config
 from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
@@ -53,13 +55,13 @@ except ImportError:
     HAS_XGBOOST = False
 
 
-def parse_args():
+def _build_cli_parser():
     p = argparse.ArgumentParser(
         description="Hyperparameter optimization with Optuna (Bayesian/TPE).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--config", type=str, required=True,
-                   help="Path to YAML/Hydra config")
+    p.add_argument("--config", "--config-name", type=str, required=True,
+                   help="Hydra config name or path to YAML config")
     p.add_argument("--models", nargs="*", default=None,
                    help="Optional subset of model types to optimize")
     p.add_argument("--n-trials", type=int, default=None,
@@ -87,7 +89,7 @@ def parse_args():
         help="Disable fast-mode defaults",
     )
     p.set_defaults(fast_mode=None)
-    return p.parse_args()
+    return p
 
 
 def _build_sampling_strategy(
@@ -96,38 +98,41 @@ def _build_sampling_strategy(
     tcfg = config["training"]
     dcfg = config["dataset"]
     scfg = tcfg.get("sampling", {})
+    if "sampling_strategy" in tcfg or "sampling_horizon" in tcfg:
+        raise ValueError(
+            "Deprecated sampling keys detected in training config. "
+            "Use `training.sampling.strategy` and `training.sampling.horizon`."
+        )
 
-    strategy_name = str(
-        scfg.get("strategy", tcfg.get("sampling_strategy", "random_fixed"))
-    ).lower()
-    legacy_horizon = int(tcfg.get("sampling_horizon", pred_len))
+    strategy_name = str(scfg.get("strategy", "random_fixed")).lower()
+    default_horizon = int(scfg.get("horizon", pred_len))
 
     if strategy_name in {"random_fixed", "fixed"}:
         horizon = int(
             horizon_override if horizon_override is not None
-            else scfg.get("horizon", legacy_horizon)
+            else scfg.get("horizon", default_horizon)
         )
         return RandomStartFixedHorizon(horizon=horizon)
     if strategy_name in {"random_random", "random"}:
         h_min = int(scfg.get("h_min", 1))
-        h_max = int(scfg.get("h_max", legacy_horizon))
+        h_max = int(scfg.get("h_max", default_horizon))
         return RandomStartRandomHorizon(h_min=h_min, h_max=h_max)
     if strategy_name in {"geometric", "geometric_horizon"}:
-        h_max = int(scfg.get("h_max", legacy_horizon))
+        h_max = int(scfg.get("h_max", default_horizon))
         return GeometricHorizonSampling(pred_len=pred_len, h_max=h_max)
     if strategy_name in {"daily_fixed", "daily"}:
         return DailyFixedHorizon(
             start_hour=int(scfg.get("start_hour", 0)),
             horizon=int(
                 horizon_override if horizon_override is not None
-                else scfg.get("horizon", legacy_horizon)
+                else scfg.get("horizon", default_horizon)
             ),
             samples_per_hour=int(scfg.get("samples_per_hour", dcfg.get("samples_per_hour", 1))),
         )
     if strategy_name in {"stride", "stride_based"}:
         return StrideBasedSampling(
             stride=int(scfg.get("stride", 12)),
-            h_max=int(scfg.get("h_max", legacy_horizon)),
+            h_max=int(scfg.get("h_max", default_horizon)),
         )
     raise ValueError(f"Unknown sampling strategy '{strategy_name}'")
 
@@ -151,6 +156,7 @@ def _suggest_overrides(
     trial: "optuna.trial.Trial",
     model_type: str,
     profile: str = "fast_gpu",
+    base_model_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Model-specific hyperparameter search spaces.
 
@@ -220,13 +226,18 @@ def _suggest_overrides(
             "dropout": trial.suggest_float("dropout", 0.0, max_dropout, step=0.05),
         }
     if model_type == "latent_ssm":
-        # Phase-7 search space (required minimum):
-        # dim_h in {128,256,512}, dim_z in {32,64,128}, decoder_layers in {2,3,4}.
-        return {
-            "hidden_dim": trial.suggest_categorical("dim_h", [128, 256, 512]),
-            "latent_dim": trial.suggest_categorical("dim_z", [32, 64, 128]),
-            "decoder_layers": trial.suggest_categorical("decoder_layers", [2, 3, 4]),
+        cfg = dict(base_model_cfg or {})
+        latent_distribution = str(cfg.get("latent_distribution", "gaussian")).lower().strip()
+        out: Dict[str, Any] = {
+            "hidden_dim": trial.suggest_categorical("hidden_dim", [128, 256]),
+            "decoder_layers": trial.suggest_categorical("decoder_layers", [2, 3]),
         }
+        if latent_distribution == "categorical":
+            out["stochastic_groups"] = trial.suggest_categorical("stochastic_groups", [16, 32])
+            out["stochastic_classes"] = trial.suggest_categorical("stochastic_classes", [16, 32])
+        else:
+            out["latent_dim"] = trial.suggest_categorical("latent_dim", [32, 64])
+        return out
     if model_type == "xgboost":
         if profile == "fast_gpu":
             n_estimators_low, n_estimators_high = 50, 300
@@ -308,11 +319,6 @@ def _save_optuna_importance_artifacts(study: "optuna.study.Study", out_dir: Path
 def _normalize_best_params(best_params: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize best params for downstream config compatibility."""
     normalized = dict(best_params)
-    # Normalize Phase-7 search aliases to train-time keys.
-    if "dim_h" in normalized and "hidden_dim" not in normalized:
-        normalized["hidden_dim"] = normalized["dim_h"]
-    if "dim_z" in normalized and "latent_dim" not in normalized:
-        normalized["latent_dim"] = normalized["dim_z"]
     if "lr" in normalized and "learning_rate" not in normalized:
         normalized["learning_rate"] = normalized["lr"]
     if "w_rollout" in normalized and "rollout_weight" not in normalized:
@@ -320,8 +326,6 @@ def _normalize_best_params(best_params: Dict[str, Any]) -> Dict[str, Any]:
     if "max_horizon" in normalized and "rollout_max_horizon" not in normalized:
         normalized["rollout_max_horizon"] = normalized["max_horizon"]
 
-    normalized.pop("dim_h", None)
-    normalized.pop("dim_z", None)
     normalized.pop("lr", None)
     normalized.pop("w_rollout", None)
     normalized.pop("max_horizon", None)
@@ -369,8 +373,9 @@ def _maybe_compile_model(model, config: Dict[str, Any]):
 
 
 def main():
-    args = parse_args()
-    config = load_config(args.config)
+    parser = _build_cli_parser()
+    args, hydra_overrides = parser.parse_known_args()
+    config = compose_config(args.config, overrides=hydra_overrides)
 
     if args.device:
         config["misc"]["device"] = args.device
@@ -455,7 +460,7 @@ def main():
             else ocfg.get("fast_steps_per_epoch", ocfg.get("steps_per_epoch", 40))
         )
         sampling_horizon_override = int(ocfg.get("fast_sampling_horizon", 24))
-        training_mode = str(ocfg.get("fast_training_mode", "one_step"))
+        training_mode = str(ocfg.get("fast_training_mode", "multi_step"))
     else:
         trial_epochs = int(args.epochs if args.epochs is not None else ocfg.get("epochs", 5))
         trial_steps = (
@@ -501,7 +506,8 @@ def main():
 
     # Build data once and reuse across all trials/models.
     index_col = dataset_cfg.get("index_col", config.get("data", {}).get("index_col", "date"))
-    train_split = dataset_cfg.get("train_split", config.get("data", {}).get("train_split", 0.7))
+    split_cfg = config.get("data", {}).get("splits", None)
+    train_split = float((split_cfg or {}).get("train", 0.7))
     df = load_csv_dataset(
         dataset_cfg["csv"],
         index_col=index_col,
@@ -519,7 +525,7 @@ def main():
         pred_len=pred_len,
         batch_size=batch_size,
         train_split=train_split,
-        split_cfg=config.get("data", {}).get("splits", None),
+        split_cfg=split_cfg,
         seed=seed,
         shuffle_train=bool(config.get("data", {}).get("shuffle_train", True)),
         drop_last=bool(config.get("data", {}).get("drop_last", True)),
@@ -535,41 +541,110 @@ def main():
 
     def make_objective(model_type: str):
         per_model_cfg = models_cfg_map.get(model_type, {"type": model_type})
+        effective_model_cfg: Dict[str, Any] = dict(model_defaults_cfg.get(model_type, {}) or {})
+        effective_model_cfg.update({k: v for k, v in per_model_cfg.items() if k != "type"})
 
         if model_type in NEURAL_MODELS:
             def objective(trial: "optuna.trial.Trial") -> float:
-                model_overrides = _suggest_overrides(trial, model_type, profile=search_space_profile)
+                model_overrides = _suggest_overrides(
+                    trial,
+                    model_type,
+                    profile=search_space_profile,
+                    base_model_cfg=effective_model_cfg,
+                )
                 lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
                 prob_cfg_default = tcfg.get("probabilistic", {}) or {}
                 if model_type == "latent_ssm":
                     recon_weight = float(prob_cfg_default.get("recon_weight", 1.0))
-                    kl_weight = trial.suggest_float("kl_weight", 0.1, 5.0)
-                    aux_weight = float(prob_cfg_default.get("aux_weight", 1.0))
-                    kl_free_bits = trial.suggest_float("kl_free_bits", 0.5, 3.0)
+                    kl_weight = float(prob_cfg_default.get("kl_weight", 0.5))
+                    aux_weight_default = float(
+                        prob_cfg_default.get(
+                            "aux_weight",
+                            prob_cfg_default.get("rollout_mse_weight", 1.0),
+                        )
+                    )
+                    optimize_aux_cfg = ocfg.get("optimize_aux_weight", None)
+                    optimize_aux_weight = (
+                        bool(aux_weight_default > 0.0)
+                        if optimize_aux_cfg is None
+                        else bool(optimize_aux_cfg)
+                    )
+                    if optimize_aux_weight:
+                        aux_weight = trial.suggest_float("aux_weight", 0.5, 3.0)
+                    else:
+                        aux_weight = float(aux_weight_default)
+                    kl_free_bits = 0.0
                     kl_balance = float(prob_cfg_default.get("kl_balance", 0.8))
-                    use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", True))
-                    use_free_bits = bool(prob_cfg_default.get("use_free_bits", True))
-                    rollout_weight = trial.suggest_float("w_rollout", 0.1, 2.0)
-                    rollout_max_horizon = trial.suggest_categorical("max_horizon", [8, 16, 32])
+                    use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", False))
+                    use_free_bits = bool(prob_cfg_default.get("use_free_bits", False))
+                    rollout_weight_default = float(prob_cfg_default.get("rollout_weight", 1.0))
+                    rollout_max_horizon_default = int(
+                        prob_cfg_default.get("rollout_max_horizon", max(1, pred_len))
+                    )
+                    optimize_rollout_w_cfg = ocfg.get("optimize_rollout_weight", None)
+                    optimize_rollout_weight = (
+                        bool(rollout_weight_default > 0.0)
+                        if optimize_rollout_w_cfg is None
+                        else bool(optimize_rollout_w_cfg)
+                    )
+                    optimize_rollout_h_cfg = ocfg.get("optimize_rollout_horizon", None)
+                    optimize_rollout_horizon = (
+                        bool(rollout_max_horizon_default > 0)
+                        if optimize_rollout_h_cfg is None
+                        else bool(optimize_rollout_h_cfg)
+                    )
+                    if optimize_rollout_weight:
+                        rollout_weight = trial.suggest_float("w_rollout", 0.5, 2.0)
+                    else:
+                        rollout_weight = float(rollout_weight_default)
+                    # If rollout loss is disabled, force horizon to 0 regardless of config.
+                    if rollout_weight <= 0.0:
+                        rollout_max_horizon = 0
+                    elif optimize_rollout_horizon:
+                        rollout_max_horizon = int(
+                            trial.suggest_categorical("max_horizon", [16, 24, 32])
+                        )
+                    else:
+                        rollout_max_horizon = int(rollout_max_horizon_default)
+                    rollout_start_epoch = int(prob_cfg_default.get("rollout_start_epoch", 4))
+                    rollout_full_epoch = int(prob_cfg_default.get("rollout_full_epoch", 20))
                     # Keep KL warmup schedule fixed from training config.
-                    kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
+                    kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 0.0))
                     kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
-                    kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
+                    kl_warmup_epochs = int(
+                        prob_cfg_default.get(
+                            "kl_anneal_epochs",
+                            prob_cfg_default.get("kl_warmup_epochs", 15),
+                        )
+                    )
+                    trial.set_user_attr("optimize_aux_weight", optimize_aux_weight)
+                    trial.set_user_attr("optimize_rollout_weight", optimize_rollout_weight)
+                    trial.set_user_attr("optimize_rollout_horizon", optimize_rollout_horizon)
+                    trial.set_user_attr("resolved_aux_weight", float(aux_weight))
+                    trial.set_user_attr("resolved_rollout_weight", float(rollout_weight))
+                    trial.set_user_attr("resolved_rollout_max_horizon", int(rollout_max_horizon))
                 else:
                     recon_weight = float(prob_cfg_default.get("recon_weight", prob_cfg_default.get("elbo_weight", 1.0)))
-                    kl_weight = float(prob_cfg_default.get("kl_weight", 1.0))
+                    kl_weight = float(prob_cfg_default.get("kl_weight", 0.5))
                     aux_weight = float(prob_cfg_default.get("aux_weight", prob_cfg_default.get("rollout_mse_weight", 1.0)))
-                    kl_free_bits = float(prob_cfg_default.get("kl_free_bits", 1.0))
+                    kl_free_bits = float(prob_cfg_default.get("kl_free_bits", 0.0))
                     kl_balance = float(prob_cfg_default.get("kl_balance", 0.8))
-                    use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", True))
-                    use_free_bits = bool(prob_cfg_default.get("use_free_bits", True))
-                    rollout_weight = float(prob_cfg_default.get("rollout_weight", 0.0))
+                    use_kl_balancing = bool(prob_cfg_default.get("use_kl_balancing", False))
+                    use_free_bits = bool(prob_cfg_default.get("use_free_bits", False))
+                    rollout_weight = float(prob_cfg_default.get("rollout_weight", 1.0))
                     rollout_max_horizon = int(
                         prob_cfg_default.get("rollout_max_horizon", max(1, pred_len))
                     )
-                    kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 1.0))
+                    rollout_start_epoch = int(prob_cfg_default.get("rollout_start_epoch", 4))
+                    rollout_full_epoch = int(prob_cfg_default.get("rollout_full_epoch", 20))
+                    kl_beta_start = float(prob_cfg_default.get("kl_beta_start", 0.0))
                     kl_beta_end = float(prob_cfg_default.get("kl_beta_end", 1.0))
-                    kl_warmup_epochs = int(prob_cfg_default.get("kl_warmup_epochs", 1))
+                    kl_warmup_epochs = int(
+                        prob_cfg_default.get(
+                            "kl_anneal_epochs",
+                            prob_cfg_default.get("kl_warmup_epochs", 15),
+                        )
+                    )
 
                 one_step_weight = tcfg.get("one_step_weight", 0.5)
                 if tcfg.get("mode", "multi_step") == "combined":
@@ -629,6 +704,10 @@ def main():
                     device=device,
                     use_amp=bool(tcfg.get("use_amp", False)),
                     early_stopping=tcfg.get("early_stopping", False),
+                    early_stopping_min_epoch=tcfg.get(
+                        "early_stopping_min_epoch",
+                        tcfg.get("early_stopping_start_epoch", 1),
+                    ),
                     patience=tcfg.get("patience", 5),
                     min_delta=tcfg.get("min_delta", 0.0),
                     run_dir=None,  # avoid trial artifact overhead
@@ -639,6 +718,8 @@ def main():
                         "aux_weight": aux_weight,
                         "rollout_weight": rollout_weight,
                         "rollout_max_horizon": int(rollout_max_horizon),
+                        "rollout_start_epoch": int(rollout_start_epoch),
+                        "rollout_full_epoch": int(rollout_full_epoch),
                         "kl_free_bits": kl_free_bits,
                         "kl_balance": kl_balance,
                         "use_kl_balancing": use_kl_balancing,
@@ -718,7 +799,12 @@ def main():
         def objective_xgb(trial: "optuna.trial.Trial") -> float:
             if not HAS_XGBOOST:
                 raise RuntimeError("xgboost is not installed")
-            model_overrides = _suggest_overrides(trial, model_type, profile=search_space_profile)
+            model_overrides = _suggest_overrides(
+                trial,
+                model_type,
+                profile=search_space_profile,
+                base_model_cfg=effective_model_cfg,
+            )
             model = build_model(
                 model_type,
                 input_dim,
@@ -825,4 +911,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

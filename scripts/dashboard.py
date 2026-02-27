@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 import yaml
 
 from timesim.data.loader import build_grouped_dataloaders

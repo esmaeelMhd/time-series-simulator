@@ -7,7 +7,7 @@ from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.sampling import RandomStartFixedHorizon
 from timesim.evaluation import open_loop_evaluate
 from timesim.models.factory import build_model
-from timesim.serving.simulator import RSSMSimulator
+from timesim.simulator import RSSMSimulator
 from timesim.training import WorldModelTrainer
 
 

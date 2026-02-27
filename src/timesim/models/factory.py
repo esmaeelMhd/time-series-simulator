@@ -12,6 +12,7 @@ The factory merges three sources of parameters (highest priority last):
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, Optional
 import warnings
 
@@ -36,64 +37,63 @@ PRIMARY_MODEL_TYPES = {"latent_ssm"}
 LEGACY_MODEL_TYPES = {"lstm", "dlinear", "nlinear", "tft", "transformer", "xgboost"}
 _WARNED_LEGACY_TYPES: set[str] = set()
 
-# Hard-coded fallbacks used when *neither* config nor caller supplies a value.
-# These mirror the constructor defaults of each model class.
-_BUILTIN_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "lstm": {
-        "hidden_dim": 64,
-        "num_layers": 2,
-        "dropout": 0.0,
-    },
-    "dlinear": {
-        "kernel_size": 25,
-        "individual": False,
-    },
-    "nlinear": {
-        "individual": False,
-    },
-    "tft": {
-        "hidden_dim": 64,
-        "n_heads": 4,
-        "num_lstm_layers": 2,
-        "dropout": 0.1,
-    },
-    "transformer": {
-        "d_model": 64,
-        "nhead": 4,
-        "num_layers": 2,
-        "dim_feedforward": 128,
-        "dropout": 0.1,
-    },
-    "latent_ssm": {
-        "hidden_dim": 64,
-        "latent_dim": 16,
-        "num_layers": 1,
-        "dropout": 0.1,
-        "min_scale": 1e-4,
-        "min_df": 2.1,
-        "encoder_dim": 64,
-        "decoder_layers": 2,
-        "use_symlog": False,
-        "use_aux_decoder": True,
-        "use_dual_path": True,
-        "use_stochastic_path": True,
-        "share_encoder_weights": False,
-        "leak_objective_to_transition": False,
-        "allow_objective_leak_for_ablation": False,
-        "allow_disable_aux_decoder_for_ablation": False,
-        "allow_shared_encoder_for_ablation": False,
-        "allow_disable_stochastic_for_ablation": False,
-    },
-    "xgboost": {
-        "n_estimators": 100,
-        "max_depth": 6,
-        "learning_rate": 0.1,
-        "n_jobs": -1,
-        "early_stopping_rounds": 10,
-        "objective": "reg:squarederror",
-    },
+# Single source of truth for model type classification
+# Use these constants in configuration files to ensure consistency
+MODEL_TYPE_CONSTANTS = {
+    "neural_models": sorted(NEURAL_MODELS),
+    "primary_model_types": sorted(PRIMARY_MODEL_TYPES),
+    "legacy_model_types": sorted(LEGACY_MODEL_TYPES),
 }
 
+
+def get_model_param_names(model_type: str) -> set[str]:
+    """Return constructor parameter names for a model type.
+
+    This is used by CLI scripts to split model params from training params
+    (e.g. when applying Optuna best params).
+    """
+    mt = str(model_type).lower().strip()
+    cls = None
+    if mt == "lstm":
+        from .lstm import LSTMWorldModel
+
+        cls = LSTMWorldModel
+    elif mt == "dlinear":
+        from .dlinear import DLinearWorldModel
+
+        cls = DLinearWorldModel
+    elif mt == "nlinear":
+        from .nlinear import NLinearWorldModel
+
+        cls = NLinearWorldModel
+    elif mt == "tft":
+        from .tft import TFTWorldModel
+
+        cls = TFTWorldModel
+    elif mt == "transformer":
+        from .transformer import TransformerWorldModel
+
+        cls = TransformerWorldModel
+    elif mt == "latent_ssm":
+        from .latent_ssm import LatentSSMWorldModel
+
+        cls = LatentSSMWorldModel
+    elif mt == "xgboost":
+        if not _check_xgboost():
+            return set()
+        from .xgboost_model import XGBoostForecaster
+
+        cls = XGBoostForecaster
+    else:
+        return set()
+
+    sig = inspect.signature(cls.__init__)
+    names = {
+        str(name)
+        for name, param in sig.parameters.items()
+        if name != "self" and param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    return names
 
 def _merge_params(
     model_type: str,
@@ -101,9 +101,11 @@ def _merge_params(
     per_model_cfg: Dict[str, Any],
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Merge parameter sources: builtin < config model_defaults < per-model < overrides."""
+    """Merge parameter sources: config model_defaults < per-model < overrides.
+
+    Constructor defaults remain the final fallback source.
+    """
     merged: Dict[str, Any] = {}
-    merged.update(_BUILTIN_DEFAULTS.get(model_type, {}))
     merged.update(model_defaults_cfg.get(model_type, {}))
     # per_model_cfg may contain "type" key -- skip it
     merged.update({k: v for k, v in per_model_cfg.items() if k != "type"})
@@ -226,7 +228,17 @@ def build_model(
             num_layers=p.get("num_layers", 1),
             dropout=p.get("dropout", 0.1),
             pred_len=pred_len,
-            min_scale=p.get("min_scale", 1e-4),
+            min_scale=p.get("min_scale", 0.5),
+            min_std=p.get("min_std", p.get("min_scale", 0.5)),
+            max_std=p.get("max_std", p.get("decoder_max_std", 2.0)),
+            decoder_min_std=p.get("decoder_min_std", p.get("min_std", p.get("min_scale", 0.5))),
+            decoder_max_std=p.get("decoder_max_std", p.get("max_std", 2.0)),
+            prior_min_std=p.get("prior_min_std", 0.1),
+            prior_max_std=p.get("prior_max_std", 1.5),
+            posterior_min_std=p.get("posterior_min_std", 0.1),
+            posterior_max_std=p.get("posterior_max_std", 1.5),
+            prior_constant_std=p.get("prior_constant_std"),
+            posterior_constant_std=p.get("posterior_constant_std"),
             min_df=p.get("min_df", 2.1),
             control_dim=p.get("control_dim", control_dim),
             exogenous_dim=p.get("exogenous_dim", exogenous_dim),
@@ -234,14 +246,20 @@ def build_model(
             decoder_layers=p.get("decoder_layers", 2),
             use_symlog=p.get("use_symlog", False),
             use_aux_decoder=p.get("use_aux_decoder", True),
+            predict_exogenous=p.get("predict_exogenous", True),
             use_dual_path=p.get("use_dual_path", True),
             use_stochastic_path=p.get("use_stochastic_path", True),
             share_encoder_weights=p.get("share_encoder_weights", False),
             leak_objective_to_transition=p.get("leak_objective_to_transition", False),
+            h_dropout=p.get("h_dropout", 0.0),
+            decoder_hidden=p.get("decoder_hidden"),
             allow_objective_leak_for_ablation=p.get("allow_objective_leak_for_ablation", False),
             allow_disable_aux_decoder_for_ablation=p.get("allow_disable_aux_decoder_for_ablation", False),
             allow_shared_encoder_for_ablation=p.get("allow_shared_encoder_for_ablation", False),
             allow_disable_stochastic_for_ablation=p.get("allow_disable_stochastic_for_ablation", False),
+            latent_distribution=p.get("latent_distribution", "gaussian"),
+            stochastic_groups=p.get("stochastic_groups", 32),
+            stochastic_classes=p.get("stochastic_classes", 32),
         )
 
     elif model_type == "xgboost":

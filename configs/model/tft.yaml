@@ -1,0 +1,6 @@
+name: tft
+type: tft
+hidden_dim: 64
+n_heads: 4
+num_lstm_layers: 2
+dropout: 0.1

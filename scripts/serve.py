@@ -9,12 +9,14 @@ import time
 import logging
 
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 from joblib import load
 import numpy as np
 import pandas as pd
 
-from timesim.utils.config import load_config
-from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
+from timesim.utils.config import compose_config
+from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.schema import VariableSchema
 from timesim.utils.misc import resolve_device
 from timesim.models.factory import build_model
@@ -41,37 +43,41 @@ def _load_model_state(model: torch.nn.Module, checkpoint: str | Path, device: st
             )
 
 
-def parse_args():
+def _build_cli_parser():
     p = argparse.ArgumentParser(description="Serve RSSM simulator API")
-    p.add_argument("--config", type=str, required=True)
+    p.add_argument("--config", "--config-name", type=str, required=True,
+                   help="Hydra config name or path to YAML config")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--session-ttl", type=int, default=3600)
     p.add_argument("--sigma-scale", type=float, default=None)
-    return p.parse_args()
+    return p
 
 
 def main():
-    args = parse_args()
-    config = load_config(args.config)
+    parser = _build_cli_parser()
+    args, hydra_overrides = parser.parse_known_args()
+    config = compose_config(args.config, overrides=hydra_overrides)
     device = resolve_device(args.device if args.device is not None else config.get("misc", {}).get("device", "auto"))
     seed = int(config.get("misc", {}).get("seed", 42))
 
     dcfg = config["dataset"]
     data_cfg = config.get("data", {})
-    add_time = bool(data_cfg.get("add_time_features", False))
-    tf_cfg = data_cfg.get("time_features", {}) or {}
-    if isinstance(tf_cfg, dict) and "enabled" in tf_cfg:
-        add_time = bool(tf_cfg.get("enabled")) or add_time
     groups = dcfg["variables"]
     schema = VariableSchema.from_groups(groups)
     input_groups = config["model_io"]["input_groups"]
     output_groups = config["model_io"]["output_groups"]
 
-    seq_len = int(dcfg["seq_len"])
+    dataset_seq_len = int(dcfg["seq_len"])
     pred_len = int(dcfg["pred_len"])
+    seq_len = int(
+        config.get("training", {}).get(
+            "window_len",
+            config.get("training", {}).get("warmup_len", dataset_seq_len),
+        )
+    )
     batch_size = int(dcfg["batch_size"])
 
     input_cols = schema.columns_for_group_names(input_groups)
@@ -93,28 +99,11 @@ def main():
         raise FileNotFoundError(f"Scaler not found: {scaler_path}")
     scaler = load(scaler_path)
 
-    _, val_loader, _ = build_grouped_dataloaders(
-        df,
-        groups,
-        input_groups,
-        output_groups,
-        seq_len=seq_len,
-        pred_len=pred_len,
-        batch_size=batch_size,
-        train_split=dcfg.get("train_split", data_cfg.get("train_split", 0.7)),
-        split_cfg=data_cfg.get("splits", None),
+    _, val_loader, _ = build_dataloaders_from_config(
+        config=config,
+        df=df,
         seed=seed,
-        shuffle_train=False,
-        drop_last=bool(data_cfg.get("drop_last", True)),
-        num_workers=int(data_cfg.get("num_workers", 0)),
-        pin_memory=bool(data_cfg.get("pin_memory", False)),
-        stride=int(data_cfg.get("window_stride", 1)),
-        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
-        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
-        add_time=add_time,
-        time_features_cfg=tf_cfg,
-        existing_scaler=scaler,
-        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
+        scaler=scaler,
     )
     dataset = val_loader.dataset
 

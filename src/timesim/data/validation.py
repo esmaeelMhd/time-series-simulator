@@ -54,11 +54,14 @@ def validate_time_series_dataframe(
         raise ValueError(f"NaNs detected in dataframe columns: {nan_cols}.")
 
     try:
-        import pandera as pa  # type: ignore
+        import pandera.pandas as pa  # type: ignore
     except Exception:
-        if strict:
-            raise ImportError("Pandera strict validation requested but pandera is not installed.")
-        return df
+        try:
+            import pandera as pa  # type: ignore
+        except Exception:
+            if strict:
+                raise ImportError("Pandera strict validation requested but pandera is not installed.")
+            return df
 
     schema_cols = {c: pa.Column(float, nullable=allow_nan, coerce=True) for c in df.columns}
     schema = pa.DataFrameSchema(

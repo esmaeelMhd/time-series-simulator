@@ -26,6 +26,57 @@ _DEFAULT_SHAPE_LOSS_CFG: Dict[str, float] = {
 }
 
 
+def fast_kl_balancing_loss(
+    post_logits: torch.Tensor,
+    prior_logits: torch.Tensor,
+    *,
+    alpha: float = 0.8,
+    free_nats: float = 0.0,
+    use_kl_balancing: bool = False,
+    use_free_bits: bool = False,
+) -> torch.Tensor:
+    """Dreamer-style categorical KL balancing on raw logits.
+
+    Inputs are flattened logits of shape (B, T, G*C). Internally reshaped to
+    (B, T, G, C), and returns per-group KL terms with shape (B, T, G).
+    """
+    if post_logits.shape != prior_logits.shape:
+        raise ValueError(
+            f"post_logits and prior_logits must match shape, got "
+            f"{tuple(post_logits.shape)} vs {tuple(prior_logits.shape)}"
+        )
+    if post_logits.dim() != 4:
+        raise ValueError(
+            f"Categorical logits must be rank-4 (B,T,G,C), got rank={post_logits.dim()}"
+        )
+    post_log_probs = F.log_softmax(post_logits, dim=-1)
+    prior_log_probs = F.log_softmax(prior_logits, dim=-1)
+    post_probs = torch.exp(post_log_probs)
+
+    if use_kl_balancing:
+        sg_prior_log_probs = prior_log_probs.detach()
+        sg_post_probs = post_probs.detach()
+        sg_post_log_probs = post_log_probs.detach()
+        kl_prior = torch.sum(
+            sg_post_probs * (sg_post_log_probs - prior_log_probs),
+            dim=-1,
+        )  # (B,T,G)
+        kl_post = torch.sum(
+            post_probs * (post_log_probs - sg_prior_log_probs),
+            dim=-1,
+        )  # (B,T,G)
+        kl_groups = float(alpha) * kl_prior + (1.0 - float(alpha)) * kl_post
+    else:
+        kl_groups = torch.sum(post_probs * (post_log_probs - prior_log_probs), dim=-1)
+
+    if use_free_bits and float(free_nats) > 0.0:
+        kl_steps = kl_groups.sum(dim=-1)  # (B,T)
+        kl_steps = torch.clamp(kl_steps, min=float(free_nats))
+        scale = kl_steps / kl_groups.sum(dim=-1).clamp_min(1e-6)
+        kl_groups = kl_groups * scale.unsqueeze(-1)
+    return kl_groups
+
+
 def _merged_shape_cfg(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
     out = dict(_DEFAULT_SHAPE_LOSS_CFG)
     if cfg:
@@ -381,10 +432,10 @@ class ProbabilisticRolloutLoss(nn.Module):
         recon_weight: float = 1.0,
         kl_weight: float = 1.0,
         aux_weight: float = 1.0,
-        kl_free_bits: float = 1.0,
+        kl_free_bits: float = 0.0,
         kl_balance: float = 0.8,
-        use_kl_balancing: bool = True,
-        use_free_bits: bool = True,
+        use_kl_balancing: bool = False,
+        use_free_bits: bool = False,
         use_symlog: bool = False,
         # Backward-compat aliases:
         elbo_weight: Optional[float] = None,
@@ -453,7 +504,32 @@ class ProbabilisticRolloutLoss(nn.Module):
         posterior_logvar: torch.Tensor,
         prior_mu: torch.Tensor,
         prior_logvar: torch.Tensor,
+        posterior_logits: Optional[torch.Tensor] = None,
+        prior_logits: Optional[torch.Tensor] = None,
+        stochastic_groups: Optional[int] = None,
+        stochastic_classes: Optional[int] = None,
     ) -> torch.Tensor:
+        if posterior_logits is not None and prior_logits is not None:
+            if stochastic_groups is None or stochastic_classes is None:
+                raise ValueError("stochastic_groups/classes are required for categorical KL.")
+            post_l = posterior_logits.view(
+                *posterior_logits.shape[:-1],
+                int(stochastic_groups),
+                int(stochastic_classes),
+            )
+            prior_l = prior_logits.view(
+                *prior_logits.shape[:-1],
+                int(stochastic_groups),
+                int(stochastic_classes),
+            )
+            return fast_kl_balancing_loss(
+                post_l,
+                prior_l,
+                alpha=self.kl_balance,
+                free_nats=self.kl_free_bits,
+                use_kl_balancing=self.use_kl_balancing,
+                use_free_bits=self.use_free_bits,
+            )
         post = self._normal_from_mu_logvar(posterior_mu, posterior_logvar)
         prior = self._normal_from_mu_logvar(prior_mu, prior_logvar)
         raw_kl = torch.distributions.kl_divergence(post, prior)
@@ -471,6 +547,38 @@ class ProbabilisticRolloutLoss(nn.Module):
         kl_post_fit = torch.distributions.kl_divergence(post, prior_sg)
         return self.kl_balance * kl_prior_fit + (1.0 - self.kl_balance) * kl_post_fit
 
+    def _raw_kl(
+        self,
+        posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+        posterior_logits: Optional[torch.Tensor] = None,
+        prior_logits: Optional[torch.Tensor] = None,
+        stochastic_groups: Optional[int] = None,
+        stochastic_classes: Optional[int] = None,
+    ) -> torch.Tensor:
+        if posterior_logits is not None and prior_logits is not None:
+            if stochastic_groups is None or stochastic_classes is None:
+                raise ValueError("stochastic_groups/classes are required for categorical KL.")
+            post_l = posterior_logits.view(
+                *posterior_logits.shape[:-1],
+                int(stochastic_groups),
+                int(stochastic_classes),
+            )
+            prior_l = prior_logits.view(
+                *prior_logits.shape[:-1],
+                int(stochastic_groups),
+                int(stochastic_classes),
+            )
+            post_log_probs = F.log_softmax(post_l, dim=-1)
+            prior_log_probs = F.log_softmax(prior_l, dim=-1)
+            post_probs = torch.exp(post_log_probs)
+            return torch.sum(post_probs * (post_log_probs - prior_log_probs), dim=-1)
+        post = self._normal_from_mu_logvar(posterior_mu, posterior_logvar)
+        prior = self._normal_from_mu_logvar(prior_mu, prior_logvar)
+        return torch.distributions.kl_divergence(post, prior)
+
     def forward(
         self,
         targets: torch.Tensor,
@@ -480,6 +588,10 @@ class ProbabilisticRolloutLoss(nn.Module):
         prior_logvar: torch.Tensor,
         posterior_mu: torch.Tensor,
         posterior_logvar: torch.Tensor,
+        prior_logits: Optional[torch.Tensor] = None,
+        posterior_logits: Optional[torch.Tensor] = None,
+        stochastic_groups: Optional[int] = None,
+        stochastic_classes: Optional[int] = None,
         recon_dist: Optional[torch.distributions.Distribution] = None,
         exogenous_targets: Optional[torch.Tensor] = None,
         aux_loc: Optional[torch.Tensor] = None,
@@ -496,6 +608,10 @@ class ProbabilisticRolloutLoss(nn.Module):
             prior_logvar=prior_logvar,
             posterior_mu=posterior_mu,
             posterior_logvar=posterior_logvar,
+            prior_logits=prior_logits,
+            posterior_logits=posterior_logits,
+            stochastic_groups=stochastic_groups,
+            stochastic_classes=stochastic_classes,
             recon_dist=recon_dist,
             exogenous_targets=exogenous_targets,
             aux_loc=aux_loc,
@@ -512,6 +628,7 @@ class ProbabilisticRolloutLoss(nn.Module):
             "loss_total": float(total.detach().item()),
             "recon_nll": float(recon_nll.detach().item()),
             "kl": float(kl.detach().item()),
+            "kl_mean": float(kl.detach().item()),
             "aux_nll": float(aux_nll.detach().item()),
             "kl_beta": float(kl_beta),
         }
@@ -526,6 +643,10 @@ class ProbabilisticRolloutLoss(nn.Module):
         prior_logvar: torch.Tensor,
         posterior_mu: torch.Tensor,
         posterior_logvar: torch.Tensor,
+        prior_logits: Optional[torch.Tensor] = None,
+        posterior_logits: Optional[torch.Tensor] = None,
+        stochastic_groups: Optional[int] = None,
+        stochastic_classes: Optional[int] = None,
         recon_dist: Optional[torch.distributions.Distribution] = None,
         exogenous_targets: Optional[torch.Tensor] = None,
         aux_loc: Optional[torch.Tensor] = None,
@@ -546,8 +667,13 @@ class ProbabilisticRolloutLoss(nn.Module):
             posterior_logvar=posterior_logvar,
             prior_mu=prior_mu,
             prior_logvar=prior_logvar,
+            posterior_logits=posterior_logits,
+            prior_logits=prior_logits,
+            stochastic_groups=stochastic_groups,
+            stochastic_classes=stochastic_classes,
         )
-        if self.use_free_bits:
+        is_categorical = posterior_logits is not None and prior_logits is not None
+        if self.use_free_bits and not is_categorical:
             kl_elem = torch.maximum(
                 kl_elem,
                 torch.full_like(kl_elem, fill_value=self.kl_free_bits),
@@ -556,9 +682,14 @@ class ProbabilisticRolloutLoss(nn.Module):
         kl = self._sum_time_mean_batch(kl_steps, mask)
 
         aux_nll = torch.zeros((), dtype=recon_nll.dtype, device=recon_nll.device)
+        has_aux_prediction = bool(
+            (aux_dist is not None)
+            or (aux_loc is not None and aux_scale is not None and aux_loc.shape[-1] > 0 and aux_scale.shape[-1] > 0)
+        )
         if (
             exogenous_targets is not None
             and exogenous_targets.shape[-1] > 0
+            and has_aux_prediction
         ):
             aux_nll = self.compute_aux_nll(
                 targets=exogenous_targets,

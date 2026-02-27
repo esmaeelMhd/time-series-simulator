@@ -26,9 +26,11 @@ import yaml
 import numpy as np
 import pandas as pd
 import torch
+from timesim.utils.misc import configure_torch_defaults
+configure_torch_defaults()
 
-from timesim.utils.config import load_config
-from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+from timesim.utils.config import compose_config
+from timesim.data.loader import load_csv_dataset, build_dataloaders_from_config
 from timesim.data.schema import VariableSchema
 from timesim.utils.plotting import save_loss_plot, save_forecast_plot
 from timesim.utils.misc import seed_everything, resolve_device
@@ -100,18 +102,18 @@ def load_loss_history(model_dir: Path):
 # CLI
 # ─────────────────────────────────────────────────────────────────────
 
-def parse_args():
+def _build_cli_parser():
     parser = argparse.ArgumentParser(
         description="Compare trained models (evaluation only -- no training)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to YAML/Hydra config")
+    parser.add_argument("--config", "--config-name", type=str, required=True,
+                        help="Hydra config name or path to YAML config")
     parser.add_argument("--models", nargs="*",
                         help="Override: compare only these model types")
     parser.add_argument("--device", type=str,
                         help="Override device (auto / cpu / cuda)")
-    return parser.parse_args()
+    return parser
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -119,10 +121,10 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
+    parser = _build_cli_parser()
+    args, hydra_overrides = parser.parse_known_args()
 
-    # ── Load config ───────────────────────────────────────────────────
-    config = load_config(args.config)
+    config = compose_config(args.config, overrides=hydra_overrides)
     if args.device:
         config["misc"]["device"] = args.device
 
@@ -163,8 +165,15 @@ def main():
     input_cols = schema.columns_for_group_names(input_groups)
     output_cols = schema.columns_for_group_names(output_groups)
 
-    seq_len = config["dataset"]["seq_len"]
+    dataset_seq_len = int(config["dataset"]["seq_len"])
     pred_len = config["dataset"]["pred_len"]
+    all_latent = bool(model_names) and all(str(m).lower() == "latent_ssm" for m in model_names)
+    seq_len = int(
+        config.get("training", {}).get(
+            "window_len",
+            config.get("training", {}).get("warmup_len", dataset_seq_len),
+        )
+    ) if all_latent else dataset_seq_len
     # Use union to avoid double-counting when output_cols are in input_groups
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
@@ -175,7 +184,10 @@ def main():
     control_dim = len([c for c in input_cols if c in control_cols])
     exo_dim = len([c for c in input_cols if c in exo_cols_list])
 
-    warmup_len = config["training"].get("warmup_len", seq_len)
+    warmup_len = config["training"].get(
+        "window_len",
+        config["training"].get("warmup_len", seq_len),
+    )
     eval_cfg = config.get("evaluation", {}) or {}
     eval_horizon = eval_cfg.get("horizon", max(pred_len, 12))
     n_windows = eval_cfg.get("n_windows", 4)
@@ -200,8 +212,6 @@ def main():
     # ── Load scaler & dataset ─────────────────────────────────────────
     index_col = config["dataset"].get("index_col",
                                        data_cfg.get("index_col", "date"))
-    train_split = config["dataset"].get("train_split",
-                                         data_cfg.get("train_split", 0.7))
 
     scaler_path = run_dir / "scaler.pkl"
     if not scaler_path.exists():
@@ -224,22 +234,11 @@ def main():
     )
     print(f"  Rows: {len(df)}, Columns: {list(df.columns)}")
 
-    train_loader, val_loader, _ = build_grouped_dataloaders(
-        df, groups, input_groups, output_groups,
-        seq_len=seq_len, pred_len=pred_len,
-        batch_size=config["dataset"]["batch_size"],
-        train_split=train_split,
-        split_cfg=data_cfg.get("splits", None),
+    train_loader, val_loader, _ = build_dataloaders_from_config(
+        config=config,
+        df=df,
         seed=seed,
-        shuffle_train=bool(data_cfg.get("shuffle_train", True)),
-        drop_last=bool(data_cfg.get("drop_last", True)),
-        num_workers=int(data_cfg.get("num_workers", 0)),
-        pin_memory=bool(data_cfg.get("pin_memory", False)),
-        stride=int(data_cfg.get("window_stride", 1)),
-        use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
-        symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),
-        existing_scaler=scaler,
-        require_full_role_mapping=bool(data_cfg.get("require_full_role_mapping", True)),
+        scaler=scaler,
     )
 
     val_dataset = val_loader.dataset
@@ -507,4 +506,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

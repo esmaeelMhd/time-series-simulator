@@ -56,12 +56,8 @@ class TimeSeriesDataModule((pl.LightningDataModule if pl is not None else object
         split_cfg = data_cfg.get("splits", None)
         ratios = resolve_split_ratios(
             split_cfg=split_cfg,
-            train_split=dcfg.get("train_split", data_cfg.get("train_split", None)),
-            default=(
-                float(data_cfg.get("default_train_ratio", 0.70)),
-                float(data_cfg.get("default_val_ratio", 0.15)),
-                float(data_cfg.get("default_test_ratio", 0.15)),
-            ),
+            train_split=None,
+            default=(0.70, 0.15, 0.15),
         )
         train_df, val_df, test_df = chronological_split_dataframe(df, split_ratios=ratios)
 

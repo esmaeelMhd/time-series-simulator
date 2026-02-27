@@ -16,6 +16,7 @@ from .trainer import (
     WorldModelTrainer,
     Trainer,
 )
+from .retrainer import Retrainer, EpisodeSampler
 try:
     from .lightning_module import WorldModelLightningModule
 except ImportError:  # optional dependency: pytorch-lightning
@@ -38,6 +39,8 @@ __all__ = [
     "rollout_autoregressive",
     "WorldModelTrainer",
     "Trainer",
+    "Retrainer",
+    "EpisodeSampler",
     "get_git_metadata",
     "merged_latent_ssm_params",
     "merged_probabilistic_cfg",

@@ -4,34 +4,30 @@ dataset:
   name: wastewater
   csv: datasets/wastewater.csv
   index_col: date
-  seq_len: 24
+  # seq_len/pred_len define windowing for grouped datasets and are also used by
+  # evaluation/simulation utilities. RSSM training additionally uses
+  # training.warmup_len + training.sampling.horizon for curriculum behavior.
+  seq_len: 128
   pred_len: 1
-  batch_size: 32
+  batch_size: 512
   variables:
-    control: [IN_METAL_Q, T1_O2]
-    exogenous: [METAL_Q, IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]
+    control: [IN_METAL_Q, T1_O2, METAL_Q]
+    exogenous: [IN_Q, MAX_CF, PROCESSPHASE_INLET, PROCESSPHASE_OUTLET]
     objective: [T1_PO4]
 
 data:
   csv_engine: pandas
-  train_split: 0.7
   splits:
     train: 0.70
     val: 0.15
     test: 0.15
-  default_train_ratio: 0.70
-  default_val_ratio: 0.15
-  default_test_ratio: 0.15
   shuffle_train: true
   drop_last: true
-  batch_size: 32
-  num_workers: 0
-  pin_memory: false
+  num_workers: 8
+  pin_memory: true
   window_stride: 1
   shuffle_within_window: false
-  index_col: date
   require_full_role_mapping: true
-  add_time_features: true
   time_features:
     enabled: true
     features: [hour, day_of_week, month]
@@ -51,4 +47,3 @@ data:
 model_io:
   input_groups: ["control", "exogenous", "objective"]
   output_groups: ["objective"]
-
