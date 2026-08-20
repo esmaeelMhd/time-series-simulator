@@ -17,7 +17,7 @@ Model behavior, schema expectations, training recipe, simulator usage, limitatio
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/time-series-simulator.git
+git clone https://github.com/esmaeelMhd/time-series-simulator.git
 cd time-series-simulator
 
 # Default install (CUDA 12.8 PyTorch)
