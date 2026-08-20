@@ -137,6 +137,10 @@ class RSSMCell(nn.Module):
             )
         self.leak_objective_to_transition = False
         self.use_stochastic_path = bool(use_stochastic_path)
+        # min_std is honoured exactly as configured; the only constraint imposed
+        # here is non-negativity, and max_std is raised if it would sit below it.
+        # Deliberately no hidden floor: callers choosing a small std must be able
+        # to get it, and every shipped config uses 0.1 or above anyway.
         self.min_std = float(max(0.0, float(min_std)))
         self.max_std = float(max(self.min_std, float(max_std)))
         self.prior_constant_std = None if prior_constant_std is None else float(max(1e-6, float(prior_constant_std)))

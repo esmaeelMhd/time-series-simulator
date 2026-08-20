@@ -64,22 +64,54 @@ def test_prior_and_posterior_distribution_shapes():
     assert obs.posterior.rsample().shape == (3, 8)
 
 
-def test_min_std_is_enforced_for_prior_and_posterior():
-    cell = _make_cell(min_std=1e-6)
-    # Enforced floor must be >= 0.01
-    assert cell.min_std >= 0.01
-
+def _observe(cell):
     state0 = cell.initial_state(batch_size=2, device=torch.device("cpu"), dtype=torch.float32)
-    obs = cell.observe(
+    return cell.observe(
         prev_state=state0,
         control_embed=torch.randn(2, 6),
         exogenous_embed=torch.randn(2, 5),
         observation_embed=torch.randn(2, 7),
         sample=False,
     )
-    assert torch.all(obs.prior_std >= 0.01)
+
+
+def test_configured_min_std_is_respected_exactly():
+    """min_std is a user parameter, not a suggestion.
+
+    The cell must not silently raise a configured floor to some hidden internal
+    constant; a caller asking for 1e-6 gets 1e-6. Non-negativity is the only
+    constraint the cell imposes.
+    """
+    cell = _make_cell(min_std=1e-6)
+    assert cell.min_std == 1e-6
+
+    obs = _observe(cell)
+    assert torch.all(obs.prior_std >= 1e-6)
     assert obs.posterior_std is not None
-    assert torch.all(obs.posterior_std >= 0.01)
+    assert torch.all(obs.posterior_std >= 1e-6)
+
+
+def test_min_std_and_max_std_bound_prior_and_posterior():
+    cell = _make_cell(min_std=0.05, max_std=0.9)
+    assert cell.min_std == 0.05
+    assert cell.max_std == 0.9
+
+    obs = _observe(cell)
+    assert torch.all(obs.prior_std >= 0.05)
+    assert torch.all(obs.prior_std <= 0.9)
+    assert obs.posterior_std is not None
+    assert torch.all(obs.posterior_std >= 0.05)
+    assert torch.all(obs.posterior_std <= 0.9)
+
+
+def test_negative_min_std_is_floored_to_zero():
+    cell = _make_cell(min_std=-1.0)
+    assert cell.min_std == 0.0
+
+
+def test_max_std_is_never_below_min_std():
+    cell = _make_cell(min_std=0.4, max_std=0.1)
+    assert cell.max_std >= cell.min_std
 
 
 def test_observe_returns_state_sampled_from_posterior():
