@@ -350,7 +350,7 @@ for _ in range(100):
 1. **Domain-agnostic** — no domain-specific assumptions in the core library
 2. **Composable** — mix and match models, sampling strategies, and loss functions
 3. **Extensible** — easy to add new models, strategies, and features
-4. **Production-ready** — proper error handling, logging, and checkpointing
+4. **Operationally careful** — error handling, logging, and checkpointing throughout
 5. **Research-friendly** — clean abstractions for experimentation
 
 ## License
