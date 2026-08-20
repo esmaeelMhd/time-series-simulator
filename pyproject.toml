@@ -51,6 +51,9 @@ dev = [
     "black",
     "flake8",
     "mypy",
+    # starlette.testclient (used by tests/test_api.py) refuses to import
+    # without httpx installed.
+    "httpx>=0.27",
 ]
 tracking = [
     "wandb>=0.17",
