@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+title: "Time-Series World Models for Control"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Mohammadi"
+    given-names: "Esmaeel"
+repository-code: "https://github.com/esmaeelMhd/time-series-simulator"
+abstract: >-
+  A domain-agnostic library for training recurrent world models on
+  time-series data for model-based control, reinforcement learning, and
+  model predictive control, with multi-step rollout training to reduce
+  compounding prediction error.
+keywords:
+  - world models
+  - recurrent state-space model
+  - model-based reinforcement learning
+  - time series
+  - model predictive control
+  - surrogate modelling
+license: MIT
+references:
+  - type: article
+    title: "Multi-Step Simulation Improvement for Time Series Using Exogenous State Variables"
+    authors:
+      - family-names: "Mohammadi"
+        given-names: "Esmaeel"
+    year: 2024
+    doi: "10.5220/0012927300003822"
+  - type: article
+    title: "Deep learning based simulators for the phosphorus removal process control via deep reinforcement learning"
+    authors:
+      - family-names: "Mohammadi"
+        given-names: "Esmaeel"
+    year: 2024
+    doi: "10.1016/j.engappai.2024.107992"
+version: "0.1.0"
+date-released: "2026-08-23"
