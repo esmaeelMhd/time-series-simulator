@@ -139,7 +139,7 @@ python scripts/eval.py \
     --model latent_ssm
 ```
 
-Runs multi-window rollout evaluation and recursive simulation on the validation set. Override horizon and window count:
+Runs multi-window rollout evaluation and recursive simulation on the held-out test split. Override horizon and window count:
 
 ```bash
 python scripts/eval.py \
