@@ -19,6 +19,7 @@ from joblib import load
 
 from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.schema import VariableSchema
+from timesim.data.stamps import get_time_feature_columns
 from timesim.models.factory import build_model
 from timesim.serving import create_app
 from timesim.simulator import RSSMSimulator
@@ -85,6 +86,17 @@ def main():
     input_cols = schema.columns_for_group_names(input_groups)
     output_cols = schema.columns_for_group_names(output_groups)
     input_dim = len(set(input_cols) | set(output_cols))
+    add_time_features = bool(data_cfg.get("add_time_features", False))
+    time_features_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
+    if add_time_features:
+        input_dim += len(
+            get_time_feature_columns(
+                features=time_features_cfg.get("features"),
+                encoding=time_features_cfg.get("encoding", "cyclical"),
+            )
+        )
     output_dim = len(output_cols)
 
     df = load_csv_dataset(

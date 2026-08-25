@@ -31,6 +31,7 @@ from timesim.data.loader import (
     resolve_split_ratios,
 )
 from timesim.data.schema import VariableSchema
+from timesim.data.stamps import get_time_feature_columns
 from timesim.models.factory import NEURAL_MODELS, build_model, count_parameters
 from timesim.utils.config import compose_config
 from timesim.utils.misc import resolve_device, seed_everything
@@ -141,6 +142,17 @@ def main():
     pred_len = config["dataset"]["pred_len"]
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
+    add_time_features = bool(data_cfg.get("add_time_features", False))
+    time_features_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
+    if add_time_features:
+        input_dim += len(
+            get_time_feature_columns(
+                features=time_features_cfg.get("features"),
+                encoding=time_features_cfg.get("encoding", "cyclical"),
+            )
+        )
     output_dim = len(output_cols)
 
     # ── Locate run/model/checkpoint ───────────────────────────────────
@@ -225,6 +237,8 @@ def main():
         seq_len=seq_len,
         pred_len=pred_len,
         scaler=scaler,
+        add_time=add_time_features,
+        time_features_cfg=time_features_cfg if isinstance(time_features_cfg, dict) else None,
         stride=int(data_cfg.get("window_stride", 1)),
         use_symlog=bool((data_cfg.get("symlog", {}) or {}).get("enabled", False)),
         symlog_columns=(data_cfg.get("symlog", {}) or {}).get("columns", None),

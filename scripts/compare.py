@@ -32,6 +32,7 @@ configure_torch_defaults()
 
 from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.schema import VariableSchema
+from timesim.data.stamps import get_time_feature_columns
 from timesim.models.factory import NEURAL_MODELS, build_model, count_parameters
 from timesim.utils.config import compose_config
 from timesim.utils.misc import resolve_device, seed_everything
@@ -178,6 +179,17 @@ def main():
     # Use union to avoid double-counting when output_cols are in input_groups
     all_input_features = set(input_cols) | set(output_cols)
     input_dim = len(all_input_features)
+    add_time_features = bool(data_cfg.get("add_time_features", False))
+    time_features_cfg = data_cfg.get("time_features", {}) or {}
+    if isinstance(time_features_cfg, dict) and "enabled" in time_features_cfg:
+        add_time_features = bool(time_features_cfg.get("enabled")) or add_time_features
+    if add_time_features:
+        input_dim += len(
+            get_time_feature_columns(
+                features=time_features_cfg.get("features"),
+                encoding=time_features_cfg.get("encoding", "cyclical"),
+            )
+        )
     output_dim = len(output_cols)
 
     control_cols = groups.get("control", [])

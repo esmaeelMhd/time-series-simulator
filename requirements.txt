@@ -1,5 +1,5 @@
-# Default dependency set (CUDA-enabled PyTorch 2.13.0 + CUDA 12.8 wheels)
---index-url https://download.pytorch.org/whl/cu128
+# Default dependency set (CUDA-enabled PyTorch 2.13.0 + CUDA 12.9 wheels)
+--index-url https://download.pytorch.org/whl/cu129
 --extra-index-url https://pypi.org/simple
 
 -r requirements.base.txt

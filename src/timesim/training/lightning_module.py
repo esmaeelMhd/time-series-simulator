@@ -209,14 +209,6 @@ class WorldModelLightningModule(pl.LightningModule):  # type: ignore[misc]
                     target_y = target_y[:, :time_n, :feat_n]
                     if pred_scale is not None and pred_scale.ndim == 3:
                         pred_scale = pred_scale[:, :time_n, :feat_n]
-                    if stage == "val" and int(batch_idx or -1) == 0:
-                        scale_shape = tuple(pred_scale.shape) if pred_scale is not None else None
-                        print(
-                            f"[DEBUG VAL] target shape: {tuple(target_y.shape)} | "
-                            f"pred shape: {tuple(pred_mean.shape)} | scale shape: {scale_shape} | "
-                            f"context_len={context_len} horizon={horizon}"
-                        )
-
                     # Prefer Gaussian CRPS when scale is valid; otherwise fallback to MAE proxy.
                     used_gaussian = False
                     if pred_scale is not None and torch.all(torch.isfinite(pred_scale)):

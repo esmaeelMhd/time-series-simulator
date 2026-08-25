@@ -20,7 +20,7 @@ Model behavior, schema expectations, training recipe, simulator usage, limitatio
 git clone https://github.com/esmaeelMhd/time-series-simulator.git
 cd time-series-simulator
 
-# Default install (CUDA 12.8 PyTorch)
+# Default install (CUDA 12.9 PyTorch)
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -48,7 +48,7 @@ pip install -e ".[all]"
 ### Requirements
 
 - Python >= 3.10
-- PyTorch 2.13.0 (CUDA 12.8 by default via `requirements.txt`)
+- PyTorch 2.13.0 (CUDA 12.9 by default via `requirements.txt`)
 - Use `requirements.cpu.txt` for CPU-only installs
 
 ## Repository Layout
@@ -79,7 +79,7 @@ pip install -e ".[all]"
 ├── docker-compose.yaml         # API + dashboard services
 ├── pyproject.toml              # Package metadata & tool config
 ├── requirements.base.txt       # Shared runtime dependencies
-├── requirements.txt            # Default CUDA 12.8 dependency set
+├── requirements.txt            # Default CUDA 12.9 dependency set
 ├── requirements.cpu.txt        # CPU-only dependency set
 └── requirements.cuda.txt       # Explicit CUDA alias
 ```
@@ -205,7 +205,7 @@ python scripts/train_hydra.py --config-name=wastewater.small \
 ## Docker
 
 ```bash
-# Default API image (CUDA PyTorch)
+# Default API image (CPU PyTorch)
 docker compose up api
 
 # GPU API (requires nvidia-docker)
@@ -218,6 +218,7 @@ docker compose up dashboard
 Override config and checkpoint via environment variables:
 
 ```bash
+docker build -t timesim-api .
 docker run --rm -p 8000:8000 \
     -e TIMESIM_CONFIG=configs/wastewater.yaml \
     -e TIMESIM_CHECKPOINT=runs/wastewater/full_with_time/latent_ssm/train_checkpoint.pth \

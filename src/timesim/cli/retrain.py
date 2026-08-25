@@ -34,9 +34,6 @@ def _build_cli_parser():
     p.add_argument("--batch-size", type=int)
     p.add_argument("--device", type=str)
     p.add_argument("--model", type=str)
-    p.add_argument("--retrain-method", type=str, default=None, choices=["v1", "v2", "sepp"])
-    p.add_argument("--sepp-h-max", type=int)
-    p.add_argument("--sepp-stride", type=int)
     return p
 
 
@@ -183,101 +180,21 @@ def main():
             starts_used.append(int(sidx))
 
     # ----------------------------------------------------
-    # Choose retrain path
-    retrain_method = cli_args.retrain_method or cfg.get('retrain', {}).get('method', 'v2')
-    if retrain_method == "sepp":
-        from timesim.training.sepp_trainer import SEPPTrainer
-        model = build_model_func().to(device)
-        state = torch.load(cfg['ckpt'], map_location=device)
-        if isinstance(state, dict) and "model_state_dict" in state:
-            state = state["model_state_dict"]
-        model.load_state_dict(state)
-        h_max = cli_args.sepp_h_max or 10*pred_len
-        stride = cli_args.sepp_stride or pred_len
+    # Fine-tune
+    retrainer = Retrainer(model_cls=build_model_func,
+                          checkpoint=cfg["ckpt"],
+                          device=device)
 
-        sepp_ckpt = run_dir/"checkpoint_retrained.pth"
+    train_losses, val_losses = retrainer.fine_tune(train_loader, val_loader, epochs=cfg.get("epochs", 3))
 
-        # ----------------------------------------------------
-        # Build a validation loader compatible with SEPPWindowDataset
-        # ----------------------------------------------------
-        from timesim.data.sepp_dataset import SEPPWindowDataset
-        n_total_rows = len(df_raw)
-        split_cfg = cfg.get("data", {}).get("splits", None) or {}
-        train_ratio = float(split_cfg.get("train", 0.7))
-        n_train_rows = int(
-            n_total_rows * train_ratio
-        )
-        # Ensure window fits: need at least seq_len + h_max rows
-        val_start = max(n_train_rows - seq_len - h_max, 0)
-        val_df = df_raw.iloc[val_start:]
-        if len(val_df) >= seq_len + h_max:
-            sepp_val_ds = SEPPWindowDataset(val_df,
-                                            groups,
-                                            input_groups,
-                                            output_groups,
-                                            seq_len=seq_len,
-                                            h_max=h_max,
-                                            stride=stride)
-            from torch.utils.data import DataLoader
-            sepp_val_loader = DataLoader(sepp_val_ds, batch_size=batch_size, shuffle=False)
-        else:
-            sepp_val_loader = None  # too small, fallback to None
+    save_loss_plot(train_losses, val_losses, Path(run_dir)/"figs"/"retrain_loss.png", title="Retrain loss")
 
-        sim_horizon = cfg.get('retrain', {}).get('sim_horizon', 10*pred_len)
-        def on_improve_cb(m, epoch):
-            if df_raw is None:
-                return
-            after_list_local = []
-            for sidx in starts_used:
-                _, pred, _ = simulate_autoregressive(
-                    m, df_raw, groups, input_groups, output_groups,
-                    seq_len=seq_len, horizon=sim_horizon,
-                    device=device, start_idx=sidx,
-                    scaler=scaler,
-                    use_symlog=bool((cfg.get("data", {}).get("symlog", {}) or {}).get("enabled", False)),
-                    symlog_columns=(cfg.get("data", {}).get("symlog", {}) or {}).get("columns", None),
-                )
-                after_list_local.append(pred)
-            multi_compare_simulation_plot(
-                real_list, before_list, after_list_local, output_cols,
-                Path(run_dir)/'figs'/f'simulation_compare_epoch{epoch}.png')
+    new_ckpt = run_dir/"checkpoint_retrained.pth"
+    retrainer.model.cpu()
+    torch.save(retrainer.model.state_dict(), new_ckpt)
+    logger.info(f"Saved fine-tuned checkpoint to {new_ckpt}")
 
-        sepp = SEPPTrainer(
-                model,
-                df_raw,
-                groups,
-                input_groups,
-                output_groups,
-                seq_len=seq_len,
-                pred_len=pred_len,
-                h_max=h_max,
-                stride=stride,
-                device=device,
-                val_loader=sepp_val_loader,
-                patience=cfg.get('retrain', {}).get('patience', 5),
-                ckpt_path=sepp_ckpt,
-                on_improve=on_improve_cb)
-
-        sepp_epochs = cli_args.epochs or cfg.get('retrain', {}).get('epochs', 3)
-        sepp.fit(epochs=sepp_epochs)
-
-        trained_model = model
-    else:
-        # legacy v1/v2 fine-tune path
-        retrainer = Retrainer(model_cls=build_model_func,
-                              checkpoint=cfg["ckpt"],
-                              device=device)
-
-        train_losses, val_losses = retrainer.fine_tune(train_loader, val_loader, epochs=cfg.get("epochs", 3))
-
-        save_loss_plot(train_losses, val_losses, Path(run_dir)/"figs"/"retrain_loss.png", title="Retrain loss")
-
-        new_ckpt = run_dir/"checkpoint_retrained.pth"
-        retrainer.model.cpu()
-        torch.save(retrainer.model.state_dict(), new_ckpt)
-        logger.info(f"Saved fine-tuned checkpoint to {new_ckpt}")
-
-        trained_model = retrainer.model
+    trained_model = retrainer.model
 
     # ------------- common post-simulation comparison -------------
     if df_raw is not None:
