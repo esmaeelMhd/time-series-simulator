@@ -158,14 +158,14 @@ def evaluate_neural_model(
     inverse_transform_outputs: bool = True,
     return_info: bool = False,
 ):
-    """Evaluate a neural model on multiple validation windows via rollout."""
+    """Evaluate a neural model on multiple held-out windows via rollout."""
     model.eval()
     val_data = val_dataset.values
     val_len = len(val_data)
 
     min_required = warmup_len + eval_horizon
     if val_len < min_required:
-        print(f"  Warning: val data too short ({val_len} < {min_required})")
+        print(f"  Warning: eval data too short ({val_len} < {min_required})")
         if return_info:
             return [], [], {
                 "is_probabilistic": False,
@@ -591,7 +591,8 @@ def save_comparison_forecast_plot(all_results, output_cols, out_path, eval_horiz
         gt = None
         for mn in model_names:
             if all_results[mn]["gt_list"]:
-                gt = all_results[mn]["gt_list"][0]; break
+                gt = all_results[mn]["gt_list"][0]
+                break
         if gt is None:
             continue
         steps = np.arange(gt.shape[0])
@@ -653,14 +654,18 @@ def save_metrics_bar_chart(all_results, out_path, plot_cfg=None):
     x = np.arange(len(model_names))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     bars1 = ax1.bar(x, mse_vals, 0.35, color=bar_colors, alpha=0.85, edgecolor="white")
-    ax1.set_xticks(x); ax1.set_xticklabels(model_names, fontweight="medium")
-    ax1.set_ylabel("MSE"); ax1.set_title("Rollout MSE by Model", fontweight="bold")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(model_names, fontweight="medium")
+    ax1.set_ylabel("MSE")
+    ax1.set_title("Rollout MSE by Model", fontweight="bold")
     for bar, val in zip(bars1, mse_vals):
         ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
                  f"{val:.4f}", ha="center", va="bottom", fontsize=8)
     bars2 = ax2.bar(x, mae_vals, 0.35, color=bar_colors, alpha=0.85, edgecolor="white")
-    ax2.set_xticks(x); ax2.set_xticklabels(model_names, fontweight="medium")
-    ax2.set_ylabel("MAE"); ax2.set_title("Rollout MAE by Model", fontweight="bold")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(model_names, fontweight="medium")
+    ax2.set_ylabel("MAE")
+    ax2.set_title("Rollout MAE by Model", fontweight="bold")
     for bar, val in zip(bars2, mae_vals):
         ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
                  f"{val:.4f}", ha="center", va="bottom", fontsize=8)
@@ -707,7 +712,8 @@ def save_simulation_trajectory_plot(sim_results_all, output_cols, out_path,
         cum_mse = np.cumsum(per_step_mse) / (steps + 1)
         color = colors[i % len(colors)]
         ax_err.plot(steps, cum_mse, color=color, linewidth=1.5, label=mn)
-    ax_err.set_ylabel("Cumulative MSE"); ax_err.set_xlabel("Simulation Step")
+    ax_err.set_ylabel("Cumulative MSE")
+    ax_err.set_xlabel("Simulation Step")
     ax_err.set_title("Error Accumulation", fontsize=10, fontweight="medium", loc="left")
     ax_err.legend(fontsize=cfg["legend_font_size"], framealpha=0.9)
     fig.suptitle(f"Recursive Simulation ({total_steps} steps)",

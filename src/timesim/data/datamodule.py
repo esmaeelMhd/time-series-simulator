@@ -133,7 +133,7 @@ class TimeSeriesDataModule((pl.LightningDataModule if pl is not None else object
             self._val_ds,
             batch_size=batch_size,
             shuffle=False,
-            drop_last=drop_last,
+            drop_last=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
@@ -141,7 +141,7 @@ class TimeSeriesDataModule((pl.LightningDataModule if pl is not None else object
             self._test_ds,
             batch_size=batch_size,
             shuffle=False,
-            drop_last=drop_last,
+            drop_last=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )

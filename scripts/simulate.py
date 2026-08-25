@@ -281,6 +281,10 @@ def main():
             start_max = n_total - seq_len - requested_horizon
         start_min = int(test_start)
         if start_max < start_min:
+            print(
+                "Warning: requested horizon does not fit in the test split; "
+                "sampling a start index that may fall in val/train."
+            )
             start_min = max(0, start_max)
         if start_max < 0:
             start_max = 0
@@ -387,7 +391,11 @@ def main():
         yaml.safe_dump(meta, f, sort_keys=False)
 
     print("\n" + "=" * 70)
-    print("  HELD-OUT TEST SIMULATION COMPLETE")
+    if split_name == "test":
+        print("  HELD-OUT TEST SIMULATION COMPLETE")
+    else:
+        print(f"  {split_name.upper()} SIMULATION COMPLETE")
+        print("  Warning: start index is not in the held-out test split.")
     print("=" * 70)
     print(f"  Model        : {model_type} ({round_name})")
     print(f"  Checkpoint   : {ckpt_path}")

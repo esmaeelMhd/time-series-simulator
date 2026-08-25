@@ -155,6 +155,7 @@ class WorldModelLightningModule(pl.LightningModule):  # type: ignore[misc]
             batch=batch,  # type: ignore[arg-type]
             context_len=context_len,
             horizon=horizon,
+            sample_posterior=stage == "train",
             sample_prior=False,
             compute_rollout_dtw=bool(compute_rollout_dtw and self.rollout_dtw_weight > 0.0),
             rollout_dtw_gamma=float(self.rollout_dtw_gamma),

@@ -166,7 +166,7 @@ def test_datamodule_fits_train_stats_and_saves(tmp_path):
             "window_stride": 1,
             "num_workers": 0,
             "pin_memory": False,
-            "drop_last": False,
+            "drop_last": True,
             "shuffle_train": False,
             "require_full_role_mapping": True,
             "validation": {
@@ -188,6 +188,9 @@ def test_datamodule_fits_train_stats_and_saves(tmp_path):
     assert dm.train_dataloader() is not None
     assert dm.val_dataloader() is not None
     assert dm.test_dataloader() is not None
+    assert dm.train_dataloader().drop_last is True
+    assert dm.val_dataloader().drop_last is False
+    assert dm.test_dataloader().drop_last is False
     assert dm.normalization_stats is not None
 
     raw = _make_df(200)

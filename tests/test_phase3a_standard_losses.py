@@ -201,3 +201,29 @@ def test_total_standard_loss_weighted_sum() -> None:
     assert abs(info["recon_nll"] - float(recon.detach().item())) < 1e-8
     assert abs(info["kl"] - float(kl.detach().item())) < 1e-8
     assert abs(info["aux_nll"] - float(aux.detach().item())) < 1e-8
+
+
+def test_kl_mean_from_params_gaussian_balancing_matches_loss() -> None:
+    from timesim.models.latent_ssm import LatentSSMWorldModel
+
+    torch.manual_seed(0)
+    bsz, horizon, dim_z = 2, 4, 3
+    prior_mu = torch.randn(bsz, horizon, dim_z)
+    post_mu = torch.randn(bsz, horizon, dim_z)
+    prior_logvar = torch.randn(bsz, horizon, dim_z).clamp(-3.0, 3.0)
+    post_logvar = torch.randn(bsz, horizon, dim_z).clamp(-3.0, 3.0)
+    alpha = 0.8
+    got = LatentSSMWorldModel._kl_mean_from_params(
+        prior_mu=prior_mu,
+        prior_logvar=prior_logvar,
+        post_mu=post_mu,
+        post_logvar=post_logvar,
+        min_std=1e-8,
+        use_kl_balancing=True,
+        kl_balance=alpha,
+        use_free_bits=False,
+    )
+    loss_fn = ProbabilisticRolloutLoss(use_kl_balancing=True, kl_balance=alpha, use_free_bits=False)
+    kl_elem = loss_fn._balanced_kl(post_mu, post_logvar, prior_mu, prior_logvar)
+    expected = kl_elem.sum(dim=-1).mean()
+    assert torch.allclose(got, expected, atol=1e-5)

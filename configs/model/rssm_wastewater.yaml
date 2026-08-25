@@ -14,8 +14,8 @@ prior_min_std: 0.1
 prior_max_std: 1.5
 posterior_min_std: 0.1
 posterior_max_std: 1.5
-prior_constant_std: 0.1
-posterior_constant_std: 0.1
+prior_constant_std: null
+posterior_constant_std: null
 decoder_min_std: 0.5
 decoder_max_std: 2.0
 min_df: 2.2

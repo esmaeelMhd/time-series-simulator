@@ -1079,9 +1079,17 @@ class LatentSSMWorldModel(WorldModelBase):
         min_logvar = 2.0 * torch.tensor(float(min_std), device=prior_mu.device, dtype=prior_mu.dtype).log()
         p_lv = prior_logvar.clamp_min(min_logvar.item())
         q_lv = post_logvar.clamp_min(min_logvar.item())
-        var_ratio = (q_lv - p_lv).exp()
-        delta = prior_mu - post_mu
-        kl_elem = 0.5 * (p_lv - q_lv + var_ratio + delta.pow(2) / p_lv.exp() - 1.0)
+        if bool(use_kl_balancing):
+            alpha = float(kl_balance)
+            kl_prior_fit = LatentSSMWorldModel._kl_diagonal_normal(
+                post_mu.detach(), q_lv.detach(), prior_mu, p_lv
+            )
+            kl_post_fit = LatentSSMWorldModel._kl_diagonal_normal(
+                post_mu, q_lv, prior_mu.detach(), p_lv.detach()
+            )
+            kl_elem = alpha * kl_prior_fit + (1.0 - alpha) * kl_post_fit
+        else:
+            kl_elem = LatentSSMWorldModel._kl_diagonal_normal(post_mu, q_lv, prior_mu, p_lv)
         kl_steps = kl_elem.sum(dim=-1)
         if bool(use_free_bits) and float(kl_free_bits) > 0.0:
             kl_steps = torch.clamp(kl_steps, min=float(kl_free_bits))
@@ -1244,6 +1252,7 @@ class LatentSSMWorldModel(WorldModelBase):
         feedback: Literal["model", "teacher", "mixed"] = "model",
         teacher_forcing_ratio: float = 0.0,
         targets: Optional[torch.Tensor] = None,
+        sample_posterior: bool = True,
     ) -> Dict[str, object]:
         if feedback in {"teacher", "mixed"} and targets is None:
             raise ValueError(f"targets required when feedback='{feedback}'")
@@ -1269,7 +1278,7 @@ class LatentSSMWorldModel(WorldModelBase):
                 exogenous=exogenous,
                 observations=targets[:, :horizon, :],
                 initial_state=state0,
-                sample_posterior=True,
+                sample_posterior=sample_posterior,
             )
             return {
                 "predictions": posterior["predictions"],

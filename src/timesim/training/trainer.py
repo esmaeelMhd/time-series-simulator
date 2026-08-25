@@ -211,12 +211,6 @@ class WorldModelTrainer:
             )
         else:
             raise ValueError(f"Unknown training mode: {training_mode}")
-        self._val_multi_step_loss = MultiStepLoss(
-            loss_type=loss_type,
-            weighting=loss_weighting,
-            weight_scale=loss_weight_scale,
-            shape_loss_cfg=shape_loss_cfg,
-        )
         prob_cfg = probabilistic_cfg or {}
         self.probabilistic_loss_fn = ProbabilisticRolloutLoss(
             recon_weight=prob_cfg.get("recon_weight", prob_cfg.get("elbo_weight", 1.0)),
@@ -451,23 +445,35 @@ class WorldModelTrainer:
         ):
             max_h = max(1, len(self.val_dataset.values) - self.warmup_len)
             horizon = max(1, min(self.checkpoint_open_loop_horizon, max_h))
+            curves = None
             try:
                 from ..evaluation import open_loop_evaluate
 
-                curves = open_loop_evaluate(
-                    model=self.model,
-                    dataset=self.val_dataset,
-                    warmup_len=self.warmup_len,
-                    horizon=horizon,
-                    n_windows=self.checkpoint_open_loop_windows,
-                    n_samples=self.checkpoint_open_loop_samples,
-                    device=self.device,
+                devices = [self.device] if self.device.type == "cuda" else []
+                ckpt_seed = 17_001 if self.seed is None else int(self.seed) + 17_001
+                with torch.random.fork_rng(devices=devices):
+                    torch.manual_seed(ckpt_seed)
+                    if self.device.type == "cuda":
+                        torch.cuda.manual_seed_all(ckpt_seed)
+                    curves = open_loop_evaluate(
+                        model=self.model,
+                        dataset=self.val_dataset,
+                        warmup_len=self.warmup_len,
+                        horizon=horizon,
+                        n_windows=self.checkpoint_open_loop_windows,
+                        n_samples=self.checkpoint_open_loop_samples,
+                        device=self.device,
+                    )
+            except Exception:
+                logger.warning(
+                    "open_loop_evaluate failed during checkpoint scoring; "
+                    "falling back to val_loss.",
+                    exc_info=True,
                 )
+            if curves is not None:
                 crps = curves.get("crps")
                 if crps is not None and len(crps) > 0 and np.all(np.isfinite(crps)):
                     return float(np.mean(crps)), "open_loop_crps"
-            except Exception:
-                pass
 
         if val_loss is None or not np.isfinite(val_loss):
             return float("inf"), "val_loss"
@@ -477,17 +483,29 @@ class WorldModelTrainer:
         """Fixed, deterministic validation windows (do not consume the training RNG)."""
         if self._val_windows is None:
             n_series = len(self.val_dataset.values)
+            if n_series <= self.warmup_len:
+                logger.warning(
+                    "Validation series shorter than warmup_len (%s <= %s); skipping validation windows.",
+                    n_series,
+                    self.warmup_len,
+                )
+                self._val_windows = []
+                return self._val_windows
             val_batches = max(1, n_series // max(1, self.batch_size))
             val_batches = min(val_batches, 8)
             windows: list[tuple[np.ndarray, np.ndarray]] = []
-            for _ in range(val_batches):
-                start_indices, horizons = self.sampling_strategy.sample(
-                    dataset_length=n_series,
-                    batch_size=self.batch_size,
-                    warmup_len=self.warmup_len,
-                    rng=self._val_rng,
-                )
-                windows.append((start_indices, horizons))
+            try:
+                for _ in range(val_batches):
+                    start_indices, horizons = self.sampling_strategy.sample(
+                        dataset_length=n_series,
+                        batch_size=self.batch_size,
+                        warmup_len=self.warmup_len,
+                        rng=self._val_rng,
+                    )
+                    windows.append((start_indices, horizons))
+            except ValueError as exc:
+                logger.warning("Could not sample validation windows (%s); skipping validation.", exc)
+                windows = []
             self._val_windows = windows
         return self._val_windows
 
@@ -871,11 +889,15 @@ class WorldModelTrainer:
 
         self.model.eval()
 
+        val_windows = self._get_val_windows()
+        if not val_windows:
+            return None
+
         val_losses = []
         sched_horizon, context_len, rollout_ramp = self._rollout_schedule()
         effective_rollout_weight = max(0.0, self.rollout_weight * rollout_ramp)
 
-        for start_indices, horizons0 in self._get_val_windows():
+        for start_indices, horizons0 in val_windows:
             horizons = self._apply_horizon_curriculum(horizons0)
 
             with torch.autocast(
@@ -886,7 +908,8 @@ class WorldModelTrainer:
                 if self.is_probabilistic_model:
                     result_teacher = batch_rollout_padded(
                         self.model, self.val_dataset, start_indices, horizons,
-                        self.warmup_len, feedback="teacher", device=self.device
+                        self.warmup_len, feedback="teacher", device=self.device,
+                        sample_posterior=False,
                     )
                     targets = result_teacher["targets"]
                     mask = result_teacher["mask"]
@@ -936,7 +959,6 @@ class WorldModelTrainer:
                         prior_logvar = torch.zeros_like(prior_logits)
                         posterior_mu = posterior_logits
                         posterior_logvar = torch.zeros_like(posterior_logits)
-                    self._current_kl_beta()
                     loss, _ = self.probabilistic_loss_fn(
                         targets=targets,
                         dist_loc_latent=dist_loc_latent,

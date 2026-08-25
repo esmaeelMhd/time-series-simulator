@@ -24,7 +24,7 @@ The wastewater CSV is **not** bundled with this repository. Download it from the
   - Optional exogenous auxiliary Gaussian NLL.
   - Optional rollout loss (NLL + optional soft-DTW term).
 - Latent / decoder noise:
-  - Gaussian latent stds are learned unless `prior_constant_std` / `posterior_constant_std` are set (the wastewater RSSM config uses categorical latents).
+  - Gaussian latent stds are learned unless `prior_constant_std` / `posterior_constant_std` are set (the wastewater RSSM config uses categorical latents and leaves both `null`).
   - Decoder `min_std` is honoured as configured (shipped configs use `0.5` on min-max normalized `[0, 1]` targets).
 - Optimization:
   - AdamW (default `lr=3e-4`, `weight_decay=1e-6`).

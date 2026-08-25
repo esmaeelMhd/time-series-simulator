@@ -113,6 +113,7 @@ exclude = ["tests*", "examples*", "docs*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -150,7 +151,7 @@ src = ["src", "scripts", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
-ignore = ["E501", "W293", "E741", "E402", "E702"]
+ignore = ["E501", "W293", "E741", "E402"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/*" = ["E402"]

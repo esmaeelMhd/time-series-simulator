@@ -10,7 +10,7 @@ Key optimizations applied:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Mapping
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 import numpy as np
 import torch
@@ -260,6 +260,7 @@ def batch_rollout(
     feedback: Literal["model", "teacher", "mixed"] = "model",
     teacher_forcing_ratio: float = 0.0,
     device: torch.device | str = "cpu",
+    sample_posterior: Optional[bool] = None,
 ) -> Dict[str, torch.Tensor]:
     """Perform batched multi-environment rollouts.
     
@@ -344,6 +345,9 @@ def batch_rollout(
 
     # Check if all horizons are the same (enables true batched rollout)
     uniform_horizon = (horizons == horizons[0]).all()
+    extra_rollout_kw: Dict[str, Any] = {}
+    if sample_posterior is not None:
+        extra_rollout_kw["sample_posterior"] = sample_posterior
 
     if uniform_horizon:
         # HOT PATH: True batched rollout - single model.rollout call
@@ -362,6 +366,7 @@ def batch_rollout(
             feedback=feedback,
             teacher_forcing_ratio=teacher_forcing_ratio,
             targets=targets_for_rollout,
+            **extra_rollout_kw,
         )
 
         predictions = rollout_result["predictions"]  # (B, horizon, output)
@@ -406,6 +411,7 @@ def batch_rollout(
                 feedback=feedback,
                 teacher_forcing_ratio=teacher_forcing_ratio,
                 targets=targets_i,
+                **extra_rollout_kw,
             )
 
             predictions_list.append(rollout_result["predictions"].squeeze(0))
@@ -440,6 +446,7 @@ def batch_rollout_padded(
     teacher_forcing_ratio: float = 0.0,
     device: torch.device | str = "cpu",
     pad_value: float = 0.0,
+    sample_posterior: Optional[bool] = None,
 ) -> Dict[str, torch.Tensor]:
     """Perform batched rollouts with padding to uniform horizon.
     
@@ -481,7 +488,8 @@ def batch_rollout_padded(
     """
     result = batch_rollout(
         model, dataset, start_indices, horizons, warmup_len,
-        feedback, teacher_forcing_ratio, device
+        feedback, teacher_forcing_ratio, device,
+        sample_posterior=sample_posterior,
     )
 
     predictions_list = result["predictions"]
