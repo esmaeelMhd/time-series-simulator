@@ -8,6 +8,7 @@ from timesim.data import (
     SlidingWindowRoleDataset,
     TimeSeriesDataModule,
     chronological_split_dataframe,
+    held_out_eval_frame,
     resolve_split_ratios,
 )
 from timesim.data.preprocessing import (
@@ -40,6 +41,38 @@ def test_chronological_split_70_15_15_defaults():
     assert len(test_df) == 15
     assert train_df.index.max() < val_df.index.min()
     assert val_df.index.max() < test_df.index.min()
+
+
+def test_held_out_eval_frame_warmup_does_not_leak_targets():
+    df = _make_df(1000)
+    split_cfg = {"train": 0.70, "val": 0.15, "test": 0.15}
+    _, _, chrono_test = chronological_split_dataframe(
+        df, split_ratios=resolve_split_ratios(split_cfg=split_cfg)
+    )
+    true_test_start = len(df) - len(chrono_test)
+    warmup_len = 10
+    seq_len = 50  # previously used as pad; must not pull targets into val
+
+    sliced = held_out_eval_frame(
+        df, split_cfg=split_cfg, eval_test_split=0.15, warmup_len=warmup_len
+    )
+    context_start = len(df) - len(sliced)
+    first_target = context_start + warmup_len
+    assert first_target == true_test_start
+    assert context_start == true_test_start - warmup_len
+    # Using seq_len as pad would have placed the first target before the test boundary.
+    assert first_target > true_test_start - (seq_len - warmup_len)
+
+
+def test_held_out_eval_frame_rejects_split_larger_than_configured_test():
+    df = _make_df(200)
+    with pytest.raises(ValueError, match="exceeds data.splits.test"):
+        held_out_eval_frame(
+            df,
+            split_cfg={"train": 0.70, "val": 0.15, "test": 0.15},
+            eval_test_split=0.20,
+            warmup_len=8,
+        )
 
 
 def test_train_only_normalization_and_round_trip():

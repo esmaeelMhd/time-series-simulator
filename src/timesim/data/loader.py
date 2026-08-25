@@ -104,6 +104,51 @@ def chronological_split_dataframe(
     return train_df, val_df, test_df
 
 
+def held_out_eval_frame(
+    df: pd.DataFrame,
+    *,
+    split_cfg: Optional[Dict[str, Any]] = None,
+    eval_test_split: Optional[float] = None,
+    warmup_len: int = 0,
+) -> pd.DataFrame:
+    """Slice covering the chronological test split plus warmup context.
+
+    Preceding ``warmup_len`` rows (from val/train) are included so evaluation
+    windows can condition without treating test targets as warmup. When enough
+    history exists, the first evaluated target at offset ``warmup_len`` in the
+    returned frame sits at the true test boundary.
+
+    ``eval_test_split`` may only *shrink* the chronological test suffix; it
+    cannot reach back into validation.
+    """
+    ratios = resolve_split_ratios(
+        split_cfg=split_cfg,
+        train_split=None,
+        default=(0.70, 0.15, 0.15),
+    )
+    _, _, chrono_test = chronological_split_dataframe(df, split_ratios=ratios)
+    chrono_test_start = len(df) - len(chrono_test)
+
+    if eval_test_split is None:
+        eval_test_start = chrono_test_start
+    else:
+        frac = float(eval_test_split)
+        if not 0.0 < frac < 1.0:
+            raise ValueError(f"evaluation.test_split must be in (0, 1), got {frac}")
+        configured_test = float((split_cfg or {}).get("test", ratios[2]))
+        if frac - configured_test > 1e-9:
+            raise ValueError(
+                f"evaluation.test_split={frac} exceeds data.splits.test={configured_test}. "
+                "Held-out evaluation must not include validation or train rows."
+            )
+        n_eval = max(1, min(len(chrono_test), int(round(len(df) * frac))))
+        eval_test_start = max(chrono_test_start, len(df) - n_eval)
+
+    warmup_len = max(0, int(warmup_len))
+    context_start = max(0, eval_test_start - warmup_len)
+    return df.iloc[context_start:].copy()
+
+
 def build_dataloaders(
     series: np.ndarray,
     seq_len: int,

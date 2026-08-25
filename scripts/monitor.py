@@ -21,11 +21,7 @@ import yaml
 from joblib import load as joblib_load
 
 from timesim.data.dataset import GroupedTimeSeriesDataset
-from timesim.data.loader import (
-    chronological_split_dataframe,
-    load_csv_dataset,
-    resolve_split_ratios,
-)
+from timesim.data.loader import held_out_eval_frame, load_csv_dataset
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
 from timesim.models.factory import build_model
@@ -260,19 +256,18 @@ def _build_test_dataset(cfg: Dict[str, Any], scaler) -> GroupedTimeSeriesDataset
         validation_cfg=data_cfg.get("validation", None),
     )
     eval_cfg = cfg.get("evaluation", {}) or {}
-    test_split = eval_cfg.get("test_split", None)
-    if test_split is None:
-        ratios = resolve_split_ratios(
-            split_cfg=data_cfg.get("splits", None),
-            train_split=None,
-            default=(0.70, 0.15, 0.15),
+    warmup_len = int(
+        cfg.get("training", {}).get(
+            "warmup_len",
+            cfg.get("training", {}).get("window_len", seq_len),
         )
-        _, _, test_df = chronological_split_dataframe(df, split_ratios=ratios)
-    else:
-        frac = float(test_split)
-        n_test = max(seq_len + pred_len + 1, int(round(len(df) * frac)))
-        start = max(0, len(df) - n_test - seq_len)
-        test_df = df.iloc[start:].copy()
+    )
+    test_df = held_out_eval_frame(
+        df,
+        split_cfg=data_cfg.get("splits", None),
+        eval_test_split=eval_cfg.get("test_split", None),
+        warmup_len=warmup_len,
+    )
 
     add_time = bool(data_cfg.get("add_time_features", False))
     tf_cfg = data_cfg.get("time_features", {}) or {}

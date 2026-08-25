@@ -23,9 +23,8 @@ from joblib import load as joblib_load
 
 from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.loader import (
-    chronological_split_dataframe,
+    held_out_eval_frame,
     load_csv_dataset,
-    resolve_split_ratios,
 )
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
@@ -119,30 +118,18 @@ def _build_test_dataset(config: Dict[str, Any], scaler) -> GroupedTimeSeriesData
     )
 
     eval_cfg = config.get("evaluation", {}) or {}
-    test_split = eval_cfg.get("test_split", None)
-    if test_split is None:
-        ratios = resolve_split_ratios(
-            split_cfg=data_cfg.get("splits", None),
-            train_split=None,
-            default=(0.70, 0.15, 0.15),
+    warmup_len = int(
+        config.get("training", {}).get(
+            "warmup_len",
+            config.get("training", {}).get("window_len", seq_len),
         )
-        _, _, test_df = chronological_split_dataframe(df, split_ratios=ratios)
-        test_start = len(df) - len(test_df)
-    else:
-        test_split = float(test_split)
-        if not 0.0 < test_split < 1.0:
-            raise ValueError(f"evaluation.test_split must be in (0, 1), got {test_split}")
-        configured_test = float((data_cfg.get("splits") or {}).get("test", 0.15))
-        if test_split - configured_test > 1e-9:
-            raise ValueError(
-                f"evaluation.test_split={test_split} exceeds data.splits.test={configured_test}. "
-                "Held-out evaluation must not include validation or train rows."
-            )
-        warmup_len = int(config.get("training", {}).get("warmup_len", seq_len))
-        pad = max(int(seq_len), int(warmup_len))
-        test_count = max(pad + pred_len + 1, int(round(len(df) * test_split)))
-        test_start = max(0, len(df) - test_count - pad)
-        test_df = df.iloc[test_start:].copy()
+    )
+    test_df = held_out_eval_frame(
+        df,
+        split_cfg=data_cfg.get("splits", None),
+        eval_test_split=eval_cfg.get("test_split", None),
+        warmup_len=warmup_len,
+    )
 
     add_time = bool(data_cfg.get("add_time_features", False))
     tf_cfg = data_cfg.get("time_features", {}) or {}

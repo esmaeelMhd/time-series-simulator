@@ -130,3 +130,44 @@ def test_simulator_reset_step_rollout_and_warnings():
     step_out = sim.step({"u": extreme}, exogenous_dict, n_samples=8, return_details=True)
     warnings = step_out.get("warnings", [])
     assert any("u" in w and "sigma" in w for w in warnings)
+
+
+def test_simulator_intervals_include_decoder_noise():
+    class _FixedMeanModel(_DummyWorldModel):
+        def imagine(
+            self,
+            initial_state,
+            future_controls,
+            future_exogenous,
+            n_steps=None,
+            n_samples: int = 50,
+            sample_latent: bool = True,
+        ):
+            out = super().imagine(
+                initial_state,
+                future_controls,
+                future_exogenous,
+                n_steps=n_steps,
+                n_samples=n_samples,
+                sample_latent=sample_latent,
+            )
+            if "samples" in out:
+                mean = out["predictions"].unsqueeze(0).expand_as(out["samples"]).contiguous()
+                out["samples"] = mean
+                out["dist_scale_samples"] = torch.full_like(mean, 4.0)
+            return out
+
+    df, dataset = _make_dataset()
+    model = _FixedMeanModel(output_dim=1)
+    sim = RSSMSimulator.from_dataset(model=model, dataset=dataset, sigma_scale=1.0, device="cpu")
+    history_df = df[dataset.feature_cols].iloc[-dataset.seq_len :].copy()
+    sim.reset(history_df)
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    horizon = 8
+    control_df = pd.DataFrame({"u": np.full((horizon,), float(history_df["u"].iloc[-1]), dtype=np.float32)})
+    exogenous_df = pd.DataFrame({"x": np.full((horizon,), float(history_df["x"].iloc[-1]), dtype=np.float32)})
+    rollout_df = sim.rollout(control_df, exogenous_df, n_samples=64)
+    width = float((rollout_df["y_p95"] - rollout_df["y_p5"]).mean())
+    assert width > 0.5

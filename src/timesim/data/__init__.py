@@ -9,6 +9,7 @@ from .loader import (
     build_grouped_triplet_dataloaders,
     chronological_split_dataframe,
     generate_sine_dataset,
+    held_out_eval_frame,
     load_csv_dataset,
     resolve_split_ratios,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "build_dataloaders_from_config",
     "build_grouped_triplet_dataloaders",
     "chronological_split_dataframe",
+    "held_out_eval_frame",
     "resolve_split_ratios",
     "SamplingStrategy",
     "RandomStartRandomHorizon",

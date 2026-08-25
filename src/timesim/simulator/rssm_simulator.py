@@ -12,6 +12,7 @@ import torch
 
 from ..data.dataset import GroupedTimeSeriesDataset
 from ..data.schema import VariableSchema
+from ..models.latent_ssm import add_decoder_aleatoric_noise
 
 
 @dataclass
@@ -301,7 +302,15 @@ class RSSMSimulator:
 
     def _samples_from_imagine(self, out: Dict[str, Any]) -> np.ndarray:
         if "samples" in out:
-            arr = out["samples"].detach().cpu().numpy().astype(np.float32, copy=False)
+            samples = out["samples"]
+            if torch.is_tensor(samples):
+                scale = out.get("dist_scale_samples")
+                if not torch.is_tensor(scale):
+                    scale = out.get("dist_scale")
+                samples = add_decoder_aleatoric_noise(samples, scale)
+                arr = samples.detach().cpu().numpy().astype(np.float32, copy=False)
+            else:
+                arr = np.asarray(samples, dtype=np.float32)
             # (N,B,H,O) -> (N,H,O) when B=1
             if arr.ndim == 4 and arr.shape[1] == 1:
                 arr = arr[:, 0, :, :]

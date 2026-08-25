@@ -43,6 +43,7 @@ The wastewater CSV is **not** bundled with this repository. Download it from the
 - FastAPI endpoints:
   - `GET /health`, `GET /schema`
   - `POST /reset`, `POST /step`, `POST /rollout`
+- Uncertainty: `step` / `rollout` intervals include both latent sampling and decoder Gaussian (aleatoric) noise, matching `LatentSSMWorldModel.rollout_mc` used by the evaluation suite.
 
 ## 5. Benchmarks
 Headline numbers should be regenerated with `scripts/eval.py` / `scripts/eval_rssm_suite.py` on the test split after training. This card does not ship run artifacts.

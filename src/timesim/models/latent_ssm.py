@@ -32,6 +32,23 @@ from .rssm import RSSMCell, RSSMState
 logger = logging.getLogger(__name__)
 
 
+def add_decoder_aleatoric_noise(
+    samples: torch.Tensor,
+    dist_scale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Add one decoder-Gaussian draw per sample, matching ``rollout_mc``.
+
+    ``dist_scale`` may be ``(N, B, H, O)`` or a trailing broadcast of that shape
+    (for example ``(B, H, O)``). Returns ``samples`` unchanged when scale is missing.
+    """
+    if not torch.is_tensor(dist_scale):
+        return samples
+    scale = dist_scale.to(device=samples.device, dtype=samples.dtype)
+    while scale.ndim < samples.ndim:
+        scale = scale.unsqueeze(0)
+    return samples + scale * torch.randn_like(samples)
+
+
 class LatentSSMWorldModel(WorldModelBase):
     """RSSM world model for intervention-aware simulation."""
 
@@ -1360,9 +1377,7 @@ class LatentSSMWorldModel(WorldModelBase):
         )
         samples = imagined["samples"]
         assert isinstance(samples, torch.Tensor)
-        dist_scale_samples = imagined.get("dist_scale_samples")
-        if torch.is_tensor(dist_scale_samples):
-            samples = samples + dist_scale_samples * torch.randn_like(samples)
+        samples = add_decoder_aleatoric_noise(samples, imagined.get("dist_scale_samples"))
 
         alpha = max(0.0, min(1.0, float(interval_level)))
         lo_q = (1.0 - alpha) / 2.0
