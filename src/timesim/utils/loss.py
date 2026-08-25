@@ -1,10 +1,10 @@
-import torch
 from torch import nn
+
+from .dilate import dilate_loss
 
 
 def mse_loss():
     return nn.MSELoss()
 
 
-def dilate_loss(*args, **kwargs):
-    raise NotImplementedError("Dilate loss not yet implemented in skeleton") 
+__all__ = ["mse_loss", "dilate_loss"]

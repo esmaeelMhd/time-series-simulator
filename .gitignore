@@ -94,8 +94,10 @@ lightning_logs/
 # TensorBoard logs
 events.out.tfevents.*
 
-# Datasets
+# Datasets and historical artifacts (not distributed)
 datasets/
+figures/
+policy_results/
 
 # Temporary files
 *.log

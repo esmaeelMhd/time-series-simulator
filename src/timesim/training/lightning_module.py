@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+import logging
 import math
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
+
+from .rollout import get_rollout_schedule
 
 try:
     import pytorch_lightning as pl  # type: ignore
@@ -15,6 +18,8 @@ except Exception as exc:  # pragma: no cover - optional dependency
         "WorldModelLightningModule requires pytorch-lightning. "
         "Install with: pip install pytorch-lightning"
     ) from exc
+
+logger = logging.getLogger(__name__)
 
 
 class WorldModelLightningModule(pl.LightningModule):  # type: ignore[misc]
@@ -48,6 +53,8 @@ class WorldModelLightningModule(pl.LightningModule):  # type: ignore[misc]
         self.rollout_dtw_gamma = float(p.get("rollout_dtw_gamma", 0.1))
         self.rollout_warmup_fraction = float(p.get("rollout_warmup_fraction", 0.30))
         self.rollout_max_horizon = int(max(0, p.get("rollout_max_horizon", 0)))
+        self.rollout_start_epoch = p.get("rollout_start_epoch")
+        self.rollout_full_epoch = p.get("rollout_full_epoch")
         self.validation_rollout_horizon = int(
             max(1, p.get("validation_rollout_horizon", p.get("eval_rollout_horizon", 30)))
         )
@@ -87,29 +94,21 @@ class WorldModelLightningModule(pl.LightningModule):  # type: ignore[misc]
         return crps.mean()
 
     def _rollout_schedule(self, seq_len: int) -> tuple[int, int, float]:
-        """(horizon, context_len, ramp_factor) with warmup + linear ramp."""
+        """(horizon, context_len, ramp_factor) from the shared scheduler."""
         total_epochs = int(getattr(self.trainer, "max_epochs", 1) or 1) if self.trainer is not None else 1
         ep = int(self.current_epoch) + 1
-        max_horizon = min(int(self.rollout_max_horizon), max(0, int(seq_len) - int(self.min_context)))
-        if max_horizon <= 0:
-            return 0, int(seq_len), 0.0
-
-        frac = max(0.0, min(1.0, float(self.rollout_warmup_fraction)))
-        warmup_epochs = int(math.ceil(total_epochs * frac))
-        warmup_epochs = min(total_epochs, max(0, warmup_epochs))
-        if ep <= warmup_epochs:
-            return 0, int(seq_len), 0.0
-
-        denom = max(1, total_epochs - warmup_epochs)
-        ramp = float(ep - warmup_epochs) / float(denom)
-        ramp = max(0.0, min(1.0, ramp))
-        horizon = int(round(max_horizon * ramp))
-        if horizon == 0 and ramp > 0.0:
-            horizon = 1
-        horizon = min(max_horizon, max(0, horizon))
-        context_len = max(int(self.min_context), int(seq_len) - int(horizon))
-        horizon = max(0, int(seq_len) - int(context_len))
-        return int(horizon), int(context_len), float(ramp)
+        cfg: Dict[str, Any] = {
+            "epochs": total_epochs,
+            "seq_len": int(seq_len),
+            "min_context": self.min_context,
+            "rollout_max_horizon": self.rollout_max_horizon,
+            "rollout_warmup_fraction": self.rollout_warmup_fraction,
+        }
+        if self.rollout_start_epoch is not None:
+            cfg["rollout_start_epoch"] = int(self.rollout_start_epoch)
+        if self.rollout_full_epoch is not None:
+            cfg["rollout_full_epoch"] = int(self.rollout_full_epoch)
+        return get_rollout_schedule(epoch=ep, cfg=cfg)
 
     def _compute_rssm_combined_losses(
         self,
@@ -346,7 +345,7 @@ class WorldModelLightningModule(pl.LightningModule):  # type: ignore[misc]
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         loss = self._shared_step(batch, "train", batch_idx=batch_idx)
         if torch.isnan(loss) or torch.isinf(loss):
-            print("NAN DETECTED! Skipping step.")
+            logger.warning("Non-finite training loss; skipping step.")
             return None  # type: ignore[return-value]
         return loss
 

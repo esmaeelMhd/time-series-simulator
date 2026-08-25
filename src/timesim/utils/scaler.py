@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
@@ -52,6 +53,18 @@ class NormalizationStats:
         fit_arr = self._apply_symlog(arr)
         self.min = fit_arr.min(axis=0)
         self.max = fit_arr.max(axis=0)
+        span = self.max - self.min
+        tiny = span < 1e-6
+        if np.any(tiny):
+            names = self.feature_names or [str(i) for i in range(arr.shape[1])]
+            frozen = [names[i] for i, flag in enumerate(tiny) if flag]
+            warnings.warn(
+                "Near-constant train features detected; using unit scale instead of "
+                f"dividing by eps. Columns: {frozen}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.max = np.where(tiny, self.min + 1.0, self.max)
         return self
 
     def _require_fit(self) -> None:

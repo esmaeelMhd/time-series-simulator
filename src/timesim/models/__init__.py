@@ -34,22 +34,8 @@ XGBoost (sklearn-style):
 """
 
 from .base import WorldModelBase
-from .factory import (
-    build_model,
-    count_parameters,
-    get_model_param_names,
-    NEURAL_MODELS,
-    PRIMARY_MODEL_TYPES,
-    LEGACY_MODEL_TYPES,
-    MODEL_TYPE_CONSTANTS,
-)
-from .lstm import LSTMWorldModel, SimpleLSTM
-from .transformer import SimpleTransformer, TransformerWorldModel
+from .decoders import AuxiliaryDecoder, ObjectiveDecoder
 from .dlinear import DLinear, DLinearWorldModel
-from .nlinear import NLinear, NLinearWorldModel
-from .tft import TemporalFusionTransformer, TFTWorldModel
-from .latent_ssm import LatentSSMWorldModel
-from .rssm import RSSMState, RSSMOutput, RSSMCell
 from .encoders import (
     ControlEncoder,
     ExogenousEncoder,
@@ -57,11 +43,25 @@ from .encoders import (
     UniversalSharedEncoder,
     assert_no_shared_encoder_params,
 )
-from .decoders import ObjectiveDecoder, AuxiliaryDecoder
+from .factory import (
+    LEGACY_MODEL_TYPES,
+    MODEL_TYPE_CONSTANTS,
+    NEURAL_MODELS,
+    PRIMARY_MODEL_TYPES,
+    build_model,
+    count_parameters,
+    get_model_param_names,
+)
+from .latent_ssm import LatentSSMWorldModel
+from .lstm import LSTMWorldModel, SimpleLSTM
+from .nlinear import NLinear, NLinearWorldModel
+from .rssm import RSSMCell, RSSMOutput, RSSMState
+from .tft import TemporalFusionTransformer, TFTWorldModel
+from .transformer import SimpleTransformer, TransformerWorldModel
 
 # Optional XGBoost (may not be installed)
 try:
-    from .xgboost_model import XGBoostForecaster, XGBoostEnsemble
+    from .xgboost_model import XGBoostEnsemble, XGBoostForecaster
     _HAS_XGBOOST = True
 except ImportError:
     XGBoostForecaster = None
@@ -73,11 +73,11 @@ except ImportError:
 MODEL_REGISTRY = {
     # Legacy recurrent
     "lstm": LSTMWorldModel,
-    
+
     # Legacy attention
     "transformer": TransformerWorldModel,
     "tft": TFTWorldModel,
-    
+
     # Legacy linear
     "dlinear": DLinearWorldModel,
     "nlinear": NLinearWorldModel,
@@ -123,7 +123,7 @@ def get_model(name: str, world_model: bool = True):
     >>> model = DLinearSimple(input_dim=10, seq_len=24, pred_len=12)
     """
     key = name.lower()
-    
+
     if world_model:
         if key not in MODEL_REGISTRY:
             available = list(MODEL_REGISTRY.keys())
@@ -158,21 +158,21 @@ def list_models() -> dict:
 __all__ = [
     # Base
     "WorldModelBase",
-    
+
     # LSTM
     "LSTMWorldModel",
     "SimpleLSTM",
-    
+
     # Transformer
     "SimpleTransformer",
     "TransformerWorldModel",
-    
+
     # Linear
     "DLinear",
     "DLinearWorldModel",
     "NLinear",
     "NLinearWorldModel",
-    
+
     # TFT
     "TemporalFusionTransformer",
     "TFTWorldModel",
@@ -189,11 +189,11 @@ __all__ = [
     "assert_no_shared_encoder_params",
     "ObjectiveDecoder",
     "AuxiliaryDecoder",
-    
+
     # XGBoost (optional)
     "XGBoostForecaster",
     "XGBoostEnsemble",
-    
+
     # Factory
     "build_model",
     "count_parameters",
@@ -202,7 +202,7 @@ __all__ = [
     "PRIMARY_MODEL_TYPES",
     "LEGACY_MODEL_TYPES",
     "MODEL_TYPE_CONSTANTS",
-    
+
     # Utilities
     "get_model",
     "list_models",

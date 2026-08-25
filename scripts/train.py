@@ -24,21 +24,23 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
-import logging
-import yaml
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.data import DataLoader, Dataset
 
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 # Ensure Unicode-safe console output on Windows terminals (cp1252 by default).
@@ -50,16 +52,21 @@ try:
 except Exception:
     pass
 
-from timesim.utils.config import compose_config
-from timesim.data.loader import load_csv_dataset, build_dataloaders_from_config
-from timesim.data.schema import VariableSchema, VariableRole
-from timesim.data.stamps import get_time_feature_columns
+from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.sampling import (
-    RandomStartFixedHorizon,
-    RandomStartRandomHorizon,
     DailyFixedHorizon,
     GeometricHorizonSampling,
+    RandomStartFixedHorizon,
+    RandomStartRandomHorizon,
     StrideBasedSampling,
+)
+from timesim.data.schema import VariableRole, VariableSchema
+from timesim.data.stamps import get_time_feature_columns
+from timesim.models.factory import (
+    NEURAL_MODELS,
+    build_model,
+    count_parameters,
+    get_model_param_names,
 )
 from timesim.training import WorldModelTrainer
 from timesim.training.safety import (
@@ -67,25 +74,20 @@ from timesim.training.safety import (
     merged_probabilistic_cfg,
     validate_latent_ssm_do_not,
 )
-from timesim.utils.plotting import save_loss_plot, save_forecast_plot
-from timesim.models.factory import (
-    build_model,
-    count_parameters,
-    get_model_param_names,
-    NEURAL_MODELS,
-)
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device, seed_everything
+from timesim.utils.plotting import save_forecast_plot, save_loss_plot
 from timesim.utils.tracking import ExperimentTracker
-from timesim.utils.misc import seed_everything, resolve_device
 
 # Shared eval / simulation utilities  (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_utils import (
     evaluate_neural_model,
     evaluate_xgboost_model,
+    save_per_model_simulation_csv,
+    save_per_model_simulation_plot,
     simulate_recursive_neural,
     simulate_recursive_xgboost,
-    save_per_model_simulation_plot,
-    save_per_model_simulation_csv,
 )
 
 # Try importing XGBoost
@@ -395,12 +397,15 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
             import pytorch_lightning as pl  # type: ignore
             from pytorch_lightning.callbacks import (  # type: ignore
                 Callback,
-                EarlyStopping as PLEarlyStopping,
                 ModelCheckpoint,
             )
+            from pytorch_lightning.callbacks import (
+                EarlyStopping as PLEarlyStopping,
+            )
             from pytorch_lightning.loggers import CSVLogger  # type: ignore
-            from timesim.training.lightning_module import WorldModelLightningModule
+
             from timesim.training.health_check import TrainingHealthCheck
+            from timesim.training.lightning_module import WorldModelLightningModule
         except Exception as exc:
             if allow_engine_fallback:
                 print(
@@ -595,7 +600,7 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
                     tr = self._metric(trainer, "train/loss")
                     if np.isfinite(tr):
                         self.train_losses.append(float(tr))
-                
+
                 def on_validation_epoch_end(self, trainer, pl_module):
                     metrics = trainer.callback_metrics
                     vl = metrics.get("val/loss")
@@ -780,18 +785,18 @@ def train_neural_model(model, train_dataset, val_dataset, config, device,
                     train_loss = self._metric(trainer, "train/loss")
                     val_loss = self._metric(trainer, "val/loss")
                     open_loop = self._metric(trainer, "val/open_loop_crps")
-                    loss_std = self._metric(trainer, "train/loss_std")
+                    self._metric(trainer, "train/loss_std")
                     recon = self._metric(trainer, "train/recon")
                     aux = self._metric(trainer, "train/aux_nll")
                     kl_mean = self._metric(trainer, "train/kl_mean")
-                    kl_raw = self._metric(trainer, "train/kl_raw")
+                    self._metric(trainer, "train/kl_raw")
                     kl_active = self._metric(trainer, "train/kl_active")
                     dec_std_mean = self._metric(trainer, "train/decoder_std_mean")
                     dec_std_min = self._metric(trainer, "train/dec_std_min")
                     prior_std_mean = self._metric(trainer, "train/prior_std_mean")
-                    prior_std_max = self._metric(trainer, "train/prior_std_max")
+                    self._metric(trainer, "train/prior_std_max")
                     post_std_mean = self._metric(trainer, "train/posterior_std_mean")
-                    post_std_max = self._metric(trainer, "train/posterior_std_max")
+                    self._metric(trainer, "train/posterior_std_max")
                     rollout_nll = self._metric(trainer, "train/rollout_nll")
                     horizon = self._metric(trainer, "train/horizon")
                     ramp = self._metric(trainer, "train/rollout_ramp")
@@ -1814,7 +1819,7 @@ def main(config: Optional[Dict[str, Any]] = None) -> None:
     )
     print(f"  Rows: {len(df)}, Columns: {list(df.columns)}")
 
-    train_loader, val_loader, scaler = build_dataloaders_from_config(
+    train_loader, val_loader, _test_loader, scaler = build_dataloaders_from_config(
         config=config,
         df=df,
         seed=seed,
@@ -2365,7 +2370,7 @@ def main(config: Optional[Dict[str, Any]] = None) -> None:
 
             except Exception as exc:
                 print(f"  ERROR: {exc}")
-                import traceback; traceback.print_exc()
+                traceback.print_exc()
 
     # ── Cumulative loss plots ─────────────────────────────────────────
     for model_type in trained_models:

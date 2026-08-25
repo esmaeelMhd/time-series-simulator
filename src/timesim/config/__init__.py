@@ -3,8 +3,8 @@
 from .structured import (
     DatasetConfig,
     ModelConfig,
-    TrainingConfig,
     TrainConfigSchema,
+    TrainingConfig,
     VariableGroupsConfig,
     coerce_and_validate_train_cfg,
 )

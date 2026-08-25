@@ -1,22 +1,24 @@
 """Training infrastructure for world models."""
 
 from .losses import (
-    OneStepLoss,
-    MultiStepLoss,
     CombinedLoss,
+    MultiStepLoss,
+    OneStepLoss,
     ProbabilisticRolloutLoss,
     dilate_loss,
+    shape_and_temporal_loss,
 )
+from .retrainer import EpisodeSampler, Retrainer
 from .rollout import (
     batch_rollout,
     batch_rollout_padded,
     rollout_autoregressive,
 )
 from .trainer import (
-    WorldModelTrainer,
     Trainer,
+    WorldModelTrainer,
 )
-from .retrainer import Retrainer, EpisodeSampler
+
 try:
     from .lightning_module import WorldModelLightningModule
 except ImportError:  # optional dependency: pytorch-lightning
@@ -33,6 +35,7 @@ __all__ = [
     "MultiStepLoss",
     "CombinedLoss",
     "ProbabilisticRolloutLoss",
+    "shape_and_temporal_loss",
     "dilate_loss",
     "batch_rollout",
     "batch_rollout_padded",

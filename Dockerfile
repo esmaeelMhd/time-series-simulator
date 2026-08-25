@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-ARG REQUIREMENTS_FILE="requirements.txt"
+ARG REQUIREMENTS_FILE="requirements.cpu.txt"
 ARG PIP_EXTRA_INDEX_URL=""
 
 COPY requirements*.txt /app/

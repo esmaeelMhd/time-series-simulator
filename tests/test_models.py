@@ -1,12 +1,10 @@
 """Tests for world models."""
 
-import numpy as np
-import torch
 import pytest
+import torch
 
-from timesim.models.base import WorldModelBase
-from timesim.models.lstm import LSTMWorldModel
 from timesim.models.latent_ssm import LatentSSMWorldModel
+from timesim.models.lstm import LSTMWorldModel
 
 
 def test_lstm_world_model_init():
@@ -17,7 +15,7 @@ def test_lstm_world_model_init():
         hidden_dim=32,
         num_layers=2,
     )
-    
+
     assert model.input_dim == 10
     assert model.output_dim == 3
     assert model.hidden_dim == 32
@@ -27,13 +25,13 @@ def test_lstm_world_model_init():
 def test_lstm_init_state():
     """Test LSTM state initialization from warmup."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16, num_layers=2)
-    
+
     batch_size = 4
     warmup_len = 10
     warmup_seq = torch.randn(batch_size, warmup_len, 5)
-    
+
     h, c = model.init_state(warmup_seq)
-    
+
     # Check shapes
     assert h.shape == (2, batch_size, 16)  # (num_layers, batch, hidden)
     assert c.shape == (2, batch_size, 16)
@@ -43,26 +41,26 @@ def test_lstm_step():
     """Test single-step prediction."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
     model.eval()
-    
+
     batch_size = 3
     control_dim = 2
     exo_dim = 1
     output_dim = 2
-    
+
     # Initialize state
     warmup_seq = torch.randn(batch_size, 10, 5)
     state = model.init_state(warmup_seq)
-    
+
     # Single step
     control_t = torch.randn(batch_size, control_dim)
     exo_t = torch.randn(batch_size, exo_dim)
     prev_output_t = torch.randn(batch_size, output_dim)
-    
+
     new_state, pred = model.step(state, control_t, exo_t, prev_output_t)
-    
+
     # Check output shape
     assert pred.shape == (batch_size, output_dim)
-    
+
     # Check that state was updated
     h_new, c_new = new_state
     h_old, c_old = state
@@ -73,23 +71,23 @@ def test_lstm_rollout_model_feedback():
     """Test multi-step rollout with model feedback."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
     model.eval()
-    
+
     batch_size = 2
     warmup_len = 10
     horizon = 15
     control_dim = 2
     exo_dim = 1
-    
+
     # Prepare inputs
     warmup_seq = {
         "inputs": torch.randn(batch_size, warmup_len, 5)
     }
-    
+
     rollout_inputs = {
         "controls": torch.randn(batch_size, horizon, control_dim),
         "exogenous": torch.randn(batch_size, horizon, exo_dim),
     }
-    
+
     # Rollout
     with torch.no_grad():
         result = model.rollout(
@@ -98,7 +96,7 @@ def test_lstm_rollout_model_feedback():
             horizon=horizon,
             feedback="model",
         )
-    
+
     # Check output
     assert "predictions" in result
     assert result["predictions"].shape == (batch_size, horizon, 2)
@@ -108,18 +106,18 @@ def test_lstm_rollout_teacher_forcing():
     """Test multi-step rollout with teacher forcing."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
     model.eval()
-    
+
     batch_size = 2
     warmup_len = 10
     horizon = 15
-    
+
     warmup_seq = {"inputs": torch.randn(batch_size, warmup_len, 5)}
     rollout_inputs = {
         "controls": torch.randn(batch_size, horizon, 2),
         "exogenous": torch.randn(batch_size, horizon, 1),
     }
     targets = torch.randn(batch_size, horizon, 2)
-    
+
     with torch.no_grad():
         result = model.rollout(
             warmup_seq=warmup_seq,
@@ -128,7 +126,7 @@ def test_lstm_rollout_teacher_forcing():
             feedback="teacher",
             targets=targets,
         )
-    
+
     assert result["predictions"].shape == (batch_size, horizon, 2)
 
 
@@ -136,17 +134,17 @@ def test_lstm_rollout_mixed_feedback():
     """Test rollout with mixed (scheduled sampling) feedback."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
     model.eval()
-    
+
     batch_size = 2
     horizon = 10
-    
+
     warmup_seq = {"inputs": torch.randn(batch_size, 10, 5)}
     rollout_inputs = {
         "controls": torch.randn(batch_size, horizon, 2),
         "exogenous": torch.randn(batch_size, horizon, 1),
     }
     targets = torch.randn(batch_size, horizon, 2)
-    
+
     with torch.no_grad():
         result = model.rollout(
             warmup_seq=warmup_seq,
@@ -156,20 +154,20 @@ def test_lstm_rollout_mixed_feedback():
             teacher_forcing_ratio=0.5,
             targets=targets,
         )
-    
+
     assert result["predictions"].shape == (batch_size, horizon, 2)
 
 
 def test_lstm_forward_backward_compatibility():
     """Test that forward() method works for backward compatibility."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16, pred_len=3)
-    
+
     batch_size = 4
     seq_len = 20
     x = torch.randn(batch_size, seq_len, 5)
-    
+
     pred = model(x)
-    
+
     # Check output shape
     assert pred.shape == (batch_size, 3, 2)  # (batch, pred_len, output_dim)
 
@@ -178,20 +176,20 @@ def test_lstm_deterministic_with_seed():
     """Test that model is deterministic with fixed seed."""
     torch.manual_seed(42)
     model1 = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
-    
+
     torch.manual_seed(42)
     model2 = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
-    
+
     # Same input
     x = torch.randn(2, 10, 5)
-    
+
     model1.eval()
     model2.eval()
-    
+
     with torch.no_grad():
         out1 = model1(x)
         out2 = model2(x)
-    
+
     # Should be identical
     assert torch.allclose(out1, out2)
 
@@ -200,12 +198,12 @@ def test_lstm_gradient_flow():
     """Test that gradients flow through the model."""
     model = LSTMWorldModel(input_dim=5, output_dim=2, hidden_dim=16)
     model.train()
-    
+
     x = torch.randn(2, 10, 5, requires_grad=True)
     pred = model(x)
     loss = pred.sum()
     loss.backward()
-    
+
     # Check that gradients exist
     assert x.grad is not None
     for param in model.parameters():
@@ -246,7 +244,9 @@ def test_latent_ssm_rollout_shapes_and_finiteness():
     assert out["dist_scale"].shape == (batch_size, horizon, 2)
     assert out["dist_df"].shape == (batch_size, horizon, 2)
     assert out["kl_terms"].shape == (batch_size, horizon)
-    assert torch.isfinite(out["kl_terms"]).all()
+    assert torch.isnan(out["kl_terms"]).all()
+    assert torch.isfinite(out["predictions"]).all()
+    assert torch.isfinite(out["dist_scale"]).all()
     assert torch.all(out["dist_scale"] > 0.0)
     assert torch.all(out["dist_df"] > 2.0)
 
@@ -301,8 +301,9 @@ def test_latent_ssm_no_posterior_leakage_in_model_feedback():
             feedback="model",
             targets=targets,
         )
-    # In model-feedback mode we should infer from prior only; KL should stay zero.
-    assert torch.allclose(out["kl_terms"], torch.zeros_like(out["kl_terms"]))
+    # Model-feedback uses prior only; posterior/KL stats are NaN sentinels, not zeros.
+    assert torch.isnan(out["kl_terms"]).all()
+    assert torch.isnan(out["posterior_mu"]).all()
 
 
 def test_latent_ssm_observe_imagine_api_shapes():
@@ -341,6 +342,18 @@ def test_latent_ssm_observe_imagine_api_shapes():
     assert imagined["std"].shape == (bsz, horizon, 2)
 
 
+def _condition_then_simulate(model, history_controls, history_exo, history_y, future_controls, future_exo, n_steps, n_samples):
+    observed = model.observe(history_controls, history_exo, history_y, sample_posterior=False)
+    return model.imagine(
+        initial_state=observed["state"],
+        future_controls=future_controls,
+        future_exogenous=future_exo,
+        n_steps=n_steps,
+        n_samples=n_samples,
+        sample_latent=False,
+    )
+
+
 def test_latent_ssm_controls_and_exogenous_change_imagination():
     model = LatentSSMWorldModel(
         input_dim=5,
@@ -357,7 +370,8 @@ def test_latent_ssm_controls_and_exogenous_change_imagination():
     future_exo = torch.randn(bsz, horizon, 1)
 
     with torch.no_grad():
-        base = model.condition_then_simulate(
+        base = _condition_then_simulate(
+            model,
             history_controls,
             history_exo,
             history_y,
@@ -366,7 +380,8 @@ def test_latent_ssm_controls_and_exogenous_change_imagination():
             n_steps=horizon,
             n_samples=1,
         )
-        ctrl_changed = model.condition_then_simulate(
+        ctrl_changed = _condition_then_simulate(
+            model,
             history_controls,
             history_exo,
             history_y,
@@ -375,7 +390,8 @@ def test_latent_ssm_controls_and_exogenous_change_imagination():
             n_steps=horizon,
             n_samples=1,
         )
-        exo_changed = model.condition_then_simulate(
+        exo_changed = _condition_then_simulate(
+            model,
             history_controls,
             history_exo,
             history_y,
@@ -427,7 +443,8 @@ def test_latent_ssm_single_path_ablation_runs():
     future_controls = torch.randn(bsz, horizon, 2)
     future_exo = torch.randn(bsz, horizon, 1)
     with torch.no_grad():
-        out = model.condition_then_simulate(
+        out = _condition_then_simulate(
+            model,
             history_controls,
             history_exo,
             history_y,

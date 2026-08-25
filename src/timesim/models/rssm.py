@@ -182,7 +182,7 @@ class RSSMCell(nn.Module):
                 hidden_dim=self.dim_h,
                 min_std=self.min_std,
                 max_std=self.max_std,
-                constant_std=0.1 if self.prior_constant_std is None else self.prior_constant_std,
+                constant_std=self.prior_constant_std,
             )
             self.posterior_head = RSSMGaussianHead(
                 in_dim=self.dim_h + self.dim_obs_embed,
@@ -190,7 +190,7 @@ class RSSMCell(nn.Module):
                 hidden_dim=self.dim_h,
                 min_std=self.min_std,
                 max_std=self.max_std,
-                constant_std=0.1 if self.posterior_constant_std is None else self.posterior_constant_std,
+                constant_std=self.posterior_constant_std,
             )
 
     def initial_state(

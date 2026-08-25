@@ -9,12 +9,14 @@ Design constraints enforced (default configuration):
 
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional, Tuple
 import logging
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+from ..utils.symlog import symexp as _symexp
+from ..utils.symlog import symlog as _symlog
 from .base import WorldModelBase
 from .decoders import AuxiliaryDecoder, ObjectiveDecoder
 from .distributions import diagonal_independent_normal, fast_sample
@@ -96,8 +98,8 @@ class LatentSSMWorldModel(WorldModelBase):
         else:
             raw_min_std = float(decoder_min_std)
         dec_max_std_cfg = float(max_std if decoder_max_std is None else decoder_max_std)
-        # Decoder std bounds.
-        self.min_std = float(max(0.5, raw_min_std))
+        # Decoder std bounds: honoured exactly as configured (non-negativity only).
+        self.min_std = float(max(0.0, raw_min_std))
         self.max_std = float(max(self.min_std, dec_max_std_cfg))
         # Latent prior/posterior std bounds.
         self.prior_min_std = float(max(0.0, float(prior_min_std)))
@@ -224,6 +226,8 @@ class LatentSSMWorldModel(WorldModelBase):
         else:
             self._aux_decoder_hidden = None
         self._aux_decoder_heads = nn.ModuleDict()
+        if self.decode_exogenous and self.exogenous_dim is not None and int(self.exogenous_dim) > 0:
+            self._get_aux_head(int(self.exogenous_dim))
 
     def _assert_encoder_independence(self) -> None:
         assert_no_shared_encoder_params(
@@ -243,11 +247,11 @@ class LatentSSMWorldModel(WorldModelBase):
 
     @staticmethod
     def symlog(x: torch.Tensor) -> torch.Tensor:
-        return torch.sign(x) * torch.log1p(torch.abs(x))
+        return _symlog(x)
 
     @staticmethod
     def symexp(x: torch.Tensor) -> torch.Tensor:
-        return torch.sign(x) * (torch.expm1(torch.abs(x)))
+        return _symexp(x)
 
     @staticmethod
     def _stack_or_empty(buffers, batch: int, time: int, dim: int, device: torch.device, dtype: torch.dtype):
@@ -1150,7 +1154,11 @@ class LatentSSMWorldModel(WorldModelBase):
                 )
                 z_t = teacher_mask * post_s + (1.0 - teacher_mask) * prior_s
             else:
-                z_t = teacher_mask * post_mu + (1.0 - teacher_mask) * prior_mu
+                post_std = torch.exp(0.5 * post_logvar).clamp_min(1e-6)
+                prior_std = torch.exp(0.5 * prior_logvar).clamp_min(1e-6)
+                post_z = post_mu + post_std * torch.randn_like(post_mu)
+                prior_z = prior_mu + prior_std * torch.randn_like(prior_mu)
+                z_t = teacher_mask * post_z + (1.0 - teacher_mask) * prior_z
 
             y_dist, y_dist_latent, y_loc, y_scale, y_loc_latent = self._decode_obs(h_t, z_t)
             x_dist, x_loc, x_scale = self._decode_exogenous(h_t, z_t, exo_dim)
@@ -1244,7 +1252,7 @@ class LatentSSMWorldModel(WorldModelBase):
                 exogenous=exogenous,
                 observations=targets[:, :horizon, :],
                 initial_state=state0,
-                sample_posterior=(self.latent_distribution == "categorical"),
+                sample_posterior=True,
             )
             return {
                 "predictions": posterior["predictions"],
@@ -1294,19 +1302,26 @@ class LatentSSMWorldModel(WorldModelBase):
         prior_logits = imagined.get("prior_logits")
         aux_loc = imagined["aux_loc"]
         aux_scale = imagined["aux_scale"]
+        nan_latents = torch.full_like(prior_mu, float("nan"))
+        nan_kl = torch.full(
+            (preds.shape[0], preds.shape[1]),
+            float("nan"),
+            device=preds.device,
+            dtype=preds.dtype,
+        )
         return {
             "predictions": preds,
             "dist_loc": preds,
             "dist_loc_latent": dist_loc_latent,
             "dist_scale": dist_scale,
             "dist_df": torch.full_like(dist_scale, fill_value=self.min_df + 0.5),
-            "kl_terms": torch.zeros(preds.shape[0], preds.shape[1], device=preds.device, dtype=preds.dtype),
+            "kl_terms": nan_kl,
             "prior_mu": prior_mu,
             "prior_logvar": prior_logvar,
-            "posterior_mu": torch.zeros_like(prior_mu),
-            "posterior_logvar": torch.zeros_like(prior_logvar),
+            "posterior_mu": nan_latents,
+            "posterior_logvar": nan_latents,
             "prior_logits": prior_logits,
-            "posterior_logits": (torch.zeros_like(prior_logits) if torch.is_tensor(prior_logits) else None),
+            "posterior_logits": None,
             "aux_loc": aux_loc,
             "aux_scale": aux_scale,
             "objective_dists": imagined.get("objective_dists", []),
@@ -1345,6 +1360,9 @@ class LatentSSMWorldModel(WorldModelBase):
         )
         samples = imagined["samples"]
         assert isinstance(samples, torch.Tensor)
+        dist_scale_samples = imagined.get("dist_scale_samples")
+        if torch.is_tensor(dist_scale_samples):
+            samples = samples + dist_scale_samples * torch.randn_like(samples)
 
         alpha = max(0.0, min(1.0, float(interval_level)))
         lo_q = (1.0 - alpha) / 2.0

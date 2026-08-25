@@ -9,34 +9,35 @@ Performance optimizations applied:
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Optional, Literal, Callable, Dict, Any
-import time
-import math
 import logging
+import math
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, Literal, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
 
 from ..data.dataset import GroupedTimeSeriesDataset
-from ..data.sampling import SamplingStrategy, RandomStartFixedHorizon
+from ..data.sampling import RandomStartFixedHorizon, SamplingStrategy
 from ..models.base import WorldModelBase
 from ..utils.early_stop import EarlyStopping
 from .losses import (
-    OneStepLoss,
-    MultiStepLoss,
     CombinedLoss,
+    MultiStepLoss,
+    OneStepLoss,
     ProbabilisticRolloutLoss,
     soft_dtw_distance,
 )
-from .rollout import batch_rollout_padded
+from .rollout import batch_rollout_padded, get_rollout_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ class WorldModelTrainer:
     writer : SummaryWriter, optional
         TensorBoard writer for logging.
     """
-    
+
     def __init__(
         self,
         model: WorldModelBase,
@@ -144,7 +145,7 @@ class WorldModelTrainer:
         self.use_amp = use_amp
         self.is_probabilistic_model = bool(getattr(self.model, "is_probabilistic", False))
         self.disable_aux_loss = not bool(getattr(self.model, "use_aux_decoder", True))
-        
+
         # Device setup
         if use_gpu:
             # Automatically use GPU if available
@@ -185,7 +186,7 @@ class WorldModelTrainer:
             self.sampling_strategy = RandomStartFixedHorizon(horizon=dataset.pred_len)
         else:
             self.sampling_strategy = sampling_strategy
-        
+
         # Loss function
         if training_mode == "one_step":
             self.loss_fn = OneStepLoss(
@@ -312,13 +313,13 @@ class WorldModelTrainer:
         self._base_lrs = [float(pg.get("lr", 1e-3)) for pg in self.optimizer.param_groups]
         self._global_step = 0
         self._total_train_steps = 1
-        
+
         # Early stopping
         self.early_stopping = (
             EarlyStopping(patience=patience, min_delta=min_delta)
             if early_stopping else None
         )
-        
+
         # Logging
         self.run_dir = Path(run_dir) if run_dir else None
         if self.run_dir:
@@ -331,7 +332,7 @@ class WorldModelTrainer:
                     self.writer = SummaryWriter(log_dir=self.run_dir)
                 except ModuleNotFoundError:
                     self.writer = None
-            
+
             # CSV metrics file
             self.metrics_path = self.run_dir / "metrics.csv"
             if not self.metrics_path.exists():
@@ -345,10 +346,12 @@ class WorldModelTrainer:
         else:
             self.writer = writer
             self.metrics_path = None
-        
+
         # Random number generator for reproducibility
         self.seed = None if seed is None else int(seed)
         self.rng = np.random.default_rng(self.seed)
+        self._val_rng = np.random.default_rng(None if self.seed is None else self.seed + 10_007)
+        self._val_windows: Optional[list[tuple[np.ndarray, np.ndarray]]] = None
         self.checkpoint_metadata: Dict[str, Any] = dict(checkpoint_metadata or {})
         # Do not trigger early stopping before this epoch (helps avoid premature stops during curriculum warmup).
         # Keep backward compatibility with older configs using early_stopping_start_epoch.
@@ -360,32 +363,25 @@ class WorldModelTrainer:
 
     def _rollout_schedule(self) -> tuple[int, int, float]:
         """Return (horizon, context_len, ramp_factor) for rollout losses."""
-        ep = int(self._current_epoch)
-        max_h = int(self.rollout_max_horizon)
-        if ep <= int(self.rollout_start_epoch):
-            sched_horizon = 0
-        elif ep <= int(self.rollout_full_epoch):
-            denom = max(1, int(self.rollout_full_epoch) - int(self.rollout_start_epoch))
-            progress = float(ep - int(self.rollout_start_epoch)) / float(denom)
-            sched_horizon = max(2, int(progress * float(max_h)))
-        else:
-            sched_horizon = max_h
-
-        seq_len = int(self.warmup_len)
-        sched_horizon = min(int(sched_horizon), max(0, seq_len - int(self.min_context)))
-        context_len = max(int(self.min_context), seq_len - int(sched_horizon))
-        sched_horizon = max(0, int(seq_len) - int(context_len))
-        ramp = self._current_rollout_ramp()
-        return sched_horizon, context_len, float(ramp)
+        cfg: Dict[str, Any] = {
+            "rollout_start_epoch": self.rollout_start_epoch,
+            "rollout_full_epoch": self.rollout_full_epoch,
+            "rollout_max_horizon": self.rollout_max_horizon,
+            "min_context": self.min_context,
+        }
+        if self.sequence_curriculum_enabled:
+            cfg["sequence_curriculum"] = {
+                "start_epoch": self.curriculum_start_epoch,
+                "max_epoch": self.curriculum_max_epoch,
+                "start_horizon": self.curriculum_start_horizon,
+                "target_horizon": self.curriculum_target_horizon,
+            }
+        return get_rollout_schedule(epoch=int(self._current_epoch), cfg=cfg)
 
     def _current_rollout_ramp(self) -> float:
-        """Rollout loss ramp: 1-4 -> 0.0, 5-15 linear, 16+ -> 1.0."""
-        ep = int(self._current_epoch)
-        if ep <= 4:
-            return 0.0
-        if ep <= 15:
-            return min(1.0, float(ep - 4) / float(15 - 4))
-        return 1.0
+        """Rollout loss ramp driven by rollout_start_epoch / rollout_full_epoch."""
+        _, _, ramp = self._rollout_schedule()
+        return float(ramp)
 
     def _current_kl_beta(self) -> float:
         """Current effective KL weight with optional linear warmup."""
@@ -476,7 +472,37 @@ class WorldModelTrainer:
         if val_loss is None or not np.isfinite(val_loss):
             return float("inf"), "val_loss"
         return float(val_loss), "val_loss"
-    
+
+    def _get_val_windows(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Fixed, deterministic validation windows (do not consume the training RNG)."""
+        if self._val_windows is None:
+            n_series = len(self.val_dataset.values)
+            val_batches = max(1, n_series // max(1, self.batch_size))
+            val_batches = min(val_batches, 8)
+            windows: list[tuple[np.ndarray, np.ndarray]] = []
+            for _ in range(val_batches):
+                start_indices, horizons = self.sampling_strategy.sample(
+                    dataset_length=n_series,
+                    batch_size=self.batch_size,
+                    warmup_len=self.warmup_len,
+                    rng=self._val_rng,
+                )
+                windows.append((start_indices, horizons))
+            self._val_windows = windows
+        return self._val_windows
+
+    def _masked_prediction_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean loss over valid (non-padded) steps only."""
+        mask_f = mask.to(dtype=predictions.dtype).unsqueeze(-1)
+        per_elem = (predictions - targets) ** 2
+        denom = mask_f.sum() * predictions.shape[-1]
+        return (per_elem * mask_f).sum() / denom.clamp_min(1.0)
+
     def _train_step(self) -> float:
         """Perform one training step (one batch of rollouts).
         
@@ -487,7 +513,7 @@ class WorldModelTrainer:
         """
         self.model.train()
         self._update_learning_rate()
-        
+
         # Sample rollout starting points and horizons
         start_indices, horizons = self.sampling_strategy.sample(
             dataset_length=len(self.dataset.values),
@@ -500,7 +526,7 @@ class WorldModelTrainer:
         effective_rollout_weight = max(0.0, self.rollout_weight * rollout_ramp)
 
         self.optimizer.zero_grad(set_to_none=True)
-        
+
         # Perform batched rollouts
         with torch.autocast(
             device_type=self.device.type,
@@ -723,16 +749,16 @@ class WorldModelTrainer:
                     self.model, self.dataset, start_indices, horizons,
                     self.warmup_len, feedback="model", device=self.device
                 )
-                
+
                 predictions_teacher = result_teacher["predictions"]
                 predictions_model = result_model["predictions"]
                 targets = result_teacher["targets"]
                 mask = result_teacher["mask"]
-                
+
                 # Compute loss
                 loss, info = self.loss_fn(predictions_teacher, predictions_model, targets)
                 self._last_prob_info = {}
-                
+
             else:
                 # Single rollout mode
                 result = batch_rollout_padded(
@@ -741,25 +767,25 @@ class WorldModelTrainer:
                     teacher_forcing_ratio=self.teacher_forcing_ratio,
                     device=self.device
                 )
-                
+
                 predictions = result["predictions"]
                 targets = result["targets"]
                 mask = result["mask"]
-                
+
                 # Mask out padded values for loss computation
                 # Expand mask to match output dimensions
                 mask_expanded = mask.unsqueeze(-1).expand_as(predictions)
                 predictions_masked = predictions * mask_expanded
                 targets_masked = targets * mask_expanded
-                
+
                 # Compute loss
                 loss = self.loss_fn(predictions_masked, targets_masked)
                 self._last_prob_info = {}
-        
+
         # Guard against NaN/Inf
         if torch.isnan(loss) or torch.isinf(loss):
             raise ValueError("NaN/Inf in training loss. Check data and model stability.")
-        
+
         # Backward pass
         grad_norm_value = float("nan")
         grad_norm_preclip = float("nan")
@@ -828,9 +854,9 @@ class WorldModelTrainer:
                     if key in self._last_prob_info:
                         self.writer.add_scalar(f"Train/{key}", self._last_prob_info[key], gs)
         self._global_step += 1
-        
+
         return loss.item()
-    
+
     @torch.no_grad()
     def _validate(self) -> Optional[float]:
         """Validate on validation dataset.
@@ -842,24 +868,16 @@ class WorldModelTrainer:
         """
         if self.val_dataset is None:
             return None
-        
+
         self.model.eval()
-        
-        # Sample validation rollouts
-        val_batches = max(1, len(self.val_dataset) // (self.batch_size * self.warmup_len))
+
         val_losses = []
         sched_horizon, context_len, rollout_ramp = self._rollout_schedule()
         effective_rollout_weight = max(0.0, self.rollout_weight * rollout_ramp)
-        
-        for _ in range(val_batches):
-            start_indices, horizons = self.sampling_strategy.sample(
-                dataset_length=len(self.val_dataset.values),
-                batch_size=self.batch_size,
-                warmup_len=self.warmup_len,
-                rng=self.rng,
-            )
-            horizons = self._apply_horizon_curriculum(horizons)
-            
+
+        for start_indices, horizons0 in self._get_val_windows():
+            horizons = self._apply_horizon_curriculum(horizons0)
+
             with torch.autocast(
                 device_type=self.device.type,
                 dtype=self.amp_dtype,
@@ -918,7 +936,7 @@ class WorldModelTrainer:
                         prior_logvar = torch.zeros_like(prior_logits)
                         posterior_mu = posterior_logits
                         posterior_logvar = torch.zeros_like(posterior_logits)
-                    kl_beta = self._current_kl_beta()
+                    self._current_kl_beta()
                     loss, _ = self.probabilistic_loss_fn(
                         targets=targets,
                         dist_loc_latent=dist_loc_latent,
@@ -1004,23 +1022,12 @@ class WorldModelTrainer:
                     predictions = result["predictions"]
                     targets = result["targets"]
                     mask = result["mask"]
+                    loss = self._masked_prediction_loss(predictions, targets, mask)
 
-                    # Mask out padded values
-                    mask_expanded = mask.unsqueeze(-1).expand_as(predictions)
-                    predictions_masked = predictions * mask_expanded
-                    targets_masked = targets * mask_expanded
-
-                    # Compute loss
-                    if self.training_mode == "combined":
-                        # For validation, just use multi-step loss
-                        loss = self._val_multi_step_loss(predictions_masked, targets_masked)
-                    else:
-                        loss = self.loss_fn(predictions_masked, targets_masked)
-            
             val_losses.append(loss.item())
-        
+
         return np.mean(val_losses)
-    
+
     def fit(
         self,
         epochs: int = 10,
@@ -1059,13 +1066,13 @@ class WorldModelTrainer:
             steps_per_epoch = max(1, dataset_len // self.batch_size)
         self._total_train_steps = max(1, int(epochs) * int(steps_per_epoch))
         self._global_step = 0
-        
+
         if verbose:
             logger.info(f"\n{'='*70}")
             logger.info(f"Starting training: {epochs} epochs, {steps_per_epoch} steps/epoch")
             logger.info(f"Batch size: {self.batch_size}, Training mode: {self.training_mode}")
             logger.info(f"{'='*70}\n")
-        
+
         train_losses = []
         val_losses = []
         start_time = time.time()
@@ -1085,7 +1092,7 @@ class WorldModelTrainer:
             checkpoint_target.parent.mkdir(parents=True, exist_ok=True)
             checkpoint_bundle_dir = checkpoint_target.parent / "checkpoints"
             checkpoint_bundle_dir.mkdir(parents=True, exist_ok=True)
-        
+
         for epoch in range(1, epochs + 1):
             self._fit_epochs = epochs
             self._current_epoch = epoch
@@ -1101,7 +1108,7 @@ class WorldModelTrainer:
                         f"{self._current_curriculum_horizon()} "
                         f"(start={self.curriculum_start_horizon}, target={self.curriculum_target_horizon})"
                     )
-            
+
             # Training
             self.model.train()
             epoch_losses = []
@@ -1133,7 +1140,7 @@ class WorldModelTrainer:
                 "grad_norm_pre": [],
                 "lr": [],
             }
-            
+
             if verbose:
                 # Create progress bar for training steps
                 pbar = tqdm(
@@ -1145,7 +1152,7 @@ class WorldModelTrainer:
                 )
             else:
                 pbar = range(steps_per_epoch)
-            
+
             for step in pbar:
                 batch_loss = self._train_step()
                 epoch_losses.append(batch_loss)
@@ -1157,12 +1164,12 @@ class WorldModelTrainer:
                         v = self._last_prob_info.get(k)
                         if v is not None and np.isfinite(v):
                             epoch_prob_stats[k].append(float(v))
-                
+
                 if verbose:
                     # Update progress bar with current loss
                     current_avg_loss = np.mean(epoch_losses)
                     pbar.set_postfix({"loss": f"{current_avg_loss:.4f}"})
-            
+
             train_loss = np.mean(epoch_losses)
             train_losses.append(train_loss)
             mean_epoch_kl = float(np.mean(epoch_kl_values)) if epoch_kl_values else float("nan")
@@ -1177,7 +1184,7 @@ class WorldModelTrainer:
                         f"(mean KL {mean_epoch_kl:.4f} < {self.collapse_kl_threshold:.4f} "
                         f"for {self._collapse_counter} epoch(s))."
                     )
-            
+
             # Validation
             if verbose:
                 logger.info("  Validating...")
@@ -1275,14 +1282,14 @@ class WorldModelTrainer:
                                 rm_path.unlink(missing_ok=True)
                             except Exception:
                                 pass
-            
+
             epoch_time = time.time() - epoch_start_time
             epoch_times.append(epoch_time)
-            elapsed_time = time.time() - start_time
+            time.time() - start_time
             avg_epoch_time = np.mean(epoch_times)
             remaining_epochs = epochs - epoch
             eta = avg_epoch_time * remaining_epochs if remaining_epochs > 0 else 0
-            
+
             # Logging - now print every epoch when verbose
             if verbose:
                 msg = f"[Epoch {epoch}/{epochs}] "
@@ -1346,7 +1353,7 @@ class WorldModelTrainer:
                 if epoch > 1:
                     msg += f" | ETA={eta:.1f}s"
                 logger.info(msg)
-            
+
             if self.writer is not None:
                 self.writer.add_scalar("Loss/train", train_loss, epoch)
                 if val_loss is not None:
@@ -1364,7 +1371,7 @@ class WorldModelTrainer:
                         if vals:
                             self.writer.add_scalar(f"Epoch/{k}", float(np.mean(vals)), epoch)
                 self.writer.add_scalar("Time/epoch", epoch_time, epoch)
-            
+
             if self.metrics_path is not None:
                 def _m(name: str) -> str:
                     vals = epoch_prob_stats.get(name, [])
@@ -1383,7 +1390,7 @@ class WorldModelTrainer:
                         f"{_m('rollout_weight_eff')},{_m('rollout_ramp')},"
                         f"{_m('horizon_schedule')},{_m('grad_norm')},{_m('grad_norm_pre')},{_m('lr')}\n"
                     )
-            
+
             # Early stopping with min-epoch gate.
             if self.early_stopping:
                 if int(self._current_epoch) < int(self.early_stopping_min_epoch):
@@ -1429,10 +1436,10 @@ class WorldModelTrainer:
             self.model.load_state_dict(best_state_dict)
 
         total_time = time.time() - start_time
-        
+
         if verbose:
             logger.info(f"\n{'='*70}")
-            logger.info(f"Training completed!")
+            logger.info("Training completed!")
             logger.info(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
             logger.info(f"Average epoch time: {np.mean(epoch_times):.2f}s")
             if len(train_losses) > 0:
@@ -1452,9 +1459,9 @@ class WorldModelTrainer:
                         f"{checkpoint_bundle_dir}"
                     )
             logger.info(f"{'='*70}\n")
-        
+
         return train_losses, val_losses
-    
+
     def save(self, path: str | Path):
         """Save model checkpoint.
         
@@ -1464,7 +1471,7 @@ class WorldModelTrainer:
             Path to save checkpoint.
         """
         torch.save(self.model.state_dict(), path)
-    
+
     def load(self, path: str | Path):
         """Load model checkpoint.
         
@@ -1488,7 +1495,7 @@ class Trainer(nn.Module):
     This maintains the old Trainer interface for existing code.
     For new code, use WorldModelTrainer instead.
     """
-    
+
     def __init__(
         self,
         model: nn.Module,
@@ -1504,18 +1511,18 @@ class Trainer(nn.Module):
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
-        
+
         if loss == "mse":
             self.loss_fn = nn.MSELoss()
         elif loss == "dilate":
             self.loss_fn = None  # Will use dilate_loss function
         else:
             raise ValueError("loss must be mse or dilate")
-        
+
         self.optimizer = optimizer or torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.loss_type = loss
         self.early_stopping = EarlyStopping(patience=patience) if early_stopping else None
-        
+
         # Logging
         self.run_dir = Path(run_dir) if run_dir else None
         if self.run_dir:
@@ -1528,7 +1535,7 @@ class Trainer(nn.Module):
                     self.writer = SummaryWriter(log_dir=self.run_dir)
                 except ModuleNotFoundError:
                     self.writer = None
-            
+
             self.metrics_path = self.run_dir / "metrics.csv"
             if not self.metrics_path.exists():
                 with open(self.metrics_path, "w", encoding="utf-8") as f:
@@ -1536,26 +1543,26 @@ class Trainer(nn.Module):
         else:
             self.writer = writer
             self.metrics_path = None
-    
+
     def _step(self, batch: tuple[torch.Tensor, torch.Tensor]):
         x, y = batch
         x, y = x.to(self.device), y.to(self.device)
         self.optimizer.zero_grad()
         pred = self.model(x)
-        
+
         if self.loss_type == "mse":
             loss = self.loss_fn(pred, y)
         else:
             from ..utils.dilate import dilate_loss
             loss, _, _ = dilate_loss(y, pred, device=self.device)
-        
+
         if torch.isnan(loss) or torch.isinf(loss):
             raise ValueError("NaN/Inf in training loss.")
-        
+
         loss.backward()
         self.optimizer.step()
         return loss.item()
-    
+
     @torch.no_grad()
     def _validate(self, loader: DataLoader):
         self.model.eval()
@@ -1563,18 +1570,18 @@ class Trainer(nn.Module):
         for x, y in loader:
             x, y = x.to(self.device), y.to(self.device)
             pred = self.model(x)
-            
+
             if self.loss_type == "mse":
                 batch_loss = self.loss_fn(pred, y)
             else:
                 from ..utils.dilate import dilate_loss
                 batch_loss, _, _ = dilate_loss(y, pred, device=self.device)
-            
+
             total += batch_loss.item() * len(x)
             n += len(x)
         self.model.train()
         return total / max(n, 1)
-    
+
     def fit(
         self,
         train_loader: DataLoader,
@@ -1588,18 +1595,18 @@ class Trainer(nn.Module):
             for batch in train_loader:
                 batch_loss = self._step(batch)
                 epoch_losses.append(batch_loss)
-            
+
             train_loss = sum(epoch_losses) / len(epoch_losses)
             val_loss = self._validate(val_loader) if val_loader else None
             train_losses.append(train_loss)
             val_losses.append(val_loss)
-            
+
             if verbose and (epoch == 1 or epoch == epochs or epoch % 5 == 0):
                 msg = f"[Epoch {epoch}/{epochs}] train={train_loss:.4f}"
                 if val_loss is not None:
                     msg += f" | val={val_loss:.4f}"
                 logger.info(msg)
-            
+
             if self.early_stopping:
                 self.early_stopping(val_loss)
                 if self.early_stopping.early_stop:
@@ -1615,21 +1622,21 @@ class Trainer(nn.Module):
                         if self.early_stopping.best_loss is not None:
                             logger.info(f"Best validation loss: {self.early_stopping.best_loss:.6f}")
                     break
-            
+
             if self.writer is not None:
                 self.writer.add_scalar("Loss/train", train_loss, epoch)
                 if val_loss is not None:
                     self.writer.add_scalar("Loss/val", val_loss, epoch)
-            
+
             if self.metrics_path is not None:
                 with open(self.metrics_path, "a", encoding="utf-8") as f:
                     f.write(f"{epoch},{train_loss},{val_loss if val_loss is not None else ''}\n")
-        
+
         return train_losses, val_losses
-    
+
     def save(self, path: str):
         torch.save(self.model.state_dict(), path)
-    
+
     def load(self, path: str):
         state = torch.load(path, map_location=self.device)
         if isinstance(state, dict) and "model_state_dict" in state:

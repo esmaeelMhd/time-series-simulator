@@ -9,7 +9,7 @@ This simple normalization makes the model robust to distribution shift.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Literal, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,7 +38,7 @@ class NLinear(nn.Module):
         If True, use separate linear layers per channel.
         If False, share weights across channels.
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -53,7 +53,7 @@ class NLinear(nn.Module):
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.individual = individual
-        
+
         # Linear projections
         if individual:
             # Separate linear layer per channel
@@ -63,13 +63,13 @@ class NLinear(nn.Module):
         else:
             # Shared linear layer
             self.linear = nn.Linear(seq_len, pred_len)
-        
+
         # Output projection if dimensions differ
         if self.output_dim != self.input_dim:
             self.output_proj = nn.Linear(input_dim, self.output_dim)
         else:
             self.output_proj = None
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
         
@@ -86,7 +86,7 @@ class NLinear(nn.Module):
         # Get last value and normalize (detach to not backprop through it)
         seq_last = x[:, -1:, :].detach()
         x_norm = x - seq_last
-        
+
         if self.individual:
             # Apply per-channel linear layers
             batch_size = x.shape[0]
@@ -100,14 +100,14 @@ class NLinear(nn.Module):
         else:
             # Shared linear: (B, T, F) -> (B, F, T) -> linear -> (B, F, pred_len) -> (B, pred_len, F)
             out = self.linear(x_norm.permute(0, 2, 1)).permute(0, 2, 1)
-        
+
         # Add back the last value (for all prediction steps)
         out = out + seq_last
-        
+
         # Project to output dimension if needed
         if self.output_proj is not None:
             out = self.output_proj(out)
-        
+
         return out
 
 
@@ -130,7 +130,7 @@ class NLinearWorldModel(WorldModelBase):
     individual : bool, default False
         Use per-channel linear layers.
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -144,7 +144,7 @@ class NLinearWorldModel(WorldModelBase):
         self.output_dim = output_dim or input_dim
         self.seq_len = seq_len
         self.pred_len = pred_len
-        
+
         self.model = NLinear(
             input_dim=input_dim,
             seq_len=seq_len,
@@ -152,7 +152,7 @@ class NLinearWorldModel(WorldModelBase):
             output_dim=self.output_dim,
             individual=individual,
         )
-    
+
     def init_state(self, warmup_seq: torch.Tensor) -> torch.Tensor:
         """Initialize state from warmup sequence.
         
@@ -169,7 +169,7 @@ class NLinearWorldModel(WorldModelBase):
             State tensor (the last seq_len steps).
         """
         return warmup_seq[:, -self.seq_len:, :]
-    
+
     def step(
         self,
         state: torch.Tensor,
@@ -199,14 +199,14 @@ class NLinearWorldModel(WorldModelBase):
         """
         # Predict from current state
         pred = self.model(state)[:, 0, :]  # Take first prediction step
-        
+
         # Sliding-window update uses current prediction as next output features.
         # Teacher/mixed corrections are applied in rollout().
         next_input = torch.cat([control_t, exo_t, pred], dim=-1)
-        
+
         # Update state by sliding window
         new_state = torch.cat([state[:, 1:, :], next_input.unsqueeze(1)], dim=1)
-        
+
         return new_state, pred
 
     def rollout(
@@ -227,7 +227,7 @@ class NLinearWorldModel(WorldModelBase):
             teacher_forcing_ratio=teacher_forcing_ratio,
             targets=targets,
         )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard forward pass for compatibility.
         

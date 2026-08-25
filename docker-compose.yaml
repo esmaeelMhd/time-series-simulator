@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        REQUIREMENTS_FILE: ${REQUIREMENTS_FILE:-requirements.txt}
+        REQUIREMENTS_FILE: ${REQUIREMENTS_FILE:-requirements.cpu.txt}
         # Optional extra index override at build time, if needed.
         PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
     environment:

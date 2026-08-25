@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import List, Dict, Optional
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -23,7 +23,8 @@ def simulate_autoregressive(model: Module,
                              out_fig: str | Path | None = None,
                              run_dir: str | Path | None = None,
                              start_idx: int | None = None,
-                             scaler: Optional[object] = None,
+                             *,
+                             scaler: object,
                              use_symlog: bool = False,
                              symlog_columns: Optional[List[str]] = None):
     """Run an autoregressive simulation and optionally save a plot.
@@ -44,6 +45,12 @@ def simulate_autoregressive(model: Module,
         start_idx = np.random.randint(0, start_max)
 
     window_df = df.iloc[start_idx : start_idx + seq_len + horizon].copy()
+
+    if scaler is None:
+        raise ValueError(
+            "simulate_autoregressive requires a train-fit scaler; "
+            "passing None would silently fit on the simulation window including the future horizon."
+        )
 
     # Collect results
     preds = []
@@ -104,4 +111,4 @@ def simulate_autoregressive(model: Module,
         np.save(Path(run_dir)/"simulation_real.npy", real)
         np.save(Path(run_dir)/"simulation_pred.npy", pred)
 
-    return real, pred, start_idx 
+    return real, pred, start_idx

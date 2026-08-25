@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Literal, Any
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 import numpy as np
 import torch

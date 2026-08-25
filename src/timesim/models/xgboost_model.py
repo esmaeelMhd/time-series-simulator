@@ -9,8 +9,8 @@ time series forecasting workflow.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Literal, Tuple, Union
 import warnings
+from typing import Literal, Optional, Tuple, Union
 
 import numpy as np
 
@@ -61,7 +61,7 @@ class XGBoostForecaster:
     >>> model.fit(X_train, y_train)  # X: (N, seq_len, features), y: (N, pred_len, out_features)
     >>> predictions = model.predict(X_test)
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -78,13 +78,13 @@ class XGBoostForecaster:
             raise ImportError(
                 "XGBoost is not installed. Install it with: pip install xgboost"
             )
-        
+
         self.input_dim = input_dim
         self.output_dim = output_dim or input_dim
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.strategy = strategy
-        
+
         self.xgb_params = {
             "n_estimators": n_estimators,
             "max_depth": max_depth,
@@ -93,11 +93,11 @@ class XGBoostForecaster:
             "n_jobs": -1,
             **xgb_params,
         }
-        
+
         # Models (one per output dim, or one per (output_dim, horizon) for direct)
         self.models_: Optional[list] = None
         self._fitted = False
-    
+
     def _flatten_input(self, X: np.ndarray) -> np.ndarray:
         """Flatten 3D input to 2D for XGBoost.
         
@@ -113,7 +113,7 @@ class XGBoostForecaster:
         """
         n_samples = X.shape[0]
         return X.reshape(n_samples, -1)
-    
+
     def fit(
         self,
         X: np.ndarray,
@@ -142,46 +142,45 @@ class XGBoostForecaster:
         """
         # Flatten input
         X_flat = self._flatten_input(X)
-        
+
         # Handle target shape
         if y.ndim == 2:
             # (n_samples, output_dim) -> assume pred_len=1
             y = y.reshape(y.shape[0], 1, -1)
-        
+
         n_samples, pred_len, output_dim = y.shape
-        
+
         # Prepare eval set if provided
-        eval_flat = None
         if eval_set is not None:
             X_val, y_val = eval_set
             X_val_flat = self._flatten_input(X_val)
             if y_val.ndim == 2:
                 y_val = y_val.reshape(y_val.shape[0], 1, -1)
-        
+
         if self.strategy == "recursive":
             # Train one model per output dimension (single-step prediction)
             self.models_ = []
             for out_idx in range(output_dim):
                 # Use only first step of target for training
                 y_out = y[:, 0, out_idx]
-                
+
                 # early_stopping_rounds moved to constructor in xgboost >= 2.1
                 model_params = dict(self.xgb_params)
                 if eval_set is not None:
                     model_params["early_stopping_rounds"] = 10
                 model = xgb.XGBRegressor(**model_params)
-                
+
                 fit_params = {"verbose": verbose}
                 if eval_set is not None:
                     y_val_out = y_val[:, 0, out_idx]
                     fit_params["eval_set"] = [(X_val_flat, y_val_out)]
-                
+
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     model.fit(X_flat, y_out, **fit_params)
-                
+
                 self.models_.append(model)
-        
+
         elif self.strategy == "direct":
             # Train separate model for each (horizon, output) pair
             self.models_ = []
@@ -189,27 +188,27 @@ class XGBoostForecaster:
                 horizon_models = []
                 for out_idx in range(output_dim):
                     y_out = y[:, h, out_idx]
-                    
+
                     model_params = dict(self.xgb_params)
                     if eval_set is not None:
                         model_params["early_stopping_rounds"] = 10
                     model = xgb.XGBRegressor(**model_params)
-                    
+
                     fit_params = {"verbose": verbose}
                     if eval_set is not None:
                         y_val_out = y_val[:, h, out_idx]
                         fit_params["eval_set"] = [(X_val_flat, y_val_out)]
-                    
+
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         model.fit(X_flat, y_out, **fit_params)
-                    
+
                     horizon_models.append(model)
                 self.models_.append(horizon_models)
-        
+
         self._fitted = True
         return self
-    
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Generate predictions.
         
@@ -225,24 +224,24 @@ class XGBoostForecaster:
         """
         if not self._fitted:
             raise RuntimeError("Model must be fitted before prediction.")
-        
+
         n_samples = X.shape[0]
         predictions = np.zeros((n_samples, self.pred_len, self.output_dim))
-        
+
         if self.strategy == "recursive":
             # Recursive prediction: predict one step, update input, repeat
             current_input = X.copy()
-            
+
             for h in range(self.pred_len):
                 X_flat = self._flatten_input(current_input)
-                
+
                 # Predict all output dimensions
                 step_pred = np.zeros((n_samples, self.output_dim))
                 for out_idx, model in enumerate(self.models_):
                     step_pred[:, out_idx] = model.predict(X_flat)
-                
+
                 predictions[:, h, :] = step_pred
-                
+
                 # Update input for next step (slide window)
                 if h < self.pred_len - 1:
                     # Shift window and append prediction
@@ -253,17 +252,17 @@ class XGBoostForecaster:
                         current_input[:, 1:, :],
                         new_step[:, np.newaxis, :]
                     ], axis=1)
-        
+
         elif self.strategy == "direct":
             # Direct prediction: each horizon has its own model
             X_flat = self._flatten_input(X)
-            
+
             for h in range(self.pred_len):
                 for out_idx in range(self.output_dim):
                     predictions[:, h, out_idx] = self.models_[h][out_idx].predict(X_flat)
-        
+
         return predictions
-    
+
     def save(self, path: str):
         """Save model to file.
         
@@ -286,7 +285,7 @@ class XGBoostForecaster:
                 },
                 "fitted": self._fitted,
             }, f)
-    
+
     @classmethod
     def load(cls, path: str) -> "XGBoostForecaster":
         """Load model from file.
@@ -304,7 +303,7 @@ class XGBoostForecaster:
         import pickle
         with open(path, "rb") as f:
             data = pickle.load(f)
-        
+
         model = cls(**data["params"])
         model.models_ = data["models"]
         model._fitted = data["fitted"]
@@ -324,17 +323,17 @@ class XGBoostEnsemble:
     **kwargs
         Parameters passed to XGBoostForecaster.
     """
-    
+
     def __init__(self, n_models: int = 5, **kwargs):
         if not HAS_XGBOOST:
             raise ImportError(
                 "XGBoost is not installed. Install it with: pip install xgboost"
             )
-        
+
         self.n_models = n_models
         self.kwargs = kwargs
         self.models_: list = []
-    
+
     def fit(
         self,
         X: np.ndarray,
@@ -352,7 +351,7 @@ class XGBoostEnsemble:
             model.fit(X, y, eval_set=eval_set, verbose=verbose)
             self.models_.append(model)
         return self
-    
+
     def predict(
         self,
         X: np.ndarray,
@@ -376,7 +375,7 @@ class XGBoostEnsemble:
         """
         all_preds = np.stack([m.predict(X) for m in self.models_], axis=0)
         mean = all_preds.mean(axis=0)
-        
+
         if return_std:
             std = all_preds.std(axis=0)
             return mean, std

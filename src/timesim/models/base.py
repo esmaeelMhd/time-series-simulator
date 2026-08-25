@@ -18,7 +18,7 @@ where:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Literal
+from typing import Any, Dict, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -37,7 +37,7 @@ class WorldModelBase(nn.Module, ABC):
     - Compatible with RL/MPC frameworks
     - Easy to wrap into Gymnasium environments
     """
-    
+
     @abstractmethod
     def init_state(self, warmup_seq: torch.Tensor) -> Any:
         """Initialize the model's hidden state from a warmup sequence.
@@ -56,7 +56,7 @@ class WorldModelBase(nn.Module, ABC):
             For transformers it might be a cache or None.
         """
         raise NotImplementedError
-    
+
     @abstractmethod
     def step(
         self,
@@ -87,7 +87,7 @@ class WorldModelBase(nn.Module, ABC):
             Predicted output at time t+1, shape (batch_size, output_dim).
         """
         raise NotImplementedError
-    
+
     def rollout(
         self,
         warmup_seq: Dict[str, torch.Tensor],
@@ -147,7 +147,7 @@ class WorldModelBase(nn.Module, ABC):
         # Validate inputs
         if feedback in ["teacher", "mixed"] and targets is None:
             raise ValueError(f"targets required when feedback='{feedback}'")
-        
+
         # Initialize state from warmup
         if "inputs" in warmup_seq:
             warmup_inputs = warmup_seq["inputs"]
@@ -158,15 +158,15 @@ class WorldModelBase(nn.Module, ABC):
                 warmup_seq["exogenous"],
                 warmup_seq["outputs"]
             ], dim=-1)
-        
+
         state = self.init_state(warmup_inputs)
-        
+
         # Extract rollout inputs
         controls = rollout_inputs["controls"]  # (B, H, C)
         exogenous = rollout_inputs["exogenous"]  # (B, H, E)
         batch_size = controls.shape[0]
         device = controls.device
-        
+
         # Get last output from warmup as initial prev_output
         if "outputs" in warmup_seq:
             prev_output = warmup_seq["outputs"][:, -1, :]  # (B, O)
@@ -183,26 +183,26 @@ class WorldModelBase(nn.Module, ABC):
                     "set model.output_dim, or pass targets."
                 )
             prev_output = warmup_inputs[:, -1, -output_dim:]
-        
+
         # HOT PATH: Preallocate predictions tensor (Rule 5: no allocations in loop)
         predictions = torch.empty(
             batch_size, horizon, output_dim,
             dtype=torch.float32, device=device
         )
         states = []
-        
+
         # Rollout loop - recurrence is unavoidable, but minimize overhead
         for t in range(horizon):
             control_t = controls[:, t, :]  # (B, C)
             exo_t = exogenous[:, t, :]  # (B, E)
-            
+
             # Predict next step
             state, pred_t = self.step(state, control_t, exo_t, prev_output)
-            
+
             # HOT PATH: Direct assignment to preallocated tensor
             predictions[:, t, :] = pred_t
             states.append(state)
-            
+
             # Determine what to use as prev_output for next step
             if feedback == "model":
                 prev_output = pred_t
@@ -212,7 +212,7 @@ class WorldModelBase(nn.Module, ABC):
                 # Scheduled sampling: randomly choose between model and teacher
                 use_teacher = torch.rand(batch_size, 1, device=device) < teacher_forcing_ratio
                 prev_output = torch.where(use_teacher, targets[:, t, :], pred_t)
-        
+
         return {
             "predictions": predictions,
             "states": states,
@@ -302,7 +302,7 @@ class WorldModelBase(nn.Module, ABC):
             "predictions": predictions,
             "states": states,
         }
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard forward pass for compatibility with existing training code.
         

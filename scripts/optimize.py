@@ -6,8 +6,8 @@ Use either:
   - timesim-optimize ...
 """
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 # Ensure local package import works when called as:
 #   python scripts/optimize.py ...
@@ -16,7 +16,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from timesim.cli.optimize import main
-
 
 if __name__ == "__main__":
     main()

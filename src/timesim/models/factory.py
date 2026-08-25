@@ -13,8 +13,8 @@ The factory merges three sources of parameters (highest priority last):
 from __future__ import annotations
 
 import inspect
-from typing import Any, Dict, Optional
 import warnings
+from typing import Any, Dict, Optional
 
 # Lazy imports to avoid circular dependency with __init__.py
 # (factory is imported by __init__ which is still loading MODEL_REGISTRY)

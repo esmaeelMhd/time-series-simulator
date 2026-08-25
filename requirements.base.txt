@@ -18,7 +18,7 @@ scikit-learn>=1.3
 
 # Environment & progress bars
 tqdm
-gym>=0.26
+gymnasium>=0.26
 
 # Distance metrics / DTW utilities
 tslearn>=0.6
@@ -30,7 +30,6 @@ seaborn>=0.13
 # Classical stats models (VARMAX etc.)
 statsmodels>=0.14
 
-# Added joblib dependency
 joblib>=1.3
 pandera>=0.20
 polars

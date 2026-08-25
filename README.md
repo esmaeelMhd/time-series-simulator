@@ -48,7 +48,7 @@ pip install -e ".[all]"
 ### Requirements
 
 - Python >= 3.10
-- PyTorch 2.10.0 (CUDA 12.8 by default via `requirements.txt`)
+- PyTorch 2.13.0 (CUDA 12.8 by default via `requirements.txt`)
 - Use `requirements.cpu.txt` for CPU-only installs
 
 ## Repository Layout
@@ -61,7 +61,6 @@ pip install -e ".[all]"
 │   ├── model/                  # Model architecture defaults
 │   ├── training/               # Training & eval defaults
 │   └── serving/                # Serving defaults
-├── datasets/                   # Data files (Git LFS)
 ├── scripts/                    # CLI entry-point scripts
 ├── src/timesim/                # Core package (src layout)
 │   ├── cli/                    # Packaged CLI commands (optimize, retrain)
@@ -242,9 +241,11 @@ Test coverage spans data pipeline, encoders, RSSM cell, training loop, evaluatio
 
 `.github/workflows/ci.yml` runs on every push/PR:
 
-1. Lint (`ruff`)
-2. Unit tests (`pytest`)
+1. Lint (`ruff check src scripts tests`)
+2. Unit tests (full `pytest tests/` suite)
 3. Fast training smoke test (`scripts/ci_fast_train.py`, 5 epochs on synthetic data)
+
+The wastewater CSV used by `configs/dataset/wastewater.yaml` is not in this repository; see that config for provenance and the expected local path.
 
 ## Architecture
 

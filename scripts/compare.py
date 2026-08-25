@@ -22,19 +22,20 @@ import argparse
 import sys
 from pathlib import Path
 
-import yaml
 import numpy as np
 import pandas as pd
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 
-from timesim.utils.config import compose_config
-from timesim.data.loader import load_csv_dataset, build_dataloaders_from_config
+from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.schema import VariableSchema
-from timesim.utils.plotting import save_loss_plot, save_forecast_plot
-from timesim.utils.misc import seed_everything, resolve_device
-from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
+from timesim.models.factory import NEURAL_MODELS, build_model, count_parameters
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device, seed_everything
+from timesim.utils.plotting import save_forecast_plot
 
 # Try importing XGBoost
 try:
@@ -44,6 +45,7 @@ except ImportError:
     HAS_XGBOOST = False
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 # Shared evaluation / simulation / plotting utilities
@@ -51,17 +53,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_utils import (
     evaluate_neural_model,
     evaluate_xgboost_model,
-    simulate_recursive_neural,
-    simulate_recursive_xgboost,
-    save_per_model_simulation_plot,
-    save_per_model_simulation_csv,
     save_comparison_forecast_plot,
     save_comparison_loss_plot,
     save_metrics_bar_chart,
-    save_simulation_trajectory_plot,
+    save_per_model_simulation_csv,
+    save_per_model_simulation_plot,
     save_simulation_csv,
+    save_simulation_trajectory_plot,
+    simulate_recursive_neural,
+    simulate_recursive_xgboost,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Checkpoint discovery
@@ -234,19 +235,19 @@ def main():
     )
     print(f"  Rows: {len(df)}, Columns: {list(df.columns)}")
 
-    train_loader, val_loader, _ = build_dataloaders_from_config(
+    _, _, test_loader, _ = build_dataloaders_from_config(
         config=config,
         df=df,
         seed=seed,
         scaler=scaler,
     )
 
-    val_dataset = val_loader.dataset
-    print(f"  Val samples: {len(val_dataset)}")
+    test_dataset = test_loader.dataset
+    print(f"  Test samples: {len(test_dataset)}")
 
     sim_horizon = sim_cfg.get("horizon", None)
     if sim_horizon is None:
-        sim_horizon = len(val_dataset.values) - seq_len
+        sim_horizon = len(test_dataset.values) - seq_len
 
     # ── Banner ────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -309,14 +310,14 @@ def main():
             try:
                 if model_type in NEURAL_MODELS:
                     gt_list, pred_list, eval_info = evaluate_neural_model(
-                        model, val_dataset, warmup_len, eval_horizon,
+                        model, test_dataset, warmup_len, eval_horizon,
                         control_dim, exo_dim, device, n_windows,
                         probabilistic_cfg=prob_eval_cfg,
                         return_info=True,
                     )
                 else:
                     gt_list, pred_list = evaluate_xgboost_model(
-                        model, val_dataset, seq_len, eval_horizon, n_windows,
+                        model, test_dataset, seq_len, eval_horizon, n_windows,
                     )
                     eval_info = {
                         "is_probabilistic": False,
@@ -366,13 +367,13 @@ def main():
             try:
                 if model_type in NEURAL_MODELS:
                     sim_result = simulate_recursive_neural(
-                        model, val_dataset, seq_len, sim_horizon,
+                        model, test_dataset, seq_len, sim_horizon,
                         device, start_idx=sim_start,
                         probabilistic_cfg=prob_eval_cfg,
                     )
                 else:
                     sim_result = simulate_recursive_xgboost(
-                        model, val_dataset, seq_len, sim_horizon,
+                        model, test_dataset, seq_len, sim_horizon,
                         start_idx=sim_start,
                     )
 

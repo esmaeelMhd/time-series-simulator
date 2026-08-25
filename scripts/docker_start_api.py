@@ -14,8 +14,8 @@ import sys
 from pathlib import Path
 from typing import Dict
 
-from fastapi import FastAPI
 import uvicorn
+from fastapi import FastAPI
 
 
 def _env() -> Dict[str, str]:

@@ -8,7 +8,7 @@ Includes:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Literal, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn

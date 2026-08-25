@@ -5,7 +5,6 @@ from typing import Callable, Dict, List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-
 # feature_name -> (extractor, period, offset)
 _FEATURE_SPECS: Dict[str, Tuple[Callable[[pd.DatetimeIndex], np.ndarray], int, int]] = {
     "hour": (lambda idx: idx.hour.to_numpy(dtype=np.int32), 24, 0),

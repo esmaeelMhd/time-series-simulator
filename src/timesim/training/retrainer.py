@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -31,13 +31,20 @@ class EpisodeSampler:
 class Retrainer:
     def __init__(
         self,
-        model_cls: type[nn.Module],
+        model_cls: Union[type[nn.Module], nn.Module, Callable[[], nn.Module]],
         checkpoint: str | Path,
         device: torch.device | str = "cpu",
     ):
         self.device = torch.device(device)
-        self.model = model_cls.to(self.device) if isinstance(model_cls, nn.Module) else model_cls()
-        self.model.to(self.device)
+        if isinstance(model_cls, nn.Module):
+            model = model_cls
+        elif callable(model_cls):
+            model = model_cls()
+            if not isinstance(model, nn.Module):
+                raise TypeError("model_cls() must return a torch.nn.Module")
+        else:
+            raise TypeError("model_cls must be an nn.Module, a Module subclass, or a zero-arg factory")
+        self.model = model.to(self.device)
         state = torch.load(checkpoint, map_location=self.device)
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]

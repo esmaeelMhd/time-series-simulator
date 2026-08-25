@@ -9,11 +9,23 @@ Optimizations:
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Dict, Any
+from typing import Any, Dict, Literal, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..utils.dilate import dilate_loss, shape_and_temporal_loss
+from ..utils.symlog import symlog as torch_symlog
+
+__all__ = [
+    "OneStepLoss",
+    "MultiStepLoss",
+    "CombinedLoss",
+    "ProbabilisticRolloutLoss",
+    "dilate_loss",
+    "shape_and_temporal_loss",
+]
 
 LossType = Literal["mse", "mae", "huber", "shape"]
 
@@ -166,7 +178,7 @@ class OneStepLoss(nn.Module):
     loss_type : {"mse", "mae", "huber", "shape"}
         Type of loss function.
     """
-    
+
     def __init__(
         self,
         loss_type: LossType = "mse",
@@ -175,7 +187,7 @@ class OneStepLoss(nn.Module):
         super().__init__()
         self.loss_type = loss_type
         self.shape_loss_cfg = _merged_shape_cfg(shape_loss_cfg)
-        
+
         if loss_type == "mse":
             self.loss_fn = nn.MSELoss()
         elif loss_type == "mae":
@@ -186,7 +198,7 @@ class OneStepLoss(nn.Module):
             self.loss_fn = None
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
-    
+
     def forward(
         self,
         predictions: torch.Tensor,
@@ -229,7 +241,7 @@ class MultiStepLoss(nn.Module):
     weight_scale : float, default 1.0
         Scaling factor for non-uniform weighting.
     """
-    
+
     def __init__(
         self,
         loss_type: LossType = "mse",
@@ -242,7 +254,7 @@ class MultiStepLoss(nn.Module):
         self.weighting = weighting
         self.weight_scale = weight_scale
         self.shape_loss_cfg = _merged_shape_cfg(shape_loss_cfg)
-        
+
         if loss_type == "mse":
             self.base_loss = F.mse_loss
         elif loss_type == "mae":
@@ -253,7 +265,7 @@ class MultiStepLoss(nn.Module):
             self.base_loss = None
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
-    
+
     def _compute_weights(self, horizon: int, device: torch.device) -> torch.Tensor:
         """Compute time-step weights.
         
@@ -282,11 +294,11 @@ class MultiStepLoss(nn.Module):
             )
         else:
             raise ValueError(f"Unknown weighting: {self.weighting}")
-        
+
         # Normalize weights to sum to horizon (so average is comparable to uniform)
         weights = weights / weights.mean()
         return weights
-    
+
     def forward(
         self,
         predictions: torch.Tensor,
@@ -312,7 +324,7 @@ class MultiStepLoss(nn.Module):
         """
         batch_size, horizon, output_dim = predictions.shape
         device = predictions.device
-        
+
         # Get time-step weights
         if weights is None:
             weights = self._compute_weights(horizon, device)
@@ -357,7 +369,7 @@ class CombinedLoss(nn.Module):
     multi_step_weight_scale : float, default 1.0
         Scale factor for the multi-step weighting scheme.
     """
-    
+
     def __init__(
         self,
         one_step_weight: float = 0.5,
@@ -370,7 +382,7 @@ class CombinedLoss(nn.Module):
         super().__init__()
         self.one_step_weight = one_step_weight
         self.multi_step_weight = multi_step_weight
-        
+
         self.one_step_loss = OneStepLoss(
             loss_type=loss_type,
             shape_loss_cfg=shape_loss_cfg,
@@ -381,7 +393,7 @@ class CombinedLoss(nn.Module):
             weight_scale=multi_step_weight_scale,
             shape_loss_cfg=shape_loss_cfg,
         )
-    
+
     def forward(
         self,
         predictions_teacher: torch.Tensor,
@@ -409,18 +421,18 @@ class CombinedLoss(nn.Module):
         """
         loss_1step = self.one_step_loss(predictions_teacher, targets)
         loss_multi = self.multi_step_loss(predictions_model, targets)
-        
+
         total_loss = (
             self.one_step_weight * loss_1step +
             self.multi_step_weight * loss_multi
         )
-        
+
         info = {
             "loss_1step": loss_1step.item(),
             "loss_multi": loss_multi.item(),
             "loss_total": total_loss.item(),
         }
-        
+
         return total_loss, info
 
 
@@ -489,7 +501,7 @@ class ProbabilisticRolloutLoss(nn.Module):
 
     @staticmethod
     def _symlog(x: torch.Tensor) -> torch.Tensor:
-        return torch.sign(x) * torch.log1p(torch.abs(x))
+        return torch_symlog(x)
 
     @staticmethod
     def _normal_from_mu_logvar(mu: torch.Tensor, logvar: torch.Tensor) -> torch.distributions.Normal:
@@ -673,12 +685,9 @@ class ProbabilisticRolloutLoss(nn.Module):
             stochastic_classes=stochastic_classes,
         )
         is_categorical = posterior_logits is not None and prior_logits is not None
-        if self.use_free_bits and not is_categorical:
-            kl_elem = torch.maximum(
-                kl_elem,
-                torch.full_like(kl_elem, fill_value=self.kl_free_bits),
-            )
         kl_steps = kl_elem.sum(dim=-1)
+        if self.use_free_bits and not is_categorical:
+            kl_steps = torch.clamp(kl_steps, min=float(self.kl_free_bits))
         kl = self._sum_time_mean_batch(kl_steps, mask)
 
         aux_nll = torch.zeros((), dtype=recon_nll.dtype, device=recon_nll.device)
@@ -791,56 +800,3 @@ def soft_dtw_distance(
             softmin = -g * torch.logsumexp(-prev / g, dim=-1)
             r[:, i, j] = dist[:, i - 1, j - 1] + softmin
     return r[:, tlen, tlen].mean()
-
-
-def dilate_loss(
-    target: torch.Tensor,
-    prediction: torch.Tensor,
-    alpha: float = 0.5,
-    gamma: float = 0.01,
-    device: torch.device | str = "cpu",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute DILATE loss (shape + temporal) for sequences.
-    
-    This is a simplified version of the DILATE loss from the paper:
-    "A Shape and Time Distortion Loss for Training Deep Time Series Forecasting Models"
-    
-    Parameters
-    ----------
-    target : torch.Tensor
-        Ground truth, shape (batch_size, seq_len, features).
-    prediction : torch.Tensor
-        Predictions, shape (batch_size, seq_len, features).
-    alpha : float, default 0.5
-        Weight for shape loss vs temporal loss.
-    gamma : float, default 0.01
-        Regularization for temporal loss.
-    device : torch.device or str
-        Device for computation.
-    
-    Returns
-    -------
-    loss : torch.Tensor
-        Total DILATE loss.
-    loss_shape : torch.Tensor
-        Shape component (MSE).
-    loss_temporal : torch.Tensor
-        Temporal component (derivative matching).
-    """
-    device = torch.device(device)
-    target = target.to(device)
-    prediction = prediction.to(device)
-    
-    # Shape loss (MSE)
-    loss_shape = F.mse_loss(prediction, target)
-    
-    # Temporal loss (first derivative matching)
-    def _first_derivative(x):
-        return x[:, 1:] - x[:, :-1]
-    
-    loss_temporal = F.l1_loss(_first_derivative(prediction), _first_derivative(target))
-    
-    # Combined loss
-    loss = alpha * loss_shape + (1 - alpha) * (loss_temporal + gamma)
-    
-    return loss, loss_shape, loss_temporal

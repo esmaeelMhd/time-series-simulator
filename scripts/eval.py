@@ -39,27 +39,30 @@ Examples:
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 import yaml
 
-from timesim.utils.config import compose_config
-from timesim.data.loader import load_csv_dataset, build_dataloaders_from_config
+from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
-from timesim.utils.plotting import save_forecast_plot
-from timesim.utils.misc import seed_everything, resolve_device
 from timesim.models.factory import (
+    NEURAL_MODELS,
     build_model,
     count_parameters,
     get_model_param_names,
-    NEURAL_MODELS,
 )
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device, seed_everything
+from timesim.utils.plotting import save_forecast_plot
 
 try:
     from timesim.models.xgboost_model import XGBoostForecaster
@@ -68,6 +71,7 @@ except ImportError:
     HAS_XGBOOST = False
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 # Shared eval / simulation utilities (same directory)
@@ -75,12 +79,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_utils import (
     evaluate_neural_model,
     evaluate_xgboost_model,
+    save_per_model_simulation_csv,
+    save_per_model_simulation_plot,
     simulate_recursive_neural,
     simulate_recursive_xgboost,
-    save_per_model_simulation_plot,
-    save_per_model_simulation_csv,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Checkpoint discovery
@@ -223,7 +226,7 @@ def _build_cli_parser():
     eval_grp.add_argument("--eval-horizon", type=int, default=None,
                           help="Override evaluation rollout horizon")
     eval_grp.add_argument("--n-windows", type=int, default=None,
-                          help="Override number of validation windows")
+                          help="Override number of test windows")
     eval_grp.add_argument("--no-eval", action="store_true",
                           help="Skip evaluation (multi-window rollout)")
 
@@ -231,7 +234,7 @@ def _build_cli_parser():
     sim_grp.add_argument("--sim-horizon", type=int, default=None,
                          help="Override simulation horizon (number of recursive steps)")
     sim_grp.add_argument("--sim-start", type=int, default=None,
-                         help="Override simulation start index in validation data")
+                         help="Override simulation start index in held-out test data")
     sim_grp.add_argument("--no-sim", action="store_true",
                          help="Skip recursive simulation")
 
@@ -438,13 +441,13 @@ def main():
         validation_cfg=data_cfg.get("validation", None),
     )
 
-    _, val_loader, _ = build_dataloaders_from_config(
+    _, _, test_loader, _ = build_dataloaders_from_config(
         config=config,
         df=df,
         seed=seed,
         scaler=scaler,
     )
-    val_dataset = val_loader.dataset
+    test_dataset = test_loader.dataset
 
     # Resolve simulation horizon
     sim_horizon = sim_horizon_override
@@ -453,7 +456,7 @@ def main():
         if cfg_horizon is not None:
             sim_horizon = cfg_horizon
         else:
-            sim_horizon = len(val_dataset.values) - seq_len
+            sim_horizon = len(test_dataset.values) - seq_len
 
     # ── Banner ────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -463,7 +466,7 @@ def main():
     print(f"  Model          : {model_type}")
     print(f"  Checkpoint     : {ckpt_path.name} (round: {round_name})")
     print(f"  Parameters     : {n_params:,}" if n_params
-          else f"  Parameters     : N/A (tree-based)")
+          else "  Parameters     : N/A (tree-based)")
     print(f"  Device         : {device}")
     print(f"  Eval horizon   : {eval_horizon}  (windows: {n_windows})"
           + ("  [SKIPPED]" if args.no_eval else ""))
@@ -481,12 +484,12 @@ def main():
         try:
             if model_type in NEURAL_MODELS:
                 gt_list, pred_list = evaluate_neural_model(
-                    model, val_dataset, warmup_len, eval_horizon,
+                    model, test_dataset, warmup_len, eval_horizon,
                     control_dim, exo_dim, device, n_windows,
                 )
             else:
                 gt_list, pred_list = evaluate_xgboost_model(
-                    model, val_dataset, seq_len, eval_horizon, n_windows,
+                    model, test_dataset, seq_len, eval_horizon, n_windows,
                 )
 
             if gt_list and pred_list:
@@ -533,7 +536,7 @@ def main():
 
         except Exception as exc:
             print(f"  Eval ERROR: {exc}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
 
     # ══════════════════════════════════════════════════════════════════
     #  SIMULATION (recursive step-by-step)
@@ -543,12 +546,12 @@ def main():
         try:
             if model_type in NEURAL_MODELS:
                 sim_result = simulate_recursive_neural(
-                    model, val_dataset, seq_len,
+                    model, test_dataset, seq_len,
                     sim_horizon, device, start_idx=sim_start,
                 )
             else:
                 sim_result = simulate_recursive_xgboost(
-                    model, val_dataset, seq_len,
+                    model, test_dataset, seq_len,
                     sim_horizon, start_idx=sim_start,
                 )
 
@@ -582,7 +585,7 @@ def main():
 
         except Exception as exc:
             print(f"  Sim ERROR: {exc}")
-            import traceback; traceback.print_exc()
+            traceback.print_exc()
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}")

@@ -4,24 +4,26 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-import time
 import logging
+import time
+from pathlib import Path
 
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
-from joblib import load
 import numpy as np
 import pandas as pd
+from joblib import load
 
-from timesim.utils.config import compose_config
 from timesim.data.loader import build_dataloaders_from_config, load_csv_dataset
 from timesim.data.schema import VariableSchema
-from timesim.utils.misc import resolve_device
 from timesim.models.factory import build_model
 from timesim.serving import create_app
 from timesim.simulator import RSSMSimulator
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device
 
 
 def _load_model_state(model: torch.nn.Module, checkpoint: str | Path, device: str):
@@ -78,7 +80,7 @@ def main():
             config.get("training", {}).get("warmup_len", dataset_seq_len),
         )
     )
-    batch_size = int(dcfg["batch_size"])
+    int(dcfg["batch_size"])
 
     input_cols = schema.columns_for_group_names(input_groups)
     output_cols = schema.columns_for_group_names(output_groups)
@@ -99,7 +101,7 @@ def main():
         raise FileNotFoundError(f"Scaler not found: {scaler_path}")
     scaler = load(scaler_path)
 
-    _, val_loader, _ = build_dataloaders_from_config(
+    _, val_loader, _test_loader, _ = build_dataloaders_from_config(
         config=config,
         df=df,
         seed=seed,

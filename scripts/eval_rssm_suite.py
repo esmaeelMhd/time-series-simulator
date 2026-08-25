@@ -5,39 +5,42 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Sequence, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 import yaml
 from joblib import load as joblib_load
 
-from timesim.utils.config import compose_config
+from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.loader import (
+    chronological_split_dataframe,
     load_csv_dataset,
     resolve_split_ratios,
-    chronological_split_dataframe,
 )
-from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.schema import VariableSchema
 from timesim.data.stamps import get_time_feature_columns
-from timesim.utils.misc import seed_everything, resolve_device
 from timesim.evaluation import (
-    open_loop_evaluate,
     closed_loop_evaluate,
     interventional_evaluate,
     interventional_suite_evaluate,
-    summarize_horizons,
     latent_diagnostics,
+    open_loop_evaluate,
+    summarize_horizons,
 )
 from timesim.models.factory import build_model
 from timesim.training.losses import soft_dtw_distance
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device, seed_everything
 
 
 def _build_cli_parser():
@@ -127,8 +130,18 @@ def _build_test_dataset(config: Dict[str, Any], scaler) -> GroupedTimeSeriesData
         test_start = len(df) - len(test_df)
     else:
         test_split = float(test_split)
-        test_count = max(seq_len + pred_len + 1, int(round(len(df) * test_split)))
-        test_start = max(0, len(df) - test_count - seq_len)
+        if not 0.0 < test_split < 1.0:
+            raise ValueError(f"evaluation.test_split must be in (0, 1), got {test_split}")
+        configured_test = float((data_cfg.get("splits") or {}).get("test", 0.15))
+        if test_split - configured_test > 1e-9:
+            raise ValueError(
+                f"evaluation.test_split={test_split} exceeds data.splits.test={configured_test}. "
+                "Held-out evaluation must not include validation or train rows."
+            )
+        warmup_len = int(config.get("training", {}).get("warmup_len", seq_len))
+        pad = max(int(seq_len), int(warmup_len))
+        test_count = max(pad + pred_len + 1, int(round(len(df) * test_split)))
+        test_start = max(0, len(df) - test_count - pad)
         test_df = df.iloc[test_start:].copy()
 
     add_time = bool(data_cfg.get("add_time_features", False))
@@ -604,7 +617,7 @@ def _plot_reconstruction_overlay(
 ) -> None:
     if true_arr.size == 0 or recon_arr.size == 0:
         return
-    n_obj = true_arr.shape[-1]
+    true_arr.shape[-1]
     obj = 0
     y_true = true_arr[:, obj]
     y_recon = recon_arr[:, obj]

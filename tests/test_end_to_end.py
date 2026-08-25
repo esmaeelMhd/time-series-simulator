@@ -1,15 +1,16 @@
-import sys, os
+import os
+import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 
-import tempfile
 from pathlib import Path
 
 import torch
 
-from timesim.data.loader import generate_sine_dataset, build_dataloaders
+from timesim.data.loader import build_dataloaders, generate_sine_dataset
 from timesim.models import get_model
-from timesim.training.trainer import Trainer
 from timesim.training.retrainer import Retrainer
+from timesim.training.trainer import Trainer
 
 
 def test_train_and_retrain(tmp_path: Path):
@@ -44,4 +45,4 @@ def test_train_and_retrain(tmp_path: Path):
     assert torch.isfinite(torch.tensor(last_val)), "Validation loss is not finite after retrain."
 
     # Simple heuristic: loss after retrain should not explode (<= 2x original)
-    assert last_val <= 2 * first_val, "Retrain made the loss blow up." 
+    assert last_val <= 2 * first_val, "Retrain made the loss blow up."

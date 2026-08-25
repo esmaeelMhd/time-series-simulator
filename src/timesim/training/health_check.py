@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
-import logging
 
 try:
     import pytorch_lightning as pl  # type: ignore

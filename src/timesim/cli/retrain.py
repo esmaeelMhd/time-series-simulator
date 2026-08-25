@@ -1,24 +1,31 @@
 import argparse
 from pathlib import Path
+
 import numpy as np
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 
-from timesim.data.loader import generate_sine_dataset, build_dataloaders
+from joblib import dump, load
+
+from timesim.data.loader import build_dataloaders, generate_sine_dataset
 from timesim.data.schema import VariableSchema
 from timesim.models import get_model
 from timesim.training.retrainer import Retrainer
 from timesim.utils.config import compose_config
 from timesim.utils.logger import create_run_dir, init_logging
-from timesim.utils.plotting import save_loss_plot, compare_simulation_plot, multi_compare_simulation_plot
-from timesim.utils.misc import seed_everything, resolve_device
-from joblib import load, dump
+from timesim.utils.misc import resolve_device, seed_everything
+from timesim.utils.plotting import (
+    multi_compare_simulation_plot,
+    save_loss_plot,
+)
 
 
 def _build_cli_parser():
     p = argparse.ArgumentParser(description="Fine-tune a checkpoint on new data")
-    p.add_argument("--config", "--config-name", type=str, default="configs/base.yml",
+    p.add_argument("--config", "--config-name", type=str, default="configs/wastewater.yaml",
                    help="Hydra config name or path to YAML config")
     p.add_argument("--ckpt", type=str)
     p.add_argument("--epochs", type=int)
@@ -91,7 +98,7 @@ def main():
         groups = {"control": ["sine"], "exogenous": [], "objective": ["sine"]}
         schema = VariableSchema.from_groups(groups)
     else:
-        from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
+        from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
         df_raw = load_csv_dataset(dataset_cfg["csv"],
                                   index_col=dataset_cfg.get("index_col", "date"),
                                   parse_dates=bool(cfg.get("data", {}).get("parse_dates", True)),
@@ -104,7 +111,7 @@ def main():
         scaler_path = Path(cfg["ckpt"]).parent/"scaler.pkl"
         existing_scaler = load(scaler_path) if scaler_path.exists() else None
 
-        train_loader, val_loader, scaler = build_grouped_dataloaders(df_raw,
+        train_loader, val_loader, _test_loader, scaler = build_grouped_dataloaders(df_raw,
                                                                     groups,
                                                                     input_groups,
                                                                     output_groups,
@@ -275,7 +282,6 @@ def main():
     # ------------- common post-simulation comparison -------------
     if df_raw is not None:
         from timesim.utils.simulation import simulate_autoregressive
-        from timesim.utils.plotting import compare_simulation_plot
 
         sim_points = cfg.get('retrain', {}).get('sim_points', 1)
         sim_horizon = cfg.get('retrain', {}).get('sim_horizon', 10*pred_len)
@@ -297,7 +303,7 @@ def main():
                                                     )
             after_list.append(pred)
 
-        multi_compare_simulation_plot(real_list, before_list, after_list, output_cols, Path(run_dir)/'figs'/f'simulation_compare.png')
+        multi_compare_simulation_plot(real_list, before_list, after_list, output_cols, Path(run_dir)/'figs'/'simulation_compare.png')
 
         np.save(run_dir/'starts.npy', np.array(starts_used))
         np.save(run_dir/'pre_real.npy', np.array(real_list))
@@ -306,4 +312,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

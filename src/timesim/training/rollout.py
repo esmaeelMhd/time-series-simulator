@@ -10,13 +10,12 @@ Key optimizations applied:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Literal, Any, Mapping
+from typing import Any, Dict, List, Literal, Mapping
 
 import numpy as np
 import torch
 
 from ..data.dataset import GroupedTimeSeriesDataset
-from ..data.sampling import SamplingStrategy
 from ..models.base import WorldModelBase
 
 
@@ -40,18 +39,23 @@ def _read_cfg(cfg: Mapping[str, Any], key: str, default: Any) -> Any:
 def get_rollout_schedule(epoch: int, cfg: Mapping[str, Any]) -> tuple[int, int, float]:
     """Return (horizon, context_len, ramp_factor) for rollout training schedule.
 
-    The schedule enforces:
-    - horizon=0 during warmup fraction
-    - linear ramp from 1..max_horizon afterwards
-    - context_len >= min_context (caps horizon if needed)
+    Preferred schedule keys: ``rollout_start_epoch`` / ``rollout_full_epoch``.
+    If those are absent, a ``rollout_warmup_fraction`` of total epochs is used.
+
+    ``seq_len`` is only used as a context-floor cap when provided. Trainers that
+    should not couple imagination horizon to warmup length should omit it.
     """
     ep = max(1, int(epoch))
-    total_epochs = max(1, int(_read_cfg(cfg, "epochs", _read_cfg(cfg, "fit_epochs", 1))))
-    seq_len = max(1, int(_read_cfg(cfg, "seq_len", _read_cfg(cfg, "warmup_len", 1))))
     min_context = max(1, int(_read_cfg(cfg, "min_context", 16)))
-    max_horizon_cfg = max(0, int(_read_cfg(cfg, "rollout_max_horizon", seq_len)))
-    max_horizon = min(max_horizon_cfg, max(0, seq_len - min_context))
-    # Allow explicit sequence curriculum overrides (start/max epoch + target horizon)
+    seq_len_raw = _read_cfg(cfg, "seq_len", _read_cfg(cfg, "warmup_len", None))
+    seq_len = None if seq_len_raw is None else max(1, int(seq_len_raw))
+    default_max = int(seq_len) if seq_len is not None else 0
+    max_horizon_cfg = max(0, int(_read_cfg(cfg, "rollout_max_horizon", default_max)))
+    if seq_len is not None:
+        max_horizon = min(max_horizon_cfg, max(0, seq_len - min_context))
+    else:
+        max_horizon = max_horizon_cfg
+
     sc = None
     if isinstance(cfg, Mapping) and "sequence_curriculum" in cfg:
         sc = cfg.get("sequence_curriculum")
@@ -72,18 +76,55 @@ def get_rollout_schedule(epoch: int, cfg: Mapping[str, Any]) -> tuple[int, int, 
                 ramp = float(ep - start_ep) / float(denom)
                 ramp = max(0.0, min(1.0, ramp))
                 horizon = int(round(start_h + ramp * (target_h - start_h)))
-            horizon = max(0, min(int(seq_len - min_context), int(horizon)))
-            context_len = max(min_context, seq_len - horizon)
+            if seq_len is not None:
+                horizon = max(0, min(int(seq_len - min_context), int(horizon)))
+                context_len = max(min_context, seq_len - horizon)
+            else:
+                horizon = max(0, int(horizon))
+                context_len = min_context
             return int(horizon), int(context_len), float(ramp)
-    if max_horizon <= 0:
-        return 0, seq_len, 0.0
 
+    start_ep_cfg = _read_cfg(cfg, "rollout_start_epoch", None)
+    full_ep_cfg = _read_cfg(cfg, "rollout_full_epoch", None)
+    if start_ep_cfg is not None:
+        start_ep = max(1, int(start_ep_cfg))
+        full_ep = max(start_ep, int(full_ep_cfg if full_ep_cfg is not None else start_ep))
+        if max_horizon <= 0:
+            context_len = int(seq_len) if seq_len is not None else min_context
+            return 0, context_len, 0.0
+        if ep <= start_ep:
+            ramp = 0.0
+            horizon = 0
+        elif ep >= full_ep:
+            ramp = 1.0
+            horizon = max_horizon
+        else:
+            denom = max(1, full_ep - start_ep)
+            ramp = float(ep - start_ep) / float(denom)
+            ramp = max(0.0, min(1.0, ramp))
+            horizon = int(round(max_horizon * ramp))
+            if horizon == 0 and ramp > 0.0:
+                horizon = 1
+            horizon = min(max_horizon, max(0, horizon))
+        if seq_len is not None:
+            context_len = max(min_context, seq_len - horizon)
+            horizon = max(0, seq_len - context_len)
+        else:
+            context_len = min_context
+        return int(horizon), int(context_len), float(ramp)
+
+    if max_horizon <= 0:
+        context_len = int(seq_len) if seq_len is not None else min_context
+        return 0, context_len, 0.0
+
+    total_epochs = max(1, int(_read_cfg(cfg, "epochs", _read_cfg(cfg, "fit_epochs", 1))))
     warmup_fraction = float(_read_cfg(cfg, "rollout_warmup_fraction", 0.30))
     warmup_fraction = max(0.0, min(1.0, warmup_fraction))
     warmup_epochs = int(np.ceil(total_epochs * warmup_fraction))
     warmup_epochs = min(total_epochs, max(0, warmup_epochs))
     if ep <= warmup_epochs:
-        return 0, seq_len, 0.0
+        context_len = int(seq_len) if seq_len is not None else min_context
+        return 0, context_len, 0.0
 
     denom = max(1, total_epochs - warmup_epochs)
     ramp = float(ep - warmup_epochs) / float(denom)
@@ -94,8 +135,11 @@ def get_rollout_schedule(epoch: int, cfg: Mapping[str, Any]) -> tuple[int, int, 
         horizon = 1
     horizon = min(max_horizon, max(0, horizon))
 
-    context_len = max(min_context, seq_len - horizon)
-    horizon = max(0, seq_len - context_len)
+    if seq_len is not None:
+        context_len = max(min_context, seq_len - horizon)
+        horizon = max(0, seq_len - context_len)
+    else:
+        context_len = min_context
     return horizon, context_len, ramp
 
 
@@ -147,19 +191,19 @@ def _prepare_batch_data(
     batch_size = len(start_indices)
     input_dim = len(dataset.in_idx)
     output_dim = len(dataset.out_idx)
-    
+
     control_positions = list(getattr(dataset, "control_positions", []))
     known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
     control_dim = len(control_positions)
     exo_dim = len(known_exo_positions)
-    
+
     # Preallocate numpy arrays for batch data (avoid list appends)
     warmup_controls = np.zeros((batch_size, warmup_len, control_dim), dtype=np.float32)
     warmup_exogenous = np.zeros((batch_size, warmup_len, exo_dim), dtype=np.float32)
     warmup_outputs = np.zeros((batch_size, warmup_len, output_dim), dtype=np.float32)
     rollout_inputs = np.zeros((batch_size, max_horizon, input_dim), dtype=np.float32)
     rollout_targets = np.zeros((batch_size, max_horizon, output_dim), dtype=np.float32)
-    
+
     # Extract data for each batch item (unavoidable due to variable positions)
     # But we do all numpy operations first, then a single tensor conversion
     values = dataset.values
@@ -167,11 +211,11 @@ def _prepare_batch_data(
     out_idx = dataset.out_idx
     control_idx = [in_idx[pos] for pos in control_positions]
     exo_idx = [in_idx[pos] for pos in known_exo_positions]
-    
+
     for i in range(batch_size):
         start_idx = int(start_indices[i])
         horizon = int(horizons[i])
-        
+
         # Warmup window: [start_idx - warmup_len : start_idx]
         warmup_slice = values[start_idx - warmup_len : start_idx]
         if control_dim > 0:
@@ -179,16 +223,16 @@ def _prepare_batch_data(
         if exo_dim > 0:
             warmup_exogenous[i] = warmup_slice[:, exo_idx]
         warmup_outputs[i] = warmup_slice[:, out_idx]
-        
+
         # Rollout window: [start_idx : start_idx + horizon]
         rollout_slice = values[start_idx : start_idx + horizon]
         rollout_inputs[i, :horizon] = rollout_slice[:, in_idx]
         rollout_targets[i, :horizon] = rollout_slice[:, out_idx]
-    
+
     # Build warmup_full in the same semantic order used during rollout steps:
     # [controls, known_exogenous(+time), previous_outputs].
     warmup_full = np.concatenate([warmup_controls, warmup_exogenous, warmup_outputs], axis=-1)
-    
+
     use_cuda = device.type == "cuda"
 
     def _to_device(arr: np.ndarray) -> torch.Tensor:
@@ -261,13 +305,13 @@ def batch_rollout(
     device = torch.device(device)
     batch_size = len(start_indices)
     max_horizon = int(horizons.max())
-    
+
     # Build feature positions from centralized dataset taxonomy.
     control_positions = list(getattr(dataset, "control_positions", []))
     known_exo_positions = list(getattr(dataset, "known_exo_positions", []))
     control_dim = len(control_positions)
     exo_dim = len(known_exo_positions)
-    
+
     # Prepare batch data with single conversion (HOT PATH optimization)
     batch_data = _prepare_batch_data(
         dataset,
@@ -284,7 +328,7 @@ def batch_rollout(
     warmup_full = batch_data["warmup_full"]  # (B, warmup_len, model_input_dim)
     rollout_inputs_all = batch_data["rollout_inputs"]  # (B, max_horizon, input)
     rollout_targets_all = batch_data["rollout_targets"]  # (B, max_horizon, output)
-    
+
     # Split rollout inputs into controls and exogenous
     if control_dim > 0:
         control_idx = torch.as_tensor(control_positions, dtype=torch.long, device=device)
@@ -297,10 +341,10 @@ def batch_rollout(
         exogenous = torch.index_select(rollout_inputs_all, dim=2, index=exo_idx)
     else:
         exogenous = torch.zeros(batch_size, max_horizon, 0, device=device)
-    
+
     # Check if all horizons are the same (enables true batched rollout)
     uniform_horizon = (horizons == horizons[0]).all()
-    
+
     if uniform_horizon:
         # HOT PATH: True batched rollout - single model.rollout call
         horizon = int(horizons[0])
@@ -343,13 +387,13 @@ def batch_rollout(
 
         for i in range(batch_size):
             horizon = int(horizons[i])
-            
+
             # Slice pre-prepared tensors (no conversion, just indexing)
             warmup_i = warmup_full[i:i+1]  # (1, warmup_len, F)
             controls_i = controls[i:i+1, :horizon]  # (1, horizon, C)
             exogenous_i = exogenous[i:i+1, :horizon]  # (1, horizon, E)
             targets_i = rollout_targets_all[i:i+1, :horizon]  # (1, horizon, O)
-            
+
             rollout_result = model.rollout(
                 warmup_seq={
                     "inputs": warmup_i,
@@ -439,7 +483,7 @@ def batch_rollout_padded(
         model, dataset, start_indices, horizons, warmup_len,
         feedback, teacher_forcing_ratio, device
     )
-    
+
     predictions_list = result["predictions"]
     targets_list = result["targets"]
     horizons_tensor = result["horizons"]
@@ -447,15 +491,15 @@ def batch_rollout_padded(
         k for k in result.keys()
         if k not in {"predictions", "targets", "horizons", "start_indices"}
     ]
-    
+
     batch_size = len(predictions_list)
     max_horizon = int(horizons.max())
     output_dim = predictions_list[0].shape[-1]
     dev = predictions_list[0].device
-    
+
     # Check if all horizons are uniform (fast path)
     uniform_horizon = (horizons == horizons[0]).all()
-    
+
     if uniform_horizon:
         # HOT PATH: Fast path - just stack tensors (no padding needed)
         predictions_padded = torch.stack(predictions_list, dim=0)
@@ -477,13 +521,13 @@ def batch_rollout_padded(
             (batch_size, max_horizon, output_dim),
             pad_value, dtype=torch.float32, device=dev
         )
-        
+
         # Vectorized mask creation (Rule 2: no Python loops for data ops)
         # mask[i, j] = True if j < horizons[i]
         time_indices = torch.arange(max_horizon, device=dev).unsqueeze(0)  # (1, max_horizon)
         horizon_expanded = horizons_tensor.unsqueeze(1)  # (batch_size, 1)
         mask = time_indices < horizon_expanded  # (batch_size, max_horizon)
-        
+
         # Fill in actual values using indexing
         # This loop is unavoidable due to variable lengths, but we avoid
         # creating new tensors inside - just assignment
@@ -562,12 +606,12 @@ def rollout_autoregressive(
     model.eval()
     preds = []
     x = x0.to(device)
-    
+
     with torch.no_grad():
         for _ in range(h_max):
             y = model(x)  # (B, pred_len, F_out)
             step = y[:, -1:, :]  # last step, keep time dim
             preds.append(step.cpu())
             x = torch.cat([x, step], dim=1)[:, 1:, :]  # slide window
-    
+
     return torch.cat(preds, dim=1)  # (B, h_max, F_out)

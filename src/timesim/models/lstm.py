@@ -9,7 +9,7 @@ Optimizations:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Literal, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -55,7 +55,7 @@ class LSTMWorldModel(WorldModelBase):
         [controls, exogenous, previous_outputs]
     concatenated along the feature dimension.
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -73,13 +73,13 @@ class LSTMWorldModel(WorldModelBase):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.pred_len = pred_len
-        
+
         # For step() method: if control_dim and exo_dim are provided,
         # the LSTM expects control + exo + output concatenated
         # Otherwise, input_dim should already include everything
         self.control_dim = control_dim
         self.exo_dim = exo_dim
-        
+
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -87,9 +87,9 @@ class LSTMWorldModel(WorldModelBase):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        
+
         self.fc = nn.Linear(hidden_dim, self.output_dim)
-    
+
     def init_state(self, warmup_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initialize LSTM hidden state from warmup sequence.
         
@@ -108,7 +108,7 @@ class LSTMWorldModel(WorldModelBase):
         # Run LSTM over warmup sequence to get final hidden state
         _, (h, c) = self.lstm(warmup_seq)
         return h, c
-    
+
     def step(
         self,
         state: Tuple[torch.Tensor, torch.Tensor],
@@ -137,7 +137,7 @@ class LSTMWorldModel(WorldModelBase):
             Predicted output at time t+1, shape (batch_size, output_dim).
         """
         h, c = state
-        
+
         # Concatenate inputs based on what's provided
         # The input to LSTM should match input_dim from __init__
         if prev_output_t is not None:
@@ -150,7 +150,7 @@ class LSTMWorldModel(WorldModelBase):
             device = control_t.device
             zero_output = torch.zeros(batch_size, self.output_dim, device=device)
             input_t = torch.cat([control_t, exo_t, zero_output], dim=-1)
-        
+
         # Verify dimension matches
         if input_t.shape[-1] != self.input_dim:
             raise ValueError(
@@ -158,18 +158,18 @@ class LSTMWorldModel(WorldModelBase):
                 f"got {input_t.shape[-1]}. "
                 f"Make sure input_dim = control_dim + exo_dim + output_dim"
             )
-        
+
         # Add time dimension for LSTM
         input_t = input_t.unsqueeze(1)  # (B, 1, F)
-        
+
         # LSTM step
         out, (h_new, c_new) = self.lstm(input_t, (h, c))
-        
+
         # Predict next output
         pred = self.fc(out.squeeze(1))  # (B, output_dim)
-        
+
         return (h_new, c_new), pred
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard forward pass for backward compatibility.
         
@@ -188,16 +188,16 @@ class LSTMWorldModel(WorldModelBase):
         """
         # Run LSTM over input sequence
         out, _ = self.lstm(x)  # (B, T, hidden_dim)
-        
+
         # Use last hidden state for prediction
         last = out[:, -1, :]  # (B, hidden_dim)
         pred = self.fc(last)  # (B, output_dim)
-        
+
         # Repeat for pred_len steps (simple baseline)
         pred_seq = pred.unsqueeze(1).repeat(1, self.pred_len, 1)
-        
+
         return pred_seq
-    
+
     def rollout(
         self,
         warmup_seq: Dict[str, torch.Tensor],
@@ -241,44 +241,44 @@ class LSTMWorldModel(WorldModelBase):
         # Validate inputs
         if feedback in ["teacher", "mixed"] and targets is None:
             raise ValueError(f"targets required when feedback='{feedback}'")
-        
+
         # Initialize state
         warmup_inputs = warmup_seq["inputs"]
         state = self.init_state(warmup_inputs)
-        
+
         # Extract rollout inputs
         controls = rollout_inputs["controls"]  # (B, H, C)
         exogenous = rollout_inputs["exogenous"]  # (B, H, E)
         batch_size = controls.shape[0]
         device = controls.device
-        
+
         # Get initial previous output from warmup
         # Assume outputs are the last output_dim features of warmup
         prev_output = warmup_inputs[:, -1, -(self.output_dim):]  # (B, O)
-        
+
         # HOT PATH: Preallocate predictions tensor (Rule 5: no allocations in loop)
         predictions = torch.empty(
             batch_size, horizon, self.output_dim,
             dtype=torch.float32, device=device
         )
-        
+
         # States list is needed for potential downstream use, but we only
         # store references, not copies
         states = []
-        
+
         # Rollout loop - unavoidable due to recurrence, but minimized overhead
         for t in range(horizon):
             # Direct indexing (no intermediate tensors)
             control_t = controls[:, t, :]  # (B, C)
             exo_t = exogenous[:, t, :]  # (B, E)
-            
+
             # Predict next step
             state, pred_t = self.step(state, control_t, exo_t, prev_output)
-            
+
             # HOT PATH: Direct assignment to preallocated tensor
             predictions[:, t, :] = pred_t
             states.append(state)
-            
+
             # Determine feedback for next step
             if feedback == "model":
                 prev_output = pred_t
@@ -288,7 +288,7 @@ class LSTMWorldModel(WorldModelBase):
                 # Scheduled sampling - single random generation per step
                 use_teacher = torch.rand(batch_size, 1, device=device) < teacher_forcing_ratio
                 prev_output = torch.where(use_teacher, targets[:, t, :], pred_t)
-        
+
         return {
             "predictions": predictions,
             "states": states,

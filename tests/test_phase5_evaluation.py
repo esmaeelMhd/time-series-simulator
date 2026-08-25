@@ -2,15 +2,15 @@
 
 import numpy as np
 import pandas as pd
+from scripts.eval_rssm_suite import _uncertainty_growth_summary
 
 from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.evaluation import (
-    open_loop_evaluate,
     closed_loop_evaluate,
     interventional_suite_evaluate,
+    open_loop_evaluate,
 )
 from timesim.models.latent_ssm import LatentSSMWorldModel
-from scripts.eval_rssm_suite import _uncertainty_growth_summary
 
 
 def _make_dataset(n: int = 240) -> GroupedTimeSeriesDataset:

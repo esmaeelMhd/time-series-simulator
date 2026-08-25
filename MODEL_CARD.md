@@ -10,17 +10,22 @@
   - `CONTROL`: actionable variables (interventions).
   - `EXOGENOUS`: non-controlled context/disturbances.
   - `OBJECTIVE`: predicted targets.
-- Example wastewater schema:
-  - Control: `IN_METAL_Q`, `T1_O2`
-  - Exogenous: `METAL_Q`, `IN_Q`, `MAX_CF`, `PROCESSPHASE_INLET`, `PROCESSPHASE_OUTLET`
+- Example wastewater schema (matches `configs/dataset/wastewater.yaml`):
+  - Control: `IN_METAL_Q`, `T1_O2`, `METAL_Q`
+  - Exogenous: `IN_Q`, `MAX_CF`, `PROCESSPHASE_INLET`, `PROCESSPHASE_OUTLET`
   - Objective: `T1_PO4`
+
+The wastewater CSV is **not** bundled with this repository. Download it from the data paper (arXiv:2407.05346) and place it at the path in the dataset config.
 
 ## 3. Training Recipe
 - Core losses:
-  - Objective reconstruction Gaussian NLL.
-  - KL(post || prior) with optional free-bits + KL balancing.
+  - Objective reconstruction Gaussian NLL (in **normalized** space; RMSE/MAE/CRPS in evaluation reports are inverse-transformed to original units).
+  - KL(post || prior) with optional free-bits applied to the **per-step aggregate** KL (Dreamer convention) + optional KL balancing.
   - Optional exogenous auxiliary Gaussian NLL.
   - Optional rollout loss (NLL + optional soft-DTW term).
+- Latent / decoder noise:
+  - Gaussian latent stds are learned unless `prior_constant_std` / `posterior_constant_std` are set (the wastewater RSSM config uses categorical latents).
+  - Decoder `min_std` is honoured as configured (shipped configs use `0.5` on min-max normalized `[0, 1]` targets).
 - Optimization:
   - AdamW (default `lr=3e-4`, `weight_decay=1e-6`).
   - LR warmup + cosine decay.
@@ -28,6 +33,7 @@
 - Data handling:
   - Strict chronological split.
   - Train-only normalization stats; val/test reuse train stats.
+  - `scripts/eval.py` and `scripts/compare.py` report metrics on the held-out **test** split. Validation is used for early stopping, checkpoint selection, and Optuna.
 
 ## 4. How To Run Simulator
 - Python API:
@@ -38,14 +44,8 @@
   - `GET /health`, `GET /schema`
   - `POST /reset`, `POST /step`, `POST /rollout`
 
-## 5. Benchmarks (Example Run)
-- Example artifact: `runs/wastewater/checklist_loss_eval_rollout/latent_ssm/eval_suite/summary.yaml`
-- Snapshot metrics:
-  - Open-loop RMSE@1: `0.7296`
-  - Open-loop RMSE@20: `1.0371`
-  - RMSE ratio h20/h1: `1.4214`
-  - Coverage@95 mean: `0.8950`
-  - Latent KL mean: `2.7505`
+## 5. Benchmarks
+Headline numbers should be regenerated with `scripts/eval.py` / `scripts/eval_rssm_suite.py` on the test split after training. This card does not ship run artifacts.
 
 ## 6. Known Limitations
 - Interventional validity depends on correct role mapping and data coverage.
@@ -59,4 +59,3 @@
   - Disabling aux decoder blocked unless explicit ablation flag enabled.
   - Shared encoders and no-stochastic-path blocked unless explicit ablation flags enabled.
 - Serve-time extrapolation warnings trigger when inputs are >2 sigma from train distribution.
-

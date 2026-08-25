@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Simulate a trained model on the full dataset from a chosen start index.
+"""Simulate a trained model on the held-out test split from a chosen start index.
 
 This script loads a trained checkpoint (neural or XGBoost), restores the saved
 scaler from the run directory, builds a GroupedTimeSeriesDataset on the full
 CSV, then runs recursive simulation for a chosen horizon.
 
 Compared to eval.py:
-- Uses the full dataset by default (ignores dataset.slice unless requested)
+- Loads the full CSV (ignores dataset.slice unless requested) but defaults the
+  start index to the chronological test region
 - Focuses only on environment-style recursive simulation
 - Supports fixed or random start index selection
 """
@@ -17,16 +18,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 import yaml
 
-from timesim.utils.config import compose_config
-from timesim.data.loader import load_csv_dataset
 from timesim.data.dataset import GroupedTimeSeriesDataset
+from timesim.data.loader import (
+    chronological_split_dataframe,
+    load_csv_dataset,
+    resolve_split_ratios,
+)
 from timesim.data.schema import VariableSchema
-from timesim.models.factory import build_model, count_parameters, NEURAL_MODELS
-from timesim.utils.misc import seed_everything, resolve_device
+from timesim.models.factory import NEURAL_MODELS, build_model, count_parameters
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device, seed_everything
 
 try:
     from timesim.models.xgboost_model import XGBoostForecaster
@@ -35,15 +42,16 @@ except ImportError:
     HAS_XGBOOST = False
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 # Shared simulation / plotting utilities (same directory)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_utils import (
+    save_per_model_simulation_csv,
+    save_per_model_simulation_plot,
     simulate_recursive_neural,
     simulate_recursive_xgboost,
-    save_per_model_simulation_plot,
-    save_per_model_simulation_csv,
 )
 
 
@@ -224,6 +232,12 @@ def main():
     )
 
     n_total = len(dataset_full.values)
+    split_cfg = data_cfg.get("splits", None)
+    ratios = resolve_split_ratios(split_cfg=split_cfg, train_split=None, default=(0.70, 0.15, 0.15))
+    train_df, _val_df, test_df = chronological_split_dataframe(df, split_ratios=ratios)
+    train_end = len(train_df)
+    test_start = n_total - len(test_df)
+
     max_possible_horizon = n_total - seq_len
     if max_possible_horizon <= 0:
         print(
@@ -251,9 +265,12 @@ def main():
             start_max = n_total - seq_len - 1
         else:
             start_max = n_total - seq_len - requested_horizon
+        start_min = int(test_start)
+        if start_max < start_min:
+            start_min = max(0, start_max)
         if start_max < 0:
             start_max = 0
-        start_idx = int(np.random.randint(0, start_max + 1))
+        start_idx = int(np.random.randint(start_min, start_max + 1))
 
     # Clip start index to valid bounds for at least one step
     max_valid_start = n_total - seq_len - 1
@@ -327,6 +344,13 @@ def main():
     )
     csv_path = model_dir / f"{prefix}_simulation.csv"
 
+    if start_idx >= test_start:
+        split_name = "test"
+    elif start_idx >= train_end:
+        split_name = "val"
+    else:
+        split_name = "train"
+
     meta = {
         "model_type": model_type,
         "round": round_name,
@@ -334,6 +358,7 @@ def main():
         "dataset_rows": int(n_total),
         "seq_len": int(seq_len),
         "start_idx": int(start_idx),
+        "split": split_name,
         "requested_horizon": None if requested_horizon is None else int(requested_horizon),
         "used_horizon": int(sim_result["n_steps"]),
         "mse": sim_mse,
@@ -348,12 +373,12 @@ def main():
         yaml.safe_dump(meta, f, sort_keys=False)
 
     print("\n" + "=" * 70)
-    print("  FULL-DATASET SIMULATION COMPLETE")
+    print("  HELD-OUT TEST SIMULATION COMPLETE")
     print("=" * 70)
     print(f"  Model        : {model_type} ({round_name})")
     print(f"  Checkpoint   : {ckpt_path}")
     print(f"  Dataset rows : {n_total}")
-    print(f"  Start idx    : {start_idx}")
+    print(f"  Start idx    : {start_idx} ({split_name})")
     print(f"  Horizon      : {sim_result['n_steps']}")
     print(f"  MSE / MAE    : {sim_mse:.6f} / {sim_mae:.6f}")
     print(f"  Plot         : {plot_path}")

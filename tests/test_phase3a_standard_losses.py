@@ -114,8 +114,8 @@ def test_kl_balancing_and_free_bits_match_formula() -> None:
     kl_balanced = alpha * torch.distributions.kl_divergence(post_sg, prior) + (
         1.0 - alpha
     ) * torch.distributions.kl_divergence(post, prior_sg)
-    kl_fb = torch.maximum(kl_balanced, torch.full_like(kl_balanced, free_nats))
-    expected = _sum_time_mean_batch(kl_fb.sum(dim=-1), mask)
+    kl_fb = torch.clamp(kl_balanced.sum(dim=-1), min=free_nats)
+    expected = _sum_time_mean_batch(kl_fb, mask)
     assert torch.allclose(kl, expected, atol=1e-6)
 
 

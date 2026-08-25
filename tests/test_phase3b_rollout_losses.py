@@ -7,7 +7,12 @@ from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.sampling import RandomStartFixedHorizon
 from timesim.models.latent_ssm import LatentSSMWorldModel
 from timesim.training.losses import soft_dtw_distance
-from timesim.training.rollout import batch_rollout_padded, get_horizon, get_rollout_ramp, get_rollout_schedule
+from timesim.training.rollout import (
+    batch_rollout_padded,
+    get_horizon,
+    get_rollout_ramp,
+    get_rollout_schedule,
+)
 from timesim.training.trainer import WorldModelTrainer
 
 
@@ -105,8 +110,8 @@ def test_rollout_model_feedback_uses_prior_only_path() -> None:
 
     assert "posterior_mu" in result
     assert "kl_terms" in result
-    assert torch.allclose(result["posterior_mu"], torch.zeros_like(result["posterior_mu"]), atol=1e-7)
-    assert torch.allclose(result["kl_terms"], torch.zeros_like(result["kl_terms"]), atol=1e-7)
+    assert torch.isnan(result["posterior_mu"]).all()
+    assert torch.isnan(result["kl_terms"]).all()
 
 
 def test_rollout_loss_combination_and_weight_ramp_in_trainer() -> None:
@@ -134,6 +139,8 @@ def test_rollout_loss_combination_and_weight_ramp_in_trainer() -> None:
             "rollout_dtw_gamma": 0.1,
             "rollout_warmup_fraction": 0.30,
             "rollout_max_horizon": 4,
+            "rollout_start_epoch": 4,
+            "rollout_full_epoch": 10,
             "min_context": 6,
             "checkpoint_metric": "open_loop_crps",
             "checkpoint_open_loop_horizon": 4,

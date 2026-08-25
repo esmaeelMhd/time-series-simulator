@@ -1,11 +1,11 @@
 import random
 
 import numpy as np
-import torch
 import pytest
+import torch
 
 from timesim.data.schema import VariableSchema
-from timesim.utils.misc import seed_everything, resolve_device
+from timesim.utils.misc import resolve_device, seed_everything
 
 
 def test_variable_schema_rejects_duplicate_assignments():

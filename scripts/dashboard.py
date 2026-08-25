@@ -9,16 +9,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
-import yaml
 
 from timesim.data.loader import build_grouped_dataloaders
+from timesim.data.sampling import RandomStartFixedHorizon
 from timesim.models.factory import build_model
 from timesim.simulator import RSSMSimulator
 from timesim.training import WorldModelTrainer
-from timesim.data.sampling import RandomStartFixedHorizon
-
 
 st.set_page_config(page_title="TimeSim RSSM Simulator", layout="wide")
 st.title("TimeSim RSSM World Model Simulator")
@@ -65,7 +65,7 @@ checkpoint_path = right.text_input("Checkpoint path (optional)", value="")
 
 if st.button("Initialize Simulator", type="primary"):
     with st.spinner("Preparing model and simulator..."):
-        train_loader, val_loader, scaler = build_grouped_dataloaders(
+        train_loader, val_loader, _test_loader, scaler = build_grouped_dataloaders(
             raw_df,
             groups,
             input_groups=["control", "exogenous"],

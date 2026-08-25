@@ -18,8 +18,8 @@ from .loader import (
     load_csv_dataset,
     resolve_split_ratios,
 )
-from .validation import validate_variable_groups
 from .preprocessing import fit_normalization_stats
+from .validation import validate_variable_groups
 
 
 class TimeSeriesDataModule((pl.LightningDataModule if pl is not None else object)):  # type: ignore[misc]

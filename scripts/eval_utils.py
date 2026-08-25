@@ -11,16 +11,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from timesim.models.factory import NEURAL_MODELS  # canonical source
 from timesim.data.schema import VariableRole
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Default plotting config (used when no config dict is provided)
@@ -176,7 +177,7 @@ def evaluate_neural_model(
 
     max_start = val_len - min_required
     step = max(1, max_start // n_windows)
-    start_indices = list(range(0, max_start, step))[:n_windows]
+    start_indices = list(range(0, max_start + 1, step))[:n_windows]
 
     prob_cfg = probabilistic_cfg or {}
     mc_samples = max(2, int(prob_cfg.get("mc_samples", 256)))
@@ -302,7 +303,7 @@ def evaluate_xgboost_model(
 
     max_start = val_len - min_required
     step = max(1, max_start // n_windows)
-    start_indices = list(range(0, max_start, step))[:n_windows]
+    start_indices = list(range(0, max_start + 1, step))[:n_windows]
 
     gt_list, pred_list = [], []
     for start_idx in start_indices:

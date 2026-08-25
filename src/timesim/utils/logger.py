@@ -4,7 +4,6 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
 
 # Note: we *lazily* import SummaryWriter only when needed to avoid requiring
 # tensorboard as a hard dependency for users who do not log.
@@ -76,4 +75,4 @@ def init_logging(run_dir: str | os.PathLike):
     except ModuleNotFoundError:
         tb_writer = None
     logger.info(f"Run directory: {run_dir}")
-    return logger, tb_writer 
+    return logger, tb_writer

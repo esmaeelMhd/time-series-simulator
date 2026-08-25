@@ -220,8 +220,8 @@ def build_grouped_dataloaders(
     use_symlog: bool = False,
     symlog_columns: Optional[list[str]] = None,
     split_cfg: Optional[Dict[str, Any]] = None,
-) -> Tuple[DataLoader, DataLoader, object]:
-    train_loader, val_loader, _, scaler = build_grouped_triplet_dataloaders(
+) -> Tuple[DataLoader, DataLoader, DataLoader, object]:
+    train_loader, val_loader, test_loader, scaler = build_grouped_triplet_dataloaders(
         df=df,
         groups=groups,
         input_groups=input_groups,
@@ -245,7 +245,7 @@ def build_grouped_dataloaders(
         symlog_columns=symlog_columns,
         split_cfg=split_cfg,
     )
-    return train_loader, val_loader, scaler
+    return train_loader, val_loader, test_loader, scaler
 
 
 def build_dataloaders_from_config(
@@ -253,8 +253,8 @@ def build_dataloaders_from_config(
     df: pd.DataFrame,
     seed: Optional[int],
     scaler=None,
-) -> Tuple[DataLoader, DataLoader, object]:
-    """Build grouped train/val dataloaders from a composed runtime config."""
+) -> Tuple[DataLoader, DataLoader, DataLoader, object]:
+    """Build grouped train/val/test dataloaders from a composed runtime config."""
     data_cfg = config.get("data", {}) or {}
     dataset_cfg = config["dataset"]
     model_io_cfg = config["model_io"]

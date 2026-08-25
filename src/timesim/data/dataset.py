@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Any
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .stamps import add_time_features
-from .schema import VariableRole, VariableSchema
-from .validation import validate_variable_groups
-from .preprocessing import fit_normalization_stats
 from ..utils.scaler import MinMaxScaler, NormalizationStats
+from .preprocessing import fit_normalization_stats
+from .schema import VariableRole, VariableSchema
+from .stamps import add_time_features
+from .validation import validate_variable_groups
 
 
 class TimeSeriesDataset(Dataset):
@@ -56,10 +56,10 @@ class TimeSeriesDataset(Dataset):
             raise ValueError("NaNs remain in TimeSeriesDataset after preprocessing.")
 
     def __len__(self):
-        base = len(self.values) - (self.seq_len + self.pred_len)
-        if base <= 0:
+        max_start = len(self.values) - (self.seq_len + self.pred_len)
+        if max_start < 0:
             return 0
-        return base // self.stride
+        return (max_start // self.stride) + 1
 
     def __getitem__(self, idx: int):
         start = int(idx) * self.stride
@@ -147,10 +147,10 @@ class GroupedTimeSeriesDataset(Dataset):
             raise ValueError("NaNs remain in GroupedTimeSeriesDataset after preprocessing.")
 
     def __len__(self):
-        base = len(self.values) - (self.seq_len + self.pred_len)
-        if base <= 0:
+        max_start = len(self.values) - (self.seq_len + self.pred_len)
+        if max_start < 0:
             return 0
-        return base // self.stride
+        return (max_start // self.stride) + 1
 
     def __getitem__(self, idx: int):
         start = int(idx) * self.stride

@@ -5,15 +5,15 @@ import pandas as pd
 import pytest
 
 from timesim.data import (
-    TimeSeriesDataModule,
     SlidingWindowRoleDataset,
+    TimeSeriesDataModule,
     chronological_split_dataframe,
     resolve_split_ratios,
 )
 from timesim.data.preprocessing import (
+    denormalize_array,
     fit_normalization_stats,
     normalize_array,
-    denormalize_array,
 )
 from timesim.data.validation import validate_time_series_dataframe, validate_variable_groups
 

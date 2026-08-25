@@ -2,17 +2,17 @@
 
 import numpy as np
 import pandas as pd
-import torch
 import pytest
+import torch
 
 from timesim.data.dataset import GroupedTimeSeriesDataset
 from timesim.data.sampling import RandomStartFixedHorizon
-from timesim.models.lstm import LSTMWorldModel
-from timesim.models.latent_ssm import LatentSSMWorldModel
-from timesim.training.rollout import batch_rollout, batch_rollout_padded
-from timesim.training.losses import OneStepLoss, MultiStepLoss, ProbabilisticRolloutLoss
-from timesim.training.trainer import WorldModelTrainer
 from timesim.evaluation import interventional_evaluate
+from timesim.models.latent_ssm import LatentSSMWorldModel
+from timesim.models.lstm import LSTMWorldModel
+from timesim.training.losses import MultiStepLoss, OneStepLoss, ProbabilisticRolloutLoss
+from timesim.training.rollout import batch_rollout, batch_rollout_padded
+from timesim.training.trainer import WorldModelTrainer
 
 
 def create_synthetic_dataset(n=500):
@@ -22,18 +22,18 @@ def create_synthetic_dataset(n=500):
         "exo": np.cos(np.linspace(0, 10, n)),
         "output": np.sin(np.linspace(0, 10, n)) * 0.5 + np.cos(np.linspace(0, 10, n)) * 0.5,
     })
-    
+
     groups = {
         "control": ["control"],
         "exogenous": ["exo"],
         "objective": ["output"],
     }
-    
+
     dataset = GroupedTimeSeriesDataset(
         df, groups, ["control", "exogenous"], ["objective"],
         seq_len=10, pred_len=5, scale=True
     )
-    
+
     return dataset
 
 
@@ -42,24 +42,24 @@ def test_batch_rollout_basic():
     dataset = create_synthetic_dataset(n=300)
     model = LSTMWorldModel(input_dim=3, output_dim=1, hidden_dim=16)
     model.eval()
-    
+
     # Sample rollouts
     start_indices = np.array([50, 100, 150])
     horizons = np.array([10, 10, 10])
     warmup_len = 20
-    
+
     with torch.no_grad():
         result = batch_rollout(
             model, dataset, start_indices, horizons, warmup_len,
             feedback="model", device="cpu"
         )
-    
+
     # Check outputs
     assert "predictions" in result
     assert "targets" in result
     assert len(result["predictions"]) == 3
     assert len(result["targets"]) == 3
-    
+
     # Check shapes
     for i in range(3):
         assert result["predictions"][i].shape == (10, 1)
@@ -71,23 +71,23 @@ def test_batch_rollout_padded():
     dataset = create_synthetic_dataset(n=300)
     model = LSTMWorldModel(input_dim=3, output_dim=1, hidden_dim=16)
     model.eval()
-    
+
     # Variable horizons
     start_indices = np.array([50, 100, 150])
     horizons = np.array([8, 12, 10])
     warmup_len = 20
-    
+
     with torch.no_grad():
         result = batch_rollout_padded(
             model, dataset, start_indices, horizons, warmup_len,
             feedback="model", device="cpu"
         )
-    
+
     # Check outputs
     assert result["predictions"].shape == (3, 12, 1)  # max horizon is 12
     assert result["targets"].shape == (3, 12, 1)
     assert result["mask"].shape == (3, 12)
-    
+
     # Check mask
     assert result["mask"][0, :8].all()   # First 8 valid
     assert not result["mask"][0, 8:].any()  # Rest padded
@@ -100,29 +100,29 @@ def test_rollout_with_teacher_forcing():
     dataset = create_synthetic_dataset(n=300)
     model = LSTMWorldModel(input_dim=3, output_dim=1, hidden_dim=16)
     model.eval()
-    
+
     start_indices = np.array([50, 100])
     horizons = np.array([10, 10])
     warmup_len = 20
-    
+
     with torch.no_grad():
         result = batch_rollout_padded(
             model, dataset, start_indices, horizons, warmup_len,
             feedback="teacher", device="cpu"
         )
-    
+
     assert result["predictions"].shape == (2, 10, 1)
 
 
 def test_one_step_loss():
     """Test one-step loss computation."""
     loss_fn = OneStepLoss(loss_type="mse")
-    
+
     predictions = torch.randn(4, 10, 2)
     targets = torch.randn(4, 10, 2)
-    
+
     loss = loss_fn(predictions, targets)
-    
+
     assert isinstance(loss.item(), float)
     assert loss.item() >= 0
 
@@ -130,12 +130,12 @@ def test_one_step_loss():
 def test_multi_step_loss_uniform():
     """Test multi-step loss with uniform weighting."""
     loss_fn = MultiStepLoss(loss_type="mse", weighting="uniform")
-    
+
     predictions = torch.randn(4, 10, 2)
     targets = torch.randn(4, 10, 2)
-    
+
     loss = loss_fn(predictions, targets)
-    
+
     assert isinstance(loss.item(), float)
     assert loss.item() >= 0
 
@@ -143,12 +143,12 @@ def test_multi_step_loss_uniform():
 def test_multi_step_loss_linear_weighting():
     """Test multi-step loss with linear weighting (emphasize later steps)."""
     loss_fn = MultiStepLoss(loss_type="mse", weighting="linear")
-    
+
     predictions = torch.randn(4, 10, 2)
     targets = torch.randn(4, 10, 2)
-    
+
     loss = loss_fn(predictions, targets)
-    
+
     assert isinstance(loss.item(), float)
     assert loss.item() >= 0
 
@@ -160,57 +160,57 @@ def test_simple_training_reduces_loss():
     control = np.random.randn(n)
     exo = np.random.randn(n)
     output = 0.5 * control + 0.3 * exo + 0.01 * np.random.randn(n)
-    
+
     df = pd.DataFrame({
         "control": control,
         "exo": exo,
         "output": output,
     })
-    
+
     groups = {
         "control": ["control"],
         "exogenous": ["exo"],
         "objective": ["output"],
     }
-    
+
     dataset = GroupedTimeSeriesDataset(
         df, groups, ["control", "exogenous"], ["objective"],
         seq_len=10, pred_len=5, scale=True
     )
-    
+
     # Create model
     model = LSTMWorldModel(input_dim=3, output_dim=1, hidden_dim=32, num_layers=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     loss_fn = MultiStepLoss(loss_type="mse")
-    
+
     # Train for a few steps
     initial_loss = None
     final_loss = None
-    
+
     for step in range(20):
         # Sample rollouts
         start_indices = np.array([50, 100, 150, 200])
         horizons = np.array([10, 10, 10, 10])
         warmup_len = 20
-        
+
         result = batch_rollout_padded(
             model, dataset, start_indices, horizons, warmup_len,
             feedback="model", device="cpu"
         )
-        
+
         predictions = result["predictions"]
         targets = result["targets"]
-        
+
         optimizer.zero_grad()
         loss = loss_fn(predictions, targets)
         loss.backward()
         optimizer.step()
-        
+
         if step == 0:
             initial_loss = loss.item()
         if step == 19:
             final_loss = loss.item()
-    
+
     # Loss should decrease
     assert final_loss < initial_loss * 0.8, f"Loss did not decrease enough: {initial_loss:.4f} -> {final_loss:.4f}"
 

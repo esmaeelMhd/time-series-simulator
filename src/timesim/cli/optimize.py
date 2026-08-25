@@ -17,29 +17,31 @@ import math
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+
 from timesim.utils.misc import configure_torch_defaults
+
 configure_torch_defaults()
 import yaml
 
-from timesim.utils.config import compose_config
-from timesim.data.loader import load_csv_dataset, build_grouped_dataloaders
-from timesim.data.schema import VariableSchema
-from timesim.data.stamps import get_time_feature_columns
+from timesim.data.loader import build_grouped_dataloaders, load_csv_dataset
 from timesim.data.sampling import (
-    RandomStartFixedHorizon,
-    RandomStartRandomHorizon,
     DailyFixedHorizon,
     GeometricHorizonSampling,
+    RandomStartFixedHorizon,
+    RandomStartRandomHorizon,
     StrideBasedSampling,
 )
-from timesim.models.factory import build_model, NEURAL_MODELS
-from timesim.training import WorldModelTrainer
+from timesim.data.schema import VariableSchema
+from timesim.data.stamps import get_time_feature_columns
 from timesim.evaluation import open_loop_evaluate
-from timesim.utils.misc import seed_everything, resolve_device
+from timesim.models.factory import NEURAL_MODELS, build_model
+from timesim.training import WorldModelTrainer
+from timesim.utils.config import compose_config
+from timesim.utils.misc import resolve_device, seed_everything
 
 try:
     import optuna
@@ -49,7 +51,7 @@ except ImportError as exc:
     ) from exc
 
 try:
-    from timesim.models.xgboost_model import XGBoostForecaster
+    import timesim.models.xgboost_model  # noqa: F401
     HAS_XGBOOST = True
 except ImportError:
     HAS_XGBOOST = False
@@ -516,7 +518,7 @@ def main():
         engine=str(config.get("data", {}).get("csv_engine", "pandas")),
         validation_cfg=config.get("data", {}).get("validation", None),
     )
-    train_loader, val_loader, scaler = build_grouped_dataloaders(
+    train_loader, val_loader, _test_loader, scaler = build_grouped_dataloaders(
         df,
         groups,
         input_groups,

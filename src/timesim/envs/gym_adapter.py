@@ -8,13 +8,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+import gymnasium as gym
 import numpy as np
 import torch
-import gymnasium as gym
 from gymnasium import spaces
 
-from ..models.base import WorldModelBase
 from ..data.dataset import GroupedTimeSeriesDataset
+from ..models.base import WorldModelBase
 
 
 class WorldModelEnv(gym.Env):
@@ -66,9 +66,9 @@ class WorldModelEnv(gym.Env):
     - Add action penalties (e.g., control effort)
     - Support domain-specific constraints
     """
-    
+
     metadata = {"render_modes": ["human"]}
-    
+
     def __init__(
         self,
         world_model: WorldModelBase,
@@ -84,7 +84,7 @@ class WorldModelEnv(gym.Env):
         device: torch.device | str = "cpu",
     ):
         super().__init__()
-        
+
         self.world_model = world_model
         self.world_model.eval()
         self.dataset = dataset
@@ -94,7 +94,7 @@ class WorldModelEnv(gym.Env):
         self.exo_dim = exo_dim
         self.output_dim = output_dim
         self.device = torch.device(device)
-        
+
         # Reward function
         if reward_fn is not None:
             self.reward_fn = reward_fn
@@ -104,7 +104,7 @@ class WorldModelEnv(gym.Env):
             self.reward_fn = lambda obs: -np.mean((obs - self.target_output) ** 2)
         else:
             raise ValueError("Either reward_fn or target_output must be provided")
-        
+
         # Action space (controls)
         if control_bounds is not None:
             low, high = control_bounds
@@ -112,19 +112,19 @@ class WorldModelEnv(gym.Env):
             low = np.full(control_dim, -np.inf, dtype=np.float32)
             high = np.full(control_dim, np.inf, dtype=np.float32)
         self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
-        
+
         # Observation space (outputs)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(output_dim,), dtype=np.float32
         )
-        
+
         # Episode state
         self.current_step = 0
         self.model_state = None
         self.current_obs = None
         self.exo_sequence = None
         self.scenario_start_idx = None
-    
+
     def reset(
         self,
         seed: Optional[int] = None,
@@ -147,39 +147,39 @@ class WorldModelEnv(gym.Env):
             Additional information.
         """
         super().reset(seed=seed)
-        
+
         # Sample a random scenario (starting point in dataset)
         if options is not None and "scenario_idx" in options:
             start_idx = options["scenario_idx"]
         else:
             max_start = len(self.dataset.values) - (self.warmup_len + self.episode_len)
             start_idx = self.np_random.integers(self.warmup_len, max_start)
-        
+
         self.scenario_start_idx = start_idx
-        
+
         # Get warmup data and initialize model state
         warmup_data = self.dataset.get_warmup_window(start_idx, self.warmup_len)
         warmup_inputs = torch.tensor(
             warmup_data["inputs"], dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        
+
         with torch.no_grad():
             self.model_state = self.world_model.init_state(warmup_inputs)
-        
+
         # Get exogenous sequence for this episode
         rollout_data = self.dataset.get_rollout_slice(start_idx, self.episode_len)
         self.exo_sequence = rollout_data["inputs"][:, self.control_dim:self.control_dim+self.exo_dim]
-        
+
         # Initial observation (last output from warmup)
         self.current_obs = warmup_data["outputs"][-1]
         self.current_step = 0
-        
+
         info = {
             "scenario_idx": start_idx,
         }
-        
+
         return self.current_obs.astype(np.float32), info
-    
+
     def step(
         self, action: np.ndarray
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -205,49 +205,49 @@ class WorldModelEnv(gym.Env):
         """
         if self.model_state is None:
             raise RuntimeError("Environment not reset. Call reset() first.")
-        
+
         # Prepare inputs
         control_t = torch.tensor(
             action, dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        
+
         exo_t = torch.tensor(
             self.exo_sequence[self.current_step],
             dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        
+
         prev_output_t = torch.tensor(
             self.current_obs, dtype=torch.float32, device=self.device
         ).unsqueeze(0)
-        
+
         # Simulate one step
         with torch.no_grad():
             self.model_state, pred_t = self.world_model.step(
                 self.model_state, control_t, exo_t, prev_output_t
             )
-        
+
         # Update observation
         self.current_obs = pred_t.cpu().numpy().squeeze(0)
-        
+
         # Compute reward
         reward = self.reward_fn(self.current_obs)
-        
+
         # Check termination
         self.current_step += 1
         truncated = self.current_step >= self.episode_len
         terminated = False  # Could add goal-reaching logic here
-        
+
         info = {
             "step": self.current_step,
         }
-        
+
         return self.current_obs.astype(np.float32), float(reward), terminated, truncated, info
-    
+
     def render(self):
         """Render the environment (stub implementation)."""
         if self.current_obs is not None:
             print(f"Step {self.current_step}: obs={self.current_obs}")
-    
+
     def close(self):
         """Clean up resources."""
         pass
