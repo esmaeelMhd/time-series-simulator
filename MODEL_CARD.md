@@ -15,7 +15,7 @@
   - Exogenous: `IN_Q`, `MAX_CF`, `PROCESSPHASE_INLET`, `PROCESSPHASE_OUTLET`
   - Objective: `T1_PO4`
 
-The wastewater CSV is **not** bundled with this repository. Download it from the data paper (arXiv:2407.05346) and place it at the path in the dataset config.
+The wastewater CSV is **not** bundled with this repository. Download it from the data paper (arXiv:2407.05346) and save it as `datasets/wastewater.csv` (or the path in `configs/dataset/wastewater.yaml`).
 
 ## 3. Training Recipe
 - Core losses:

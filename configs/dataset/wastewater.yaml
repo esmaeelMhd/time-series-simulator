@@ -2,14 +2,11 @@
 #
 # Dataset provenance
 # ------------------
-# This config expects a published wastewater-treatment dataset, captured
-# at two-minute intervals through the plant SCADA system and released as a data
-# paper: "Wastewater Treatment Plant Data for Nutrient Removal System",
-# arXiv:2407.05346 (https://arxiv.org/abs/2407.05346).
-#
-# The CSV itself is not distributed with this repository. Download it from the
-# source above and place it at the `dataset.csv` path below. The variable names
-# in this file are the column names used by that dataset.
+# Example wastewater schema for a published nutrient-removal WWTP time series
+# (arXiv:2407.05346, https://arxiv.org/abs/2407.05346). The CSV is not
+# distributed with this repository. Download it from that paper and save it as
+# `datasets/wastewater.csv` (or override `dataset.csv`). Variable names below
+# are the column names used by that dataset.
 
 dataset:
   name: wastewater
